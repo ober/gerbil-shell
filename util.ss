@@ -1,0 +1,179 @@
+;;; util.ss — Shared utilities for gsh
+
+(export #t)
+(import :std/misc/string
+        :std/misc/list
+        :std/misc/path
+        :std/pregexp
+        :std/format
+        :std/sugar
+        :std/iter
+        :gsh/ffi)
+
+;;; --- waitpid status decoders (shell-level) ---
+
+;; Decode raw waitpid status to a shell exit code (0-255)
+(def (status->exit-code raw-status)
+  (cond
+    ((WIFEXITED raw-status)
+     (WEXITSTATUS raw-status))
+    ((WIFSIGNALED raw-status)
+     (+ 128 (WTERMSIG raw-status)))
+    ((WIFSTOPPED raw-status)
+     (+ 128 (WSTOPSIG raw-status)))
+    (else 255)))
+
+;;; --- String utilities ---
+
+;; Split string by any character in charset (a string of delimiters)
+(def (string-split-chars str charset)
+  (let loop ((i 0) (start 0) (result []))
+    (cond
+      ((>= i (string-length str))
+       (reverse (if (> i start)
+                  (cons (substring str start i) result)
+                  result)))
+      ((string-index charset (string-ref str i))
+       (loop (+ i 1) (+ i 1)
+             (if (> i start)
+               (cons (substring str start i) result)
+               result)))
+      (else
+       (loop (+ i 1) start result)))))
+
+;; Check if char is in string
+(def (string-index str ch)
+  (let loop ((i 0))
+    (cond
+      ((>= i (string-length str)) #f)
+      ((char=? (string-ref str i) ch) i)
+      (else (loop (+ i 1))))))
+
+;; Substring test
+(def (string-contains? haystack needle)
+  (let ((nlen (string-length needle))
+        (hlen (string-length haystack)))
+    (if (> nlen hlen) #f
+        (let loop ((i 0))
+          (cond
+            ((> (+ i nlen) hlen) #f)
+            ((string=? (substring haystack i (+ i nlen)) needle) #t)
+            (else (loop (+ i 1))))))))
+
+;; Join strings with separator
+(def (string-join lst sep)
+  (if (null? lst) ""
+      (let loop ((rest (cdr lst)) (acc (car lst)))
+        (if (null? rest) acc
+            (loop (cdr rest) (string-append acc sep (car rest)))))))
+
+;;; --- Path / filesystem utilities ---
+
+;; Search PATH for an executable, return full path or #f
+(def (which name)
+  (if (string-contains? name "/")
+    ;; Absolute or relative path — just check executability
+    (and (file-exists? name) (executable? name) name)
+    ;; Search PATH
+    (let ((path-dirs (string-split-chars (or (getenv "PATH" #f) "/usr/bin:/bin") ":")))
+      (let loop ((dirs path-dirs))
+        (if (null? dirs) #f
+            (let ((full (string-append (car dirs) "/" name)))
+              (if (and (file-exists? full) (executable? full))
+                full
+                (loop (cdr dirs)))))))))
+
+;; Check if file is executable (by current user)
+(def (executable? path)
+  (with-catch
+   (lambda (e) #f)
+   (lambda ()
+     (let ((info (file-info path)))
+       (not (eq? (file-info-type info) 'directory))))))
+
+;; Return home directory
+(def (home-directory)
+  (or (getenv "HOME" #f)
+      (with-catch
+       (lambda (e) "/")
+       (lambda () (user-info-home (user-info (user-name)))))))
+
+;; Expand ~ and ~user at the start of a path
+(def (expand-tilde path)
+  (cond
+    ((string=? path "~") (home-directory))
+    ((and (> (string-length path) 1)
+          (char=? (string-ref path 0) #\~)
+          (char=? (string-ref path 1) #\/))
+     (string-append (home-directory) (substring path 1 (string-length path))))
+    ((and (> (string-length path) 1)
+          (char=? (string-ref path 0) #\~))
+     ;; ~user form
+     (let* ((slash-pos (string-index path #\/))
+            (username (if slash-pos
+                       (substring path 1 slash-pos)
+                       (substring path 1 (string-length path)))))
+       (with-catch
+        (lambda (e) path) ;; return as-is if user not found
+        (lambda ()
+          (let ((home (user-info-home (user-info username))))
+            (if slash-pos
+              (string-append home (substring path slash-pos (string-length path)))
+              home))))))
+    (else path)))
+
+;; Read all lines from a file
+(def (read-file-lines path)
+  (if (file-exists? path)
+    (call-with-input-file path
+      (lambda (port)
+        (let loop ((lines []))
+          (let ((line (read-line port)))
+            (if (eof-object? line)
+              (reverse lines)
+              (loop (cons line lines)))))))
+    []))
+
+;;; --- Exception utilities ---
+
+;; Extract a message string from any exception
+(def (exception-message e)
+  (cond
+    ((error-exception? e)
+     (error-exception-message e))
+    ((string? e) e)
+    (else (call-with-output-string (lambda (p) (display e p))))))
+
+;; Run thunk, return result or #f on exception
+(def (try-or-false thunk)
+  (with-catch (lambda (e) #f) thunk))
+
+;;; --- Misc ---
+
+;; Safe substring that doesn't error on out-of-bounds
+(def (safe-substring str start end)
+  (let ((len (string-length str)))
+    (substring str (min start len) (min end len))))
+
+;; Repeat a character n times
+(def (make-string-repeated ch n)
+  (make-string n ch))
+
+;; Check if a string is a valid shell name (variable name)
+(def (valid-name? str)
+  (and (> (string-length str) 0)
+       (let ((ch (string-ref str 0)))
+         (or (char-alphabetic? ch) (char=? ch #\_)))
+       (let loop ((i 1))
+         (or (>= i (string-length str))
+             (let ((ch (string-ref str i)))
+               (and (or (char-alphabetic? ch) (char-numeric? ch) (char=? ch #\_))
+                    (loop (+ i 1))))))))
+
+;; Check if string is a valid integer
+(def (string->integer str)
+  (with-catch
+   (lambda (e) #f)
+   (lambda ()
+     (let ((n (string->number str)))
+       (and (integer? n) (exact? n) n)))))
