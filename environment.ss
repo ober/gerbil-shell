@@ -28,6 +28,12 @@
 ;;; When #t, `exit` raises an exception instead of terminating the process.
 (def *in-subshell* (make-parameter #f))
 
+;;; --- Internal logical PWD ---
+;;; Tracks the shell's logical working directory independently of $PWD.
+;;; This ensures that `pwd` returns the correct path even if the user
+;;; manually sets $PWD to garbage. Only updated by cd builtin and init.
+(def *internal-pwd* (make-parameter #f))
+
 ;;; --- Shell variable ---
 ;; Attributes: exported?, readonly?, local?, integer?, uppercase?, lowercase?, nameref?
 ;;             array?, assoc?
@@ -37,6 +43,9 @@
 (defstruct shell-var (value exported? readonly? local?
                       integer? uppercase? lowercase? nameref?
                       array? assoc?) transparent: #t)
+
+;; Sentinel value for explicitly unset variables — prevents fallback to parent/OS env
+(def +unset-sentinel+ (gensym 'unset))
 
 ;;; --- Shell environment ---
 (defclass shell-environment (vars        ;; hash-table: name -> shell-var
@@ -127,13 +136,17 @@
 ;; Get from local scope only
 (def (env-get-local env name)
   (let ((var (hash-get (shell-environment-vars env) name)))
-    (and var (shell-var-scalar-value var))))
+    (and var (not (eq? (shell-var-value var) +unset-sentinel+))
+         (shell-var-scalar-value var))))
 
 ;; Get from scope chain
 (def (env-get-chain env name)
   (let ((var (hash-get (shell-environment-vars env) name)))
     (if var
-      (shell-var-scalar-value var)
+      ;; Check for unset sentinel — variable was explicitly unset, don't fall back
+      (if (eq? (shell-var-value var) +unset-sentinel+)
+        #f
+        (shell-var-scalar-value var))
       (let ((parent (shell-environment-parent env)))
         (if parent
           (env-get-chain parent name)
@@ -175,9 +188,12 @@
 ;; Look up the shell-var struct from scope chain (not value, the struct itself)
 (def (env-get-var env name)
   (let ((var (hash-get (shell-environment-vars env) name)))
-    (if var var
-        (let ((parent (shell-environment-parent env)))
-          (if parent (env-get-var parent name) #f)))))
+    (cond
+      ((and var (eq? (shell-var-value var) +unset-sentinel+)) #f)
+      (var var)
+      (else
+       (let ((parent (shell-environment-parent env)))
+         (if parent (env-get-var parent name) #f))))))
 
 ;; Set a variable — respects scope chain for non-local vars
 ;; Resolves namerefs: if `name` is a nameref, sets the target variable instead.
@@ -243,7 +259,13 @@
     (let ((var (hash-get (shell-environment-vars env) resolved)))
       (when (and var (shell-var-readonly? var))
         (error (format "~a: readonly variable" resolved)))
-      (hash-remove! (shell-environment-vars env) resolved))))
+      ;; Remove from OS environment if it was exported
+      (when (or (and var (shell-var-exported? var))
+                (getenv resolved #f))
+        (ffi-unsetenv resolved))
+      ;; Place sentinel to prevent fallback to parent scope or OS environment
+      (hash-put! (shell-environment-vars env) resolved
+                 (make-shell-var +unset-sentinel+ #f #f #f #f #f #f #f #f #f)))))
 
 ;; Unset a nameref variable itself (not the target) — used by `unset -n`
 (def (env-unset-nameref! env name)
@@ -406,8 +428,29 @@
     (env-set! env "HISTSIZE" "1000"))
   (unless (env-get-local env "HISTFILESIZE")
     (env-set! env "HISTFILESIZE" "2000"))
-  ;; Set PWD
-  (env-set! env "PWD" (current-directory))
+  ;; Set PWD — use inherited PWD if it points to the same directory, else use physical path
+  ;; Strip trailing slash (except for root /)
+  ;; Validate inherited PWD by comparing device+inode to current directory
+  (let* ((inherited-pwd (getenv "PWD" #f))
+         (physical-pwd (let ((p (current-directory)))
+                         (let ((len (string-length p)))
+                           (if (and (> len 1) (char=? (string-ref p (- len 1)) #\/))
+                             (substring p 0 (- len 1))
+                             p))))
+         (valid-inherited?
+          (and inherited-pwd
+               (> (string-length inherited-pwd) 0)
+               (char=? (string-ref inherited-pwd 0) #\/)
+               (with-catch
+                (lambda (e) #f)
+                (lambda ()
+                  (let ((a (file-info inherited-pwd))
+                        (b (file-info physical-pwd)))
+                    (and (= (file-info-device a) (file-info-device b))
+                         (= (file-info-inode a) (file-info-inode b)))))))))
+    (let ((pwd-val (if valid-inherited? inherited-pwd physical-pwd)))
+      (env-set! env "PWD" pwd-val)
+      (*internal-pwd* pwd-val)))
   ;; Set SHLVL
   (let* ((shlvl-str (or (getenv "SHLVL" #f) "0"))
          (shlvl (or (string->number shlvl-str) 0)))
@@ -444,9 +487,12 @@
 
 (def (find-var-in-chain env name)
   (let ((var (hash-get (shell-environment-vars env) name)))
-    (or var
-        (let ((parent (shell-environment-parent env)))
-          (and parent (find-var-in-chain parent name))))))
+    (cond
+      ((and var (eq? (shell-var-value var) +unset-sentinel+)) #f)
+      (var var)
+      (else
+       (let ((parent (shell-environment-parent env)))
+         (and parent (find-var-in-chain parent name)))))))
 
 ;; Get the root (outermost) environment scope
 (def (env-root env)
@@ -457,9 +503,10 @@
 (def (find-var-owner-in-chain env name)
   (and env
        (let ((var (hash-get (shell-environment-vars env) name)))
-         (if var
-           env
-           (find-var-owner-in-chain (shell-environment-parent env) name)))))
+         (cond
+           ((and var (eq? (shell-var-value var) +unset-sentinel+)) #f)
+           (var env)
+           (else (find-var-owner-in-chain (shell-environment-parent env) name))))))
 
 (def (options->flag-string env)
   (let ((flags []))

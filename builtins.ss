@@ -98,33 +98,158 @@
                 (begin (env-set! env var-name output) 0)
                 (begin (display output) (force-output) 0)))))))))
 
-;; cd [-L|-P] [dir]
+;; Helper: strip trailing slash (except for root /)
+(def (strip-trailing-slash path)
+  (let ((len (string-length path)))
+    (if (and (> len 1) (char=? (string-ref path (- len 1)) #\/))
+      (substring path 0 (- len 1))
+      path)))
+
+;; Helper: check if two paths refer to the same directory (by device+inode)
+(def (same-directory? path-a path-b)
+  (with-catch
+   (lambda (e) #f)
+   (lambda ()
+     (let ((a (file-info path-a))
+           (b (file-info path-b)))
+       (and (= (file-info-device a) (file-info-device b))
+            (= (file-info-inode a) (file-info-inode b)))))))
+
+;; Helper: resolve logical path for cd
+;; Given a base (logical pwd) and a relative target, compute the new logical path
+;; Handles ".." by removing last component textually (not resolving symlinks)
+(def (resolve-logical-path base target)
+  (let ((path (if (and (> (string-length target) 0)
+                       (char=? (string-ref target 0) #\/))
+                target  ;; absolute path
+                (string-append (strip-trailing-slash base) "/" target))))
+    ;; Normalize: split on /, resolve . and .., rejoin
+    (let* ((parts (string-split path #\/))
+           (resolved
+            (let loop ((ps parts) (acc []))
+              (cond
+                ((null? ps) (reverse acc))
+                ((string=? (car ps) "") (loop (cdr ps) (if (null? acc) [""] acc)))
+                ((string=? (car ps) ".") (loop (cdr ps) acc))
+                ((string=? (car ps) "..")
+                 (loop (cdr ps)
+                       (if (and (pair? acc) (not (string=? (car acc) "")))
+                         (cdr acc)
+                         acc)))
+                (else (loop (cdr ps) (cons (car ps) acc)))))))
+      (let ((result (string-join resolved "/")))
+        (if (string=? result "") "/" result)))))
+
+;; Helper: search CDPATH for a relative directory
+(def (search-cdpath target env)
+  (let ((cdpath (env-get env "CDPATH")))
+    (if (or (not cdpath) (string=? cdpath "")
+            (and (> (string-length target) 0)
+                 (char=? (string-ref target 0) #\/)))
+      #f  ;; no CDPATH or absolute path
+      (let loop ((dirs (string-split cdpath #\:)))
+        (if (null? dirs) #f
+          (let* ((base (if (string=? (car dirs) "") "." (car dirs)))
+                 (full (string-append (strip-trailing-slash base) "/" target)))
+            (if (file-exists? full)
+              full
+              (loop (cdr dirs)))))))))
+
+;; cd [-L|-P] [--] [dir]
 (builtin-register! "cd"
   (lambda (args env)
-    (let* ((dir (cond
-                  ((null? args) (or (env-get env "HOME") (error "cd: HOME not set")))
-                  ((string=? (car args) "-") (or (env-get env "OLDPWD") (error "cd: OLDPWD not set")))
-                  ((string=? (car args) "-L") (if (pair? (cdr args)) (cadr args) (env-get env "HOME")))
-                  ((string=? (car args) "-P") (if (pair? (cdr args)) (cadr args) (env-get env "HOME")))
-                  (else (car args))))
-           (expanded (expand-word-nosplit dir env)))
-      (with-catch
-       (lambda (e)
-         (fprintf (current-error-port) "cd: ~a: No such file or directory~n" expanded)
-         1)
-       (lambda ()
-         (let ((old-pwd (current-directory)))
-           (current-directory expanded)
-           (env-set! env "OLDPWD" old-pwd)
-           (env-set! env "PWD" (current-directory))
-           (when (string=? (car args) "-")
-             (displayln (current-directory)))
-           0))))))
+    ;; Parse options
+    (let loop ((rest args) (physical? #f))
+      (cond
+        ;; No more options
+        ((or (null? rest)
+             (string=? (car rest) "--")
+             (not (and (> (string-length (car rest)) 0)
+                       (char=? (string-ref (car rest) 0) #\-)))
+             (string=? (car rest) "-"))
+         (let* ((remaining (if (and (pair? rest) (string=? (car rest) "--"))
+                             (cdr rest)
+                             rest))
+                (dir-arg (cond
+                           ((null? remaining)
+                            (let ((home (env-get env "HOME")))
+                              (if (or (not home) (string=? home ""))
+                                (begin
+                                  (fprintf (current-error-port) "cd: HOME not set~n")
+                                  #f)
+                                home)))
+                           ((string=? (car remaining) "-")
+                            (let ((oldpwd (env-get env "OLDPWD")))
+                              (if (not oldpwd)
+                                (begin
+                                  (fprintf (current-error-port) "cd: OLDPWD not set~n")
+                                  #f)
+                                oldpwd)))
+                           (else (car remaining)))))
+           (if (not dir-arg)
+             1
+             (let* ((expanded (expand-word-nosplit dir-arg env))
+                    ;; Try CDPATH for relative paths
+                    (actual-dir (or (and (not (and (> (string-length expanded) 0)
+                                                   (char=? (string-ref expanded 0) #\/)))
+                                        (search-cdpath expanded env))
+                                   expanded))
+                    (print-dir? (or (and (pair? remaining)
+                                        (string=? (car remaining) "-"))
+                                   (and (not (string=? actual-dir expanded))
+                                        ;; CDPATH found a different dir
+                                        #t))))
+               (with-catch
+                (lambda (e)
+                  (fprintf (current-error-port) "cd: ~a: No such file or directory~n" expanded)
+                  1)
+                (lambda ()
+                  (let ((old-pwd (or (*internal-pwd*)
+                                     (strip-trailing-slash
+                                      (or (env-get env "PWD")
+                                          (strip-trailing-slash (current-directory)))))))
+                    (let ((new-pwd (if physical?
+                                     (begin
+                                       (current-directory actual-dir)
+                                       (strip-trailing-slash (current-directory)))
+                                     ;; Logical mode: compute logical path, then chdir to it
+                                     ;; First verify path is reachable physically
+                                     (let ((logical (strip-trailing-slash
+                                                     (resolve-logical-path old-pwd actual-dir))))
+                                       ;; Validate path: try chdir to actual-dir first
+                                       ;; (catches nonexistent components like cd BAD/..)
+                                       (current-directory actual-dir)
+                                       ;; Now chdir to the logical path
+                                       (current-directory logical)
+                                       logical))))
+                      (env-set! env "OLDPWD" old-pwd)
+                      (env-export! env "OLDPWD")
+                      (env-set! env "PWD" new-pwd)
+                      (env-export! env "PWD")
+                      (*internal-pwd* new-pwd)
+                      (when print-dir?
+                        (displayln new-pwd))
+                      0))))))))
+        ;; -L flag: logical (default)
+        ((string=? (car rest) "-L")
+         (loop (cdr rest) #f))
+        ;; -P flag: physical
+        ((string=? (car rest) "-P")
+         (loop (cdr rest) #t))
+        ;; Unknown option - treat as dir
+        (else
+         (loop (cons "--" rest) physical?))))))
 
 ;; pwd [-L|-P]
 (builtin-register! "pwd"
   (lambda (args env)
-    (displayln (current-directory))
+    (let ((physical? (and (pair? args) (string=? (car args) "-P"))))
+      (displayln (strip-trailing-slash
+                  (if physical?
+                    (current-directory)
+                    ;; Logical mode: use internal tracked PWD (not $PWD which user can override)
+                    (or (*internal-pwd*)
+                        (strip-trailing-slash (current-directory)))))))
     0))
 
 ;; export [name[=value] ...]
@@ -1014,7 +1139,9 @@
              (current-directory (expand-word-nosplit dir env))
              (set! (shell-environment-dir-stack env)
                (cons old (shell-environment-dir-stack env)))
-             (env-set! env "PWD" (current-directory))
+             (let ((new-pwd (strip-trailing-slash (current-directory))))
+               (env-set! env "PWD" new-pwd)
+               (*internal-pwd* new-pwd))
              ;; Print stack
              (display (current-directory))
              (for-each (lambda (d) (display " ") (display d))
@@ -1033,7 +1160,9 @@
           (set! (shell-environment-dir-stack env) (cdr stack))
           (current-directory dir)
           (env-set! env "OLDPWD" (env-get env "PWD"))
-          (env-set! env "PWD" (current-directory))
+          (let ((new-pwd (strip-trailing-slash (current-directory))))
+            (env-set! env "PWD" new-pwd)
+            (*internal-pwd* new-pwd))
           (display (current-directory))
           (for-each (lambda (d) (display " ") (display d))
                     (shell-environment-dir-stack env))

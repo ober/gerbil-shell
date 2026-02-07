@@ -11,7 +11,7 @@
             ffi-getegid ffi-access
             ffi-isatty ffi-setsid ffi-pipe-raw ffi-close-fd
             ffi-open-raw ffi-mkfifo ffi-unlink ffi-getpid
-            ffi-read-all-from-fd
+            ffi-read-all-from-fd ffi-unsetenv
             WNOHANG WUNTRACED WCONTINUED
             WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG WIFSTOPPED WSTOPSIG)
 
@@ -186,6 +186,9 @@ END-C
 
   ;; getpid — current process ID
   (define-c-lambda ffi-getpid () int "getpid")
+
+  ;; unsetenv — remove variable from OS environment
+  (define-c-lambda ffi-unsetenv (char-string) int "unsetenv")
 
   ;; Read all bytes from a raw fd into a static buffer.
   ;; Returns the number of bytes read. Use ffi-get-read-buf to retrieve the string.
