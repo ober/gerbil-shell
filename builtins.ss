@@ -55,48 +55,71 @@
 ;; echo [-neE] [args...]
 (builtin-register! "echo"
   (lambda (args env)
+    ;; Parse echo flags: -n, -e, -E, or combinations like -en, -neE
     (let loop ((args args) (newline? #t) (escape? #f))
-      (cond
-        ;; Process flags
-        ((and (pair? args) (string=? (car args) "-n"))
-         (loop (cdr args) #f escape?))
-        ((and (pair? args) (string=? (car args) "-e"))
-         (loop (cdr args) newline? #t))
-        ((and (pair? args) (string=? (car args) "-E"))
-         (loop (cdr args) newline? #f))
-        (else
-         ;; Print arguments
-         (let arg-loop ((rest args) (first? #t))
-           (when (pair? rest)
-             (unless first? (display " "))
-             (if escape?
-               (display (echo-expand-escapes (car rest)))
-               (display (car rest)))
-             (arg-loop (cdr rest) #f)))
-         (when newline? (newline))
-         (force-output)
-         0)))))
+      (if (and (pair? args)
+               (> (string-length (car args)) 1)
+               (char=? (string-ref (car args) 0) #\-)
+               ;; All chars after - must be n, e, or E
+               (let ((s (car args)))
+                 (let valid? ((j 1))
+                   (if (>= j (string-length s)) #t
+                     (let ((c (string-ref s j)))
+                       (and (or (char=? c #\n) (char=? c #\e) (char=? c #\E))
+                            (valid? (+ j 1))))))))
+        ;; Parse flags from this argument
+        (let* ((s (car args))
+               (has-n? (let find ((j 1)) (if (>= j (string-length s)) #f
+                                           (or (char=? (string-ref s j) #\n) (find (+ j 1))))))
+               (has-e? (let find ((j 1)) (if (>= j (string-length s)) #f
+                                           (or (char=? (string-ref s j) #\e) (find (+ j 1))))))
+               (has-E? (let find ((j 1)) (if (>= j (string-length s)) #f
+                                           (or (char=? (string-ref s j) #\E) (find (+ j 1)))))))
+          (loop (cdr args)
+                (if has-n? #f newline?)
+                (cond (has-E? #f) (has-e? #t) (else escape?))))
+        ;; Print arguments (use call/cc for \c early termination)
+        (call/cc
+         (lambda (stop)
+           (let arg-loop ((rest args) (first? #t))
+             (when (pair? rest)
+               (unless first? (display " "))
+               (if escape?
+                 (let ((result (echo-expand-escapes (car rest))))
+                   (display (car result))
+                   (when (cdr result)  ;; \c encountered — stop all output
+                     (force-output)
+                     (stop 0)))
+                 (display (car rest)))
+               (arg-loop (cdr rest) #f)))
+           (when newline? (newline))
+           (force-output)
+           0))))))
 
 ;; printf [-v var] format [args...]
 (builtin-register! "printf"
   (lambda (args env)
     (if (null? args)
-      (begin (fprintf (current-error-port) "printf: usage: printf [-v var] format [arguments]~n") 1)
-      ;; Parse -v option
-      (let-values (((var-name rest-args)
-                    (if (and (>= (length args) 3)
-                             (string=? (car args) "-v"))
-                      (values (cadr args) (cddr args))
-                      (values #f args))))
-        (if (null? rest-args)
-          (begin (fprintf (current-error-port) "printf: usage: printf [-v var] format [arguments]~n") 1)
-          (let ((fmt (car rest-args))
-                (rest (cdr rest-args)))
-            ;; Format with argument recycling: repeat format until all args consumed
-            (let ((output (shell-printf fmt rest)))
-              (if var-name
-                (begin (env-set! env var-name output) 0)
-                (begin (display output) (force-output) 0)))))))))
+      (begin (fprintf (current-error-port) "printf: usage: printf [-v var] format [arguments]~n") 2)
+      ;; Parse -v option and --
+      (let loop ((rest args) (var-name #f))
+        (cond
+          ((null? rest)
+           (begin (fprintf (current-error-port) "printf: usage: printf [-v var] format [arguments]~n") 2))
+          ((string=? (car rest) "--")
+           (loop (cdr rest) var-name))
+          ((and (not var-name)
+                (>= (length rest) 2)
+                (string=? (car rest) "-v"))
+           (loop (cddr rest) (cadr rest)))
+          (else
+           (let ((fmt (car rest))
+                 (fmt-args (cdr rest)))
+             ;; Format with argument recycling: repeat format until all args consumed
+             (let ((output (shell-printf fmt fmt-args)))
+               (if var-name
+                 (begin (env-set! env var-name output) 0)
+                 (begin (display output) (force-output) 0))))))))))
 
 ;; Helper: strip trailing slash (except for root /)
 (def (strip-trailing-slash path)
@@ -1322,12 +1345,13 @@
 
 ;;; --- Helpers ---
 
+;; Returns (cons text stop?) — stop? is #t when \c was encountered
 (def (echo-expand-escapes str)
   (let ((len (string-length str))
         (buf (open-output-string)))
     (let loop ((i 0))
       (cond
-        ((>= i len) (get-output-string buf))
+        ((>= i len) (cons (get-output-string buf) #f))
         ((and (char=? (string-ref str i) #\\) (< (+ i 1) len))
          (let ((next (string-ref str (+ i 1))))
            (case next
@@ -1336,8 +1360,11 @@
              ((#\r) (display "\r" buf) (loop (+ i 2)))
              ((#\a) (display "\a" buf) (loop (+ i 2)))
              ((#\b) (display "\b" buf) (loop (+ i 2)))
+             ((#\e #\E) (display (string (integer->char #x1b)) buf) (loop (+ i 2)))
+             ((#\f) (display "\x0c;" buf) (loop (+ i 2)))
+             ((#\v) (display "\x0b;" buf) (loop (+ i 2)))
              ((#\\) (display "\\" buf) (loop (+ i 2)))
-             ((#\0) ;; Octal
+             ((#\0) ;; \0nnn - octal (up to 3 digits after the 0)
               (let oloop ((j (+ i 2)) (val 0) (count 0))
                 (if (and (< j len) (< count 3)
                          (char>=? (string-ref str j) #\0)
@@ -1347,9 +1374,33 @@
                                          (char->integer #\0)))
                          (+ count 1))
                   (begin
-                    (display (string (integer->char val)) buf)
+                    (display (string (integer->char (modulo val 256))) buf)
                     (loop j)))))
-             ((#\c) (get-output-string buf))  ;; \c = stop output
+             ((#\x) ;; \xHH - hex byte (up to 2 digits)
+              (let hloop ((j (+ i 2)) (val 0) (count 0))
+                (if (and (< j len) (< count 2))
+                  (let ((hv (hex-digit-value (string-ref str j))))
+                    (if hv
+                      (hloop (+ j 1) (+ (* val 16) hv) (+ count 1))
+                      (begin (display (string (integer->char val)) buf) (loop j))))
+                  (begin (display (string (integer->char val)) buf) (loop j)))))
+             ((#\u) ;; \uNNNN - unicode (up to 4 hex digits)
+              (let hloop ((j (+ i 2)) (val 0) (count 0))
+                (if (and (< j len) (< count 4))
+                  (let ((hv (hex-digit-value (string-ref str j))))
+                    (if hv
+                      (hloop (+ j 1) (+ (* val 16) hv) (+ count 1))
+                      (begin (display-unicode-char val buf) (loop j))))
+                  (begin (display-unicode-char val buf) (loop j)))))
+             ((#\U) ;; \UNNNNNNNN - unicode (up to 8 hex digits)
+              (let hloop ((j (+ i 2)) (val 0) (count 0))
+                (if (and (< j len) (< count 8))
+                  (let ((hv (hex-digit-value (string-ref str j))))
+                    (if hv
+                      (hloop (+ j 1) (+ (* val 16) hv) (+ count 1))
+                      (begin (display-unicode-char val buf) (loop j))))
+                  (begin (display-unicode-char val buf) (loop j)))))
+             ((#\c) (cons (get-output-string buf) #t))  ;; \c = stop all output
              (else (display "\\" buf) (display (string next) buf) (loop (+ i 2))))))
         (else
          (display (string-ref str i) buf)
@@ -1412,10 +1463,11 @@
             (else
              ;; Parse width (may be *)
              (let-values (((width i args) (parse-printf-number fmt i args)))
-               ;; Parse precision
+               ;; Parse precision: .N or just . (=0)
                (let-values (((prec i args)
                              (if (and (< i flen) (char=? (string-ref fmt i) #\.))
-                               (parse-printf-number fmt (+ i 1) args)
+                               (let-values (((p j a) (parse-printf-number fmt (+ i 1) args)))
+                                 (values (or p 0) j a))  ;; . alone means precision 0
                                (values #f i args))))
                  ;; Conversion specifier
                  (if (>= i flen)
@@ -1432,35 +1484,72 @@
                                (s (if prec (substring s 0 (min prec (string-length s))) s)))
                           (display (pad-string s (or width 0) left-align? #\space) buf)
                           (values (+ i 1) rest)))
-                       ;; %d %i - decimal integer
+                       ;; %d %i - signed decimal integer
                        ((#\d #\i)
                         (let* ((n (string->integer-safe arg))
-                               (s (number->string n))
-                               (s (if (and plus-sign? (>= n 0)) (string-append "+" s) s))
-                               (s (if (and space-sign? (>= n 0) (not plus-sign?))
+                               (neg? (< n 0))
+                               (digits (number->string (abs n)))
+                               ;; Precision: minimum number of digits (zero-pad)
+                               (digits (if (and prec (> prec (string-length digits)))
+                                         (string-append (make-string (- prec (string-length digits)) #\0)
+                                                        digits)
+                                         digits))
+                               ;; Precision of 0 with value 0 produces empty string
+                               (digits (if (and prec (= prec 0) (= n 0)) "" digits))
+                               (s (if neg? (string-append "-" digits) digits))
+                               (s (if (and plus-sign? (not neg?)) (string-append "+" s) s))
+                               (s (if (and space-sign? (not neg?) (not plus-sign?))
                                     (string-append " " s) s))
-                               (pad-ch (if (and zero-pad? (not left-align?)) #\0 #\space)))
+                               ;; Zero-pad only when no precision specified
+                               (pad-ch (if (and zero-pad? (not left-align?) (not prec)) #\0 #\space)))
                           (display (pad-string s (or width 0) left-align? pad-ch) buf)
+                          (values (+ i 1) rest)))
+                       ;; %u - unsigned decimal integer
+                       ((#\u)
+                        (let* ((n (string->integer-safe arg))
+                               ;; Two's complement for negative numbers (64-bit)
+                               (n (if (< n 0) (+ (expt 2 64) n) n))
+                               (digits (number->string n))
+                               (digits (if (and prec (> prec (string-length digits)))
+                                         (string-append (make-string (- prec (string-length digits)) #\0)
+                                                        digits)
+                                         digits))
+                               (digits (if (and prec (= prec 0) (= n 0)) "" digits))
+                               (pad-ch (if (and zero-pad? (not left-align?) (not prec)) #\0 #\space)))
+                          (display (pad-string digits (or width 0) left-align? pad-ch) buf)
                           (values (+ i 1) rest)))
                        ;; %o - octal
                        ((#\o)
                         (let* ((n (string->integer-safe arg))
-                               (s (number->string (abs n) 8))
-                               (s (if (< n 0) (string-append "-" s) s))
-                               (s (if (and alt-form? (not (string=? s "0")))
-                                    (string-append "0" s) s))
-                               (pad-ch (if (and zero-pad? (not left-align?)) #\0 #\space)))
+                               ;; Two's complement for negative numbers (64-bit)
+                               (n (if (< n 0) (+ (expt 2 64) n) n))
+                               (digits (number->string n 8))
+                               (digits (if (and prec (> prec (string-length digits)))
+                                         (string-append (make-string (- prec (string-length digits)) #\0)
+                                                        digits)
+                                         digits))
+                               (digits (if (and prec (= prec 0) (= n 0)) "" digits))
+                               (s (if (and alt-form? (not (string=? digits ""))
+                                           (not (char=? (string-ref digits 0) #\0)))
+                                    (string-append "0" digits) digits))
+                               (pad-ch (if (and zero-pad? (not left-align?) (not prec)) #\0 #\space)))
                           (display (pad-string s (or width 0) left-align? pad-ch) buf)
                           (values (+ i 1) rest)))
                        ;; %x %X - hexadecimal
                        ((#\x #\X)
                         (let* ((n (string->integer-safe arg))
-                               (raw (number->string (abs n) 16))
+                               ;; Two's complement for negative numbers (64-bit)
+                               (n (if (< n 0) (+ (expt 2 64) n) n))
+                               (raw (number->string n 16))
                                (raw (if (char=? spec #\X) (string-upcase raw) raw))
-                               (s (if (< n 0) (string-append "-" raw) raw))
+                               (digits (if (and prec (> prec (string-length raw)))
+                                         (string-append (make-string (- prec (string-length raw)) #\0)
+                                                        raw)
+                                         raw))
+                               (digits (if (and prec (= prec 0) (= n 0)) "" digits))
                                (s (if (and alt-form? (not (= n 0)))
-                                    (string-append (if (char=? spec #\X) "0X" "0x") s) s))
-                               (pad-ch (if (and zero-pad? (not left-align?)) #\0 #\space)))
+                                    (string-append (if (char=? spec #\X) "0X" "0x") digits) digits))
+                               (pad-ch (if (and zero-pad? (not left-align?) (not prec)) #\0 #\space)))
                           (display (pad-string s (or width 0) left-align? pad-ch) buf)
                           (values (+ i 1) rest)))
                        ;; %c - character (first char of arg)
@@ -1476,8 +1565,8 @@
                        ((#\q)
                         (display (shell-quote-string (if (string? arg) arg "")) buf)
                         (values (+ i 1) rest))
-                       ;; %f %e %g - floating point
-                       ((#\f #\e #\g #\E #\G)
+                       ;; %f %e %g and uppercase variants - floating point
+                       ((#\f #\F #\e #\g #\E #\G)
                         (let* ((n (string->number-safe arg))
                                (p (or prec 6))
                                (s (format-float n spec p)))
@@ -1509,6 +1598,20 @@
             (values (if found? n #f) j args)))))))
 
 ;; Process a printf backslash escape
+;; Helper: convert hex digit char to its integer value, or #f
+(def (hex-digit-value ch)
+  (cond
+    ((and (char>=? ch #\0) (char<=? ch #\9)) (- (char->integer ch) 48))
+    ((and (char>=? ch #\a) (char<=? ch #\f)) (- (char->integer ch) 87))
+    ((and (char>=? ch #\A) (char<=? ch #\F)) (- (char->integer ch) 55))
+    (else #f)))
+
+;; Helper: display a unicode code point as UTF-8
+(def (display-unicode-char n buf)
+  (if (and (>= n 0) (<= n #x10FFFF))
+    (display (string (integer->char n)) buf)
+    (display (string (integer->char #xFFFD)) buf)))  ;; replacement char for invalid
+
 (def (printf-escape fmt i buf)
   (let ((flen (string-length fmt)))
     (if (>= i flen)
@@ -1535,7 +1638,9 @@
                           (+ (* n 8) (- (char->integer (string-ref fmt j)) 48))
                           (+ count 1))
                (begin (display (string (integer->char n)) buf) j))))
-          ;; \xHH - hex
+          ;; \e / \E - escape (0x1b)
+          ((#\e #\E) (display (string (integer->char #x1b)) buf) (+ i 1))
+          ;; \xHH - hex byte
           ((#\x)
            (let hex-loop ((j (+ i 1)) (n 0) (count 0))
              (if (and (< j flen) (< count 2))
@@ -1549,6 +1654,28 @@
                     (hex-loop (+ j 1) (+ (* n 16) (- (char->integer hch) 55)) (+ count 1)))
                    (else (display (string (integer->char n)) buf) j)))
                (begin (display (string (integer->char n)) buf) j))))
+          ;; \uNNNN - unicode (4 hex digits)
+          ((#\u)
+           (let hex-loop ((j (+ i 1)) (n 0) (count 0))
+             (if (and (< j flen) (< count 4))
+               (let* ((hch (string-ref fmt j))
+                      (hv (hex-digit-value hch)))
+                 (if hv
+                   (hex-loop (+ j 1) (+ (* n 16) hv) (+ count 1))
+                   (begin (display-unicode-char n buf) j)))
+               (begin (display-unicode-char n buf) j))))
+          ;; \UNNNNNNNN - unicode (8 hex digits)
+          ((#\U)
+           (let hex-loop ((j (+ i 1)) (n 0) (count 0))
+             (if (and (< j flen) (< count 8))
+               (let* ((hch (string-ref fmt j))
+                      (hv (hex-digit-value hch)))
+                 (if hv
+                   (hex-loop (+ j 1) (+ (* n 16) hv) (+ count 1))
+                   (begin (display-unicode-char n buf) j)))
+               (begin (display-unicode-char n buf) j))))
+          ;; \c - stop output (only used in %b context, but handle here too)
+          ((#\c) (+ i 1))  ;; caller should check for this
           (else (display "\\" buf) (display (string ch) buf) (+ i 1)))))))
 
 ;; Interpret backslash escapes in a string (for %b)
@@ -1582,26 +1709,43 @@
                           (substring s 1 (string-length s)))
             (string-append padding s)))))))
 
-;; Convert string to integer safely (handles 0x, 0, 'c' char literal)
+;; Convert string to integer safely (handles 0x, 0, 'c' char literal, +prefix, leading spaces)
 (def (string->integer-safe s)
-  (cond
-    ((not (string? s)) 0)
-    ((string=? s "") 0)
-    ;; Character literal: 'c or "c → ASCII value
-    ((and (>= (string-length s) 2)
-          (or (char=? (string-ref s 0) #\')
-              (char=? (string-ref s 0) #\")))
-     (char->integer (string-ref s 1)))
-    ;; Hex: 0x...
-    ((and (>= (string-length s) 2)
-          (char=? (string-ref s 0) #\0)
-          (or (char=? (string-ref s 1) #\x)
-              (char=? (string-ref s 1) #\X)))
-     (or (string->number (substring s 2 (string-length s)) 16) 0))
-    ;; Octal: 0...
-    ((and (> (string-length s) 1) (char=? (string-ref s 0) #\0))
-     (or (string->number s 8) (or (string->number s) 0)))
-    (else (or (string->number s) 0))))
+  (if (or (not (string? s)) (string=? s ""))
+    0
+    ;; Strip leading whitespace
+    (let* ((s (let trim ((i 0))
+               (if (and (< i (string-length s))
+                        (or (char=? (string-ref s i) #\space)
+                            (char=? (string-ref s i) #\tab)))
+                 (trim (+ i 1))
+                 (substring s i (string-length s))))))
+      (cond
+        ((string=? s "") 0)
+        ;; Character literal: 'c or "c -> ASCII value
+        ((and (>= (string-length s) 2)
+              (or (char=? (string-ref s 0) #\')
+                  (char=? (string-ref s 0) #\")))
+         (char->integer (string-ref s 1)))
+        (else
+         ;; Handle optional sign prefix
+         (let* ((neg? (and (> (string-length s) 0) (char=? (string-ref s 0) #\-)))
+                (pos? (and (> (string-length s) 0) (char=? (string-ref s 0) #\+)))
+                (s2 (if (or neg? pos?) (substring s 1 (string-length s)) s)))
+           (let ((val
+                  (cond
+                    ((string=? s2 "") 0)
+                    ;; Hex: 0x...
+                    ((and (>= (string-length s2) 2)
+                          (char=? (string-ref s2 0) #\0)
+                          (or (char=? (string-ref s2 1) #\x)
+                              (char=? (string-ref s2 1) #\X)))
+                     (or (string->number (substring s2 2 (string-length s2)) 16) 0))
+                    ;; Octal: 0...
+                    ((and (> (string-length s2) 1) (char=? (string-ref s2 0) #\0))
+                     (or (string->number s2 8) (or (string->number s2) 0)))
+                    (else (or (string->number s2) 0)))))
+             (if neg? (- val) val))))))))
 
 ;; Convert string to float safely
 (def (string->number-safe s)
