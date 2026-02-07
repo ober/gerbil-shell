@@ -177,3 +177,14 @@
    (lambda ()
      (let ((n (string->number str)))
        (and (integer? n) (exact? n) n)))))
+
+(def (string-upcase str)
+  (list->string (map char-upcase (string->list str))))
+
+(def (string-downcase str)
+  (list->string (map char-downcase (string->list str))))
+
+(def (hex-char? ch)
+  (or (and (char>=? ch #\0) (char<=? ch #\9))
+      (and (char>=? ch #\a) (char<=? ch #\f))
+      (and (char>=? ch #\A) (char<=? ch #\F))))

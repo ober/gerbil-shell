@@ -6,9 +6,10 @@
 (import :std/foreign)
 
 (begin-ffi (ffi-waitpid-pid ffi-waitpid-status
-            ffi-dup2 ffi-setpgid ffi-getpgid
+            ffi-dup ffi-dup2 ffi-setpgid ffi-getpgid
             ffi-tcsetpgrp ffi-tcgetpgrp ffi-umask ffi-getuid ffi-geteuid
-            ffi-isatty ffi-setsid ffi-pipe-raw
+            ffi-isatty ffi-setsid ffi-pipe-raw ffi-close-fd
+            ffi-open-raw
             WNOHANG WUNTRACED WCONTINUED
             WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG WIFSTOPPED WSTOPSIG)
 
@@ -17,6 +18,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <errno.h>
 
 /* We need to store the last waitpid result since we can't easily
@@ -81,8 +83,14 @@ END-C
   (define (ffi-waitpid-status)
     (_ffi_get_waitpid_status))
 
+  ;; dup — duplicate fd, returns new fd (next available)
+  (define-c-lambda ffi-dup (int) int "dup")
+
   ;; dup2 — duplicate fd onto target fd
   (define-c-lambda ffi-dup2 (int int) int "dup2")
+
+  ;; close — close a raw file descriptor
+  (define-c-lambda ffi-close-fd (int) int "close")
 
   ;; Process group management
   (define-c-lambda ffi-setpgid (int int) int "setpgid")
@@ -104,6 +112,10 @@ END-C
 
   ;; Session management
   (define-c-lambda ffi-setsid () int "setsid")
+
+  ;; Raw open — open a file and return raw fd
+  ;; flags: O_RDONLY=0, O_WRONLY=1, O_RDWR=2, O_CREAT=64, O_TRUNC=512, O_APPEND=1024
+  (define-c-lambda ffi-open-raw (char-string int int) int "open")
 
   ;; Raw pipe — returns 0 on success, -1 on error
   ;; After calling, retrieve fds with ffi-pipe-read-fd / ffi-pipe-write-fd

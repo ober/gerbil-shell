@@ -42,7 +42,7 @@
 
 ;;; --- Redirections ---
 (defstruct redir (op fd target) transparent: #t)
-;; op: '< '> '>> '>| '<< '<<- '<<< '<> '>& '<& '&> '&>>
+;; op: '< '> '>> 'clobber '<< '<<- '<<< '<> '>& '<& '&> '&>>
 ;; fd: integer or #f (default)
 ;; target: string (word) or heredoc-body string
 

@@ -3,11 +3,34 @@
 (export #t)
 (import :std/sugar
         :std/iter
+        :std/format
         :std/misc/hash
         :gsh/ffi)
 
+;;; --- Callback parameter for execute-input ---
+;;; Breaks circular dependency: builtins.ss and expander.ss need to call
+;;; execute-input (defined in main.ss), but main.ss imports them.
+;;; Solution: store it as a parameter, set it from main.ss at startup.
+(def *execute-input* (make-parameter #f))
+
+;;; --- Callback parameter for arithmetic evaluation ---
+;;; Used by apply-var-attrs when integer attribute is set.
+;;; Set from main.ss at startup to arith-eval.
+(def *arith-eval-fn* (make-parameter #f))
+
+;;; --- Condition context for errexit suppression ---
+;;; When #t, errexit (set -e) does not trigger on command failure.
+;;; Set to #t in: if-test, while/until-test, && / || LHS, ! prefix.
+(def *in-condition-context* (make-parameter #f))
+
+;;; --- Subshell context ---
+;;; When #t, `exit` raises an exception instead of terminating the process.
+(def *in-subshell* (make-parameter #f))
+
 ;;; --- Shell variable ---
-(defstruct shell-var (value exported? readonly? local?) transparent: #t)
+;; Attributes: exported?, readonly?, local?, integer?, uppercase?, lowercase?, nameref?
+(defstruct shell-var (value exported? readonly? local?
+                      integer? uppercase? lowercase? nameref?) transparent: #t)
 
 ;;; --- Shell environment ---
 (defclass shell-environment (vars        ;; hash-table: name -> shell-var
@@ -33,19 +56,19 @@
   (lambda (self parent: (parent #f) name: (name "gsh"))
     (set! self.vars (make-hash-table))
     (set! self.parent parent)
-    (set! self.functions (if parent parent.functions (make-hash-table)))
-    (set! self.aliases (if parent parent.aliases (make-hash-table)))
-    (set! self.options (if parent parent.options (make-hash-table)))
-    (set! self.shopts (if parent parent.shopts (make-hash-table)))
-    (set! self.positional (if parent parent.positional (vector)))
+    (set! self.functions (if parent (shell-environment-functions parent) (make-hash-table)))
+    (set! self.aliases (if parent (shell-environment-aliases parent) (make-hash-table)))
+    (set! self.options (if parent (shell-environment-options parent) (make-hash-table)))
+    (set! self.shopts (if parent (shell-environment-shopts parent) (make-hash-table)))
+    (set! self.positional (if parent (shell-environment-positional parent) (vector)))
     (set! self.last-status 0)
     (set! self.last-bg-pid 0)
-    (set! self.shell-pid (if parent parent.shell-pid (##os-getpid)))
+    (set! self.shell-pid (if parent (shell-environment-shell-pid parent) (##os-getpid)))
     (set! self.shell-name name)
-    (set! self.start-time (if parent parent.start-time (time->seconds (current-time))))
-    (set! self.cmd-number (if parent parent.cmd-number 0))
-    (set! self.traps (if parent parent.traps (make-hash-table)))
-    (set! self.dir-stack (if parent parent.dir-stack []))))
+    (set! self.start-time (if parent (shell-environment-start-time parent) (time->seconds (current-time))))
+    (set! self.cmd-number (if parent (shell-environment-cmd-number parent) 0))
+    (set! self.traps (if parent (shell-environment-traps parent) (make-hash-table)))
+    (set! self.dir-stack (if parent (shell-environment-dir-stack parent) []))))
 
 ;;; --- Variable operations ---
 
@@ -93,27 +116,77 @@
           ;; Fall back to OS environment
           (getenv name #f))))))
 
-;; Set a variable
+;; Apply variable attributes (integer, uppercase, lowercase) to a value
+;; env is optional — when provided, arithmetic evaluation can reference variables
+(def (apply-var-attrs var value (env #f))
+  (let ((v (if (shell-var-integer? var)
+             (let ((arith-fn (*arith-eval-fn*)))
+               (if arith-fn
+                 ;; Use arithmetic evaluation (handles expressions like "2+3")
+                 (number->string
+                  (arith-fn value
+                            (if env
+                              (lambda (name) (or (string->number (or (env-get env name) "0")) 0))
+                              (lambda (name) (or (string->number (or name "0")) 0)))
+                            (if env
+                              (lambda (name val) (env-set! env name (number->string val)))
+                              (lambda (name val) #!void))))
+                 ;; Fallback: simple string->number
+                 (let ((n (or (string->number value) 0)))
+                   (number->string n))))
+             value)))
+    (cond
+      ((shell-var-uppercase? var) (string-upcase v))
+      ((shell-var-lowercase? var) (string-downcase v))
+      (else v))))
+
+;; Look up the shell-var struct from scope chain (not value, the struct itself)
+(def (env-get-var env name)
+  (let ((var (hash-get (shell-environment-vars env) name)))
+    (if var var
+        (let ((parent (shell-environment-parent env)))
+          (if parent (env-get-var parent name) #f)))))
+
+;; Set a variable — respects scope chain for non-local vars
 (def (env-set! env name value)
   (let ((existing (hash-get (shell-environment-vars env) name)))
     (cond
       ((and existing (shell-var-readonly? existing))
        (error (format "~a: readonly variable" name)))
       (existing
-       (set! (shell-var-value existing) value)
-       ;; If exported, also update OS env
-       (when (shell-var-exported? existing)
-         (setenv name value)))
+       (let ((final-value (apply-var-attrs existing value env)))
+         (set! (shell-var-value existing) final-value)
+         ;; If exported, also update OS env
+         (when (shell-var-exported? existing)
+           (setenv name final-value))))
       (else
-       (let ((parent-var (find-var-in-chain env name)))
-         (if (and parent-var (shell-var-exported? parent-var))
-           ;; Inherit exported status
-           (begin
-             (hash-put! (shell-environment-vars env) name
-                        (make-shell-var value #t #f #f))
-             (setenv name value))
-           (hash-put! (shell-environment-vars env) name
-                      (make-shell-var value #f #f #f))))))))
+       ;; Not in local scope — check parent chain
+       (let ((owner (find-var-owner-in-chain (shell-environment-parent env) name)))
+         (if owner
+           ;; Variable exists in an ancestor scope — modify it there
+           (let ((parent-var (hash-get (shell-environment-vars owner) name)))
+             (when (and parent-var (shell-var-readonly? parent-var))
+               (error (format "~a: readonly variable" name)))
+             (let ((final-value (apply-var-attrs parent-var value env)))
+               (set! (shell-var-value parent-var) final-value)
+               (when (shell-var-exported? parent-var)
+                 (setenv name final-value))))
+           ;; Variable doesn't exist anywhere in the chain
+           ;; Create in ROOT scope (bash behavior: vars in functions are global)
+           (let* ((root (env-root env))
+                  (os-val (getenv name #f)))
+             (if os-val
+               ;; Exists in OS env — create as exported
+               (begin
+                 (hash-put! (shell-environment-vars root) name
+                            (make-shell-var value #t #f #f #f #f #f #f))
+                 (setenv name value))
+               (hash-put! (shell-environment-vars root) name
+                          (make-shell-var value #f #f #f #f #f #f #f))))))))))
+
+;; Set the shell name ($0)
+(def (env-set-shell-name! env name)
+  (shell-environment-shell-name-set! env name))
 
 ;; Mark variable as exported
 (def (env-export! env name (value #f))
@@ -126,7 +199,7 @@
       ;; Create empty exported variable
       (when value
         (hash-put! (shell-environment-vars env) name
-                   (make-shell-var value #t #f #f))
+                   (make-shell-var value #t #f #f #f #f #f #f))
         (setenv name value)))))
 
 ;; Unset a variable
@@ -166,6 +239,48 @@
 ;; Push a new scope (for function calls)
 (def (env-push-scope env)
   (make-shell-environment parent: env name: (shell-environment-shell-name env)))
+
+;; Deep clone an environment (for subshells)
+;; Creates a fully independent copy — mutations don't affect the original.
+(def (env-clone env)
+  (let ((clone (make-shell-environment name: (shell-environment-shell-name env))))
+    ;; Deep copy all hash tables so mutations are isolated
+    (set! (shell-environment-vars clone) (clone-var-table env))
+    (set! (shell-environment-functions clone) (hash-copy (shell-environment-functions env)))
+    (set! (shell-environment-aliases clone) (hash-copy (shell-environment-aliases env)))
+    (set! (shell-environment-options clone) (hash-copy (shell-environment-options env)))
+    (set! (shell-environment-shopts clone) (hash-copy (shell-environment-shopts env)))
+    (set! (shell-environment-positional clone) (vector-copy (shell-environment-positional env)))
+    (set! (shell-environment-last-status clone) (shell-environment-last-status env))
+    (set! (shell-environment-last-bg-pid clone) (shell-environment-last-bg-pid env))
+    (set! (shell-environment-shell-pid clone) (shell-environment-shell-pid env))
+    (set! (shell-environment-start-time clone) (shell-environment-start-time env))
+    (set! (shell-environment-cmd-number clone) (shell-environment-cmd-number env))
+    (set! (shell-environment-traps clone) (hash-copy (shell-environment-traps env)))
+    (set! (shell-environment-dir-stack clone) (shell-environment-dir-stack env))
+    clone))
+
+;; Clone the var table from full scope chain into a flat hash table
+(def (clone-var-table env)
+  (let ((result (make-hash-table)))
+    (clone-vars-from-chain! env result)
+    result))
+
+(def (clone-vars-from-chain! env target)
+  (let ((parent (shell-environment-parent env)))
+    (when parent (clone-vars-from-chain! parent target)))
+  (hash-for-each
+   (lambda (name var)
+     (hash-put! target name
+                (make-shell-var (shell-var-value var)
+                                (shell-var-exported? var)
+                                (shell-var-readonly? var)
+                                (shell-var-local? var)
+                                (shell-var-integer? var)
+                                (shell-var-uppercase? var)
+                                (shell-var-lowercase? var)
+                                (shell-var-nameref? var))))
+   (shell-environment-vars env)))
 
 ;; Pop back to parent scope
 (def (env-pop-scope env)
@@ -226,7 +341,7 @@
   (for-each
    (lambda (pair)
      (hash-put! (shell-environment-vars env) (car pair)
-                (make-shell-var (cdr pair) #t #f #f)))
+                (make-shell-var (cdr pair) #t #f #f #f #f #f #f)))
    (get-environment-variables))
   ;; Set defaults if not present
   (unless (env-get-local env "IFS")
@@ -283,6 +398,19 @@
     (or var
         (let ((parent (shell-environment-parent env)))
           (and parent (find-var-in-chain parent name))))))
+
+;; Get the root (outermost) environment scope
+(def (env-root env)
+  (let ((parent (shell-environment-parent env)))
+    (if parent (env-root parent) env)))
+
+;; Find the environment scope that owns a variable (for setting in parent chain)
+(def (find-var-owner-in-chain env name)
+  (and env
+       (let ((var (hash-get (shell-environment-vars env) name)))
+         (if var
+           env
+           (find-var-owner-in-chain (shell-environment-parent env) name)))))
 
 (def (options->flag-string env)
   (let ((flags []))

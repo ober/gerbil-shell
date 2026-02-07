@@ -1,0 +1,169 @@
+;;; signals.ss — Signal handling and traps for gsh
+
+(export #t)
+(import :std/sugar
+        :std/format
+        :std/sort
+        :std/os/signal
+        :std/os/signal-handler
+        :gsh/ffi
+        :gsh/util)
+
+;;; --- Trap table ---
+;; Maps signal names to actions:
+;;   string -> command to execute
+;;   'ignore -> ignore the signal
+;;   'default -> restore default behavior
+
+(defstruct trap-entry (signal action) transparent: #t)
+
+;; Global trap table (managed by the shell environment)
+(def *trap-table* (make-hash-table))
+
+;; Well-known signal name -> number mapping
+(def *signal-names*
+  (hash
+   ("HUP"    SIGHUP)
+   ("INT"    SIGINT)
+   ("QUIT"   SIGQUIT)
+   ("ILL"    SIGILL)
+   ("TRAP"   SIGTRAP)
+   ("ABRT"   SIGABRT)
+   ("FPE"    SIGFPE)
+   ("KILL"   SIGKILL)
+   ("SEGV"   SIGSEGV)
+   ("PIPE"   SIGPIPE)
+   ("ALRM"   SIGALRM)
+   ("TERM"   SIGTERM)
+   ("USR1"   SIGUSR1)
+   ("USR2"   SIGUSR2)
+   ("CHLD"   SIGCHLD)
+   ("CONT"   SIGCONT)
+   ("STOP"   SIGSTOP)
+   ("TSTP"   SIGTSTP)
+   ("TTIN"   SIGTTIN)
+   ("TTOU"   SIGTTOU)
+   ("WINCH"  SIGWINCH)))
+
+;; Pseudo-signals (not real OS signals)
+(def *pseudo-signals* '("EXIT" "DEBUG" "RETURN" "ERR"))
+
+;; Convert signal name to number (or #f for pseudo/unknown)
+(def (signal-name->number name)
+  (let ((uname (string-upcase name)))
+    ;; Strip SIG prefix if present
+    (let ((stripped (if (and (> (string-length uname) 3)
+                             (string=? (substring uname 0 3) "SIG"))
+                     (substring uname 3 (string-length uname))
+                     uname)))
+      (hash-get *signal-names* stripped))))
+
+;; Convert signal number to name
+(def (signal-number->name num)
+  (let ((result #f))
+    (hash-for-each
+     (lambda (name sig)
+       (when (= sig num)
+         (set! result name)))
+     *signal-names*)
+    result))
+
+;;; --- Trap operations ---
+
+;; Set a trap for a signal
+;; action: string (command), "" or 'ignore (ignore), 'default or #f (reset)
+(def (trap-set! signal-name action)
+  (let ((uname (string-upcase
+                (if (and (> (string-length signal-name) 3)
+                         (string=? (substring signal-name 0 3) "SIG"))
+                  (substring signal-name 3 (string-length signal-name))
+                  signal-name))))
+    (cond
+      ;; Reset to default
+      ((or (eq? action 'default) (not action) (string=? (if (string? action) action "") "-"))
+       (hash-remove! *trap-table* uname)
+       (let ((signum (signal-name->number uname)))
+         (when signum
+           (remove-signal-handler! signum))))
+      ;; Ignore signal
+      ((or (eq? action 'ignore) (and (string? action) (string=? action "")))
+       (hash-put! *trap-table* uname 'ignore)
+       (let ((signum (signal-name->number uname)))
+         (when signum
+           (add-signal-handler! signum (lambda () #!void)))))
+      ;; Set command handler
+      ((string? action)
+       (hash-put! *trap-table* uname action)
+       ;; For real signals, install a handler that flags for later execution
+       (let ((signum (signal-name->number uname)))
+         (when signum
+           (add-signal-handler! signum
+             (lambda ()
+               ;; The actual command execution happens in the main loop
+               ;; Here we just record that the signal was received
+               (set! *pending-signals* (cons uname *pending-signals*)))))))
+      (else
+       (error (format "trap: invalid action: ~a" action))))))
+
+;; Get the trap action for a signal
+(def (trap-get signal-name)
+  (let ((uname (string-upcase
+                (if (and (> (string-length signal-name) 3)
+                         (string=? (substring signal-name 0 3) "SIG"))
+                  (substring signal-name 3 (string-length signal-name))
+                  signal-name))))
+    (hash-get *trap-table* uname)))
+
+;; List all traps as alist of (signal-name . action)
+(def (trap-list)
+  (hash->list *trap-table*))
+
+;;; --- Pending signal queue ---
+
+(def *pending-signals* [])
+
+;; Check and clear pending signals, return list of signal names
+(def (pending-signals!)
+  (let ((pending *pending-signals*))
+    (set! *pending-signals* [])
+    (reverse pending)))
+
+;;; --- Default signal setup for interactive shell ---
+
+(def (setup-default-signal-handlers!)
+  ;; SIGINT: interrupt current command
+  (add-signal-handler! SIGINT
+    (lambda ()
+      (set! *pending-signals* (cons "INT" *pending-signals*))))
+  ;; SIGQUIT: ignore in interactive mode
+  (add-signal-handler! SIGQUIT (lambda () #!void))
+  ;; SIGTERM: flag for exit
+  (add-signal-handler! SIGTERM
+    (lambda ()
+      (set! *pending-signals* (cons "TERM" *pending-signals*))))
+  ;; SIGTSTP: ignore for the shell itself (children get it)
+  (add-signal-handler! SIGTSTP (lambda () #!void))
+  ;; SIGPIPE: ignore (let write fail with error)
+  (add-signal-handler! SIGPIPE (lambda () #!void))
+  ;; SIGWINCH: record for terminal resize
+  (add-signal-handler! SIGWINCH
+    (lambda ()
+      (set! *pending-signals* (cons "WINCH" *pending-signals*))))
+  ;; SIGCHLD: record for job status updates
+  (add-signal-handler! SIGCHLD
+    (lambda ()
+      (set! *pending-signals* (cons "CHLD" *pending-signals*)))))
+
+;;; --- Signal context for command execution ---
+
+;; Run a thunk with appropriate signal handling for foreground command execution
+(def (with-signal-context thunk)
+  ;; Clear pending signals before running
+  (set! *pending-signals* [])
+  (thunk))
+
+;;; --- Utility ---
+
+;; List all known signal names
+(def (signal-name-list)
+  (sort! (hash-keys *signal-names*) string<?))
