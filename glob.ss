@@ -9,37 +9,60 @@
 ;;; --- Public interface ---
 
 ;; Check if a string contains unquoted glob metacharacters
-(def (glob-pattern? str)
-  (let loop ((i 0) (escaped? #f))
-    (if (>= i (string-length str))
-      #f
-      (let ((ch (string-ref str i)))
-        (cond
-          (escaped? (loop (+ i 1) #f))
-          ((char=? ch #\\) (loop (+ i 1) #t))
-          ((or (char=? ch #\*) (char=? ch #\?) (char=? ch #\[))
-           #t)
-          (else (loop (+ i 1) #f)))))))
+;; When extglob? is true, also detects ?(, *(, +(, @(, !( patterns
+(def (glob-pattern? str (extglob? #f))
+  (let ((len (string-length str)))
+    (let loop ((i 0) (escaped? #f))
+      (if (>= i len)
+        #f
+        (let ((ch (string-ref str i)))
+          (cond
+            (escaped? (loop (+ i 1) #f))
+            ((char=? ch #\\) (loop (+ i 1) #t))
+            ((or (char=? ch #\*) (char=? ch #\?) (char=? ch #\[))
+             #t)
+            ;; Extended glob: ?( *( +( @( !(
+            ((and extglob?
+                  (< (+ i 1) len)
+                  (char=? (string-ref str (+ i 1)) #\()
+                  (or (char=? ch #\?) (char=? ch #\*) (char=? ch #\+)
+                      (char=? ch #\@) (char=? ch #\!)))
+             #t)
+            (else (loop (+ i 1) #f))))))))
 
 ;; Match a glob pattern against a string
 ;; Returns #t if the string matches the pattern
-(def (glob-match? pattern string)
-  (let ((rx (glob-pattern->pregexp pattern)))
+;; When path-mode? is #t (default), * and ? don't match /
+;; When path-mode? is #f, * and ? match any character (for [[ ]] pattern matching)
+(def (glob-match? pattern string (path-mode? #t) (extglob? #f))
+  (let ((rx (glob-pattern->pregexp pattern path-mode? extglob?)))
     (and (pregexp-match rx string) #t)))
 
 ;; Expand a glob pattern to a sorted list of matching file paths
-;; Returns the original pattern (as a list) if no matches
-(def (glob-expand pattern)
-  (let ((matches (glob-expand-path pattern)))
-    (if (null? matches)
-      [pattern]  ;; no match: return pattern literally
-      (sort matches string<?))))
+;; Returns the original pattern (as a list) if no matches (unless nullglob/failglob)
+;; Options: dotglob? — include dotfiles, nullglob? — return empty on no match,
+;;          failglob? — error on no match, nocase? — case-insensitive
+(def (glob-expand pattern
+                   dotglob?: (dotglob? #f)
+                   nullglob?: (nullglob? #f)
+                   failglob?: (failglob? #f)
+                   nocase?: (nocase? #f)
+                   extglob?: (extglob? #f))
+  (let ((matches (glob-expand-path pattern dotglob? nocase? extglob?)))
+    (cond
+      ((pair? matches) (sort matches string<?))
+      (failglob?
+       (raise (cons 'failglob pattern)))
+      (nullglob? [])
+      (else [pattern]))))
 
 ;;; --- Glob-to-regex conversion ---
 
 ;; Convert a glob pattern to a pregexp string
-(def (glob-pattern->pregexp pattern)
-  (let ((rx (open-output-string)))
+;; When extglob? is true, recognizes ?(pat|pat) *(pat|pat) +(pat|pat) @(pat|pat) !(pat|pat)
+(def (glob-pattern->pregexp pattern (path-mode? #t) (extglob? #f))
+  (let ((rx (open-output-string))
+        (len (string-length pattern)))
     (display "^" rx)
     (let loop ((i 0) (in-bracket? #f))
       (if (>= i (string-length pattern))
@@ -57,6 +80,23 @@
                 ;; [! at start of bracket = negation
                 (display "^" rx)
                 (loop (+ i 1) #t))
+               ;; POSIX character class [:name:]
+               ((and (char=? ch #\[)
+                     (< (+ i 1) (string-length pattern))
+                     (char=? (string-ref pattern (+ i 1)) #\:))
+                (let ((class-end (find-posix-class-end pattern (+ i 2))))
+                  (if class-end
+                    (let* ((class-name (substring pattern (+ i 2) class-end))
+                           (class-chars (posix-class->regex-chars class-name)))
+                      (if class-chars
+                        (begin (display class-chars rx)
+                               (loop (+ class-end 2) #t)) ;; skip past :]
+                        ;; Unknown class, treat [ as literal
+                        (begin (display "\\[" rx)
+                               (loop (+ i 1) #t))))
+                    ;; No closing :], treat [ as literal
+                    (begin (display "\\[" rx)
+                           (loop (+ i 1) #t)))))
                (else
                 (display (pregexp-quote-char ch) rx)
                 (loop (+ i 1) #t))))
@@ -69,6 +109,40 @@
                (begin
                  (display "\\\\" rx)
                  (loop (+ i 1) #f))))
+            ;; Extended glob: ?(pat|...) *(pat|...) +(pat|...) @(pat|...) !(pat|...)
+            ((and extglob?
+                  (< (+ i 1) len)
+                  (char=? (string-ref pattern (+ i 1)) #\()
+                  (or (char=? ch #\?) (char=? ch #\*) (char=? ch #\+)
+                      (char=? ch #\@) (char=? ch #\!)))
+             (let ((close (find-extglob-close pattern (+ i 2))))
+               (if close
+                 (let* ((body (substring pattern (+ i 2) close))
+                        (alternatives (extglob-split-pipes body))
+                        (rx-alts (glob-join-alternatives
+                                  (map (lambda (alt)
+                                         (glob-sub-pattern->pregexp alt path-mode? extglob?))
+                                       alternatives)
+                                  "|")))
+                   (cond
+                     ((char=? ch #\?) (display (string-append "(?:" rx-alts ")?") rx))
+                     ((char=? ch #\*) (display (string-append "(?:" rx-alts ")*") rx))
+                     ((char=? ch #\+) (display (string-append "(?:" rx-alts ")+") rx))
+                     ((char=? ch #\@) (display (string-append "(?:" rx-alts ")") rx))
+                     ((char=? ch #\!)
+                      ;; For !(pat), include rest of pattern in negative lookahead
+                      ;; so !(foo|bar).txt generates (?!(?:foo|bar)\.txt$)[^/]*
+                      (let ((rest-rx (glob-sub-pattern->pregexp
+                                      (substring pattern (+ close 1) len)
+                                      path-mode? extglob?)))
+                        (display (string-append "(?!(?:" rx-alts ")" rest-rx "$)"
+                                                (if path-mode? "[^/]*" ".*"))
+                                 rx))))
+                   (loop (+ close 1) #f))
+                 ;; No matching close paren — treat as literal
+                 (begin
+                   (display (pregexp-quote-char ch) rx)
+                   (loop (+ i 1) #f)))))
             ;; Glob metacharacters
             ((char=? ch #\*)
              ;; Check for **
@@ -77,11 +151,15 @@
                (begin
                  (display ".*" rx)  ;; ** matches across /
                  (loop (+ i 2) #f))
-               (begin
-                 (display "[^/]*" rx)  ;; * matches anything except /
-                 (loop (+ i 1) #f))))
+               (if path-mode?
+                 (begin
+                   (display "[^/]*" rx)  ;; * matches anything except /
+                   (loop (+ i 1) #f))
+                 (begin
+                   (display ".*" rx)  ;; * matches any character (for [[ ]])
+                   (loop (+ i 1) #f)))))
             ((char=? ch #\?)
-             (display "[^/]" rx)
+             (display (if path-mode? "[^/]" ".") rx)
              (loop (+ i 1) #f))
             ((char=? ch #\[)
              (display "[" rx)
@@ -98,11 +176,161 @@
       (string-append "\\" s)
       s)))
 
+;;; --- POSIX character class helpers ---
+
+;; Find the position of ':' in ':]' after start, within a bracket expression
+;; Returns the index of ':', or #f if not found
+(def (find-posix-class-end pattern start)
+  (let ((len (string-length pattern)))
+    (let loop ((i start))
+      (cond
+        ((>= (+ i 1) len) #f)
+        ((and (char=? (string-ref pattern i) #\:)
+              (char=? (string-ref pattern (+ i 1)) #\]))
+         i)
+        ;; Hit ] before :] — not a valid class
+        ((char=? (string-ref pattern i) #\]) #f)
+        (else (loop (+ i 1)))))))
+
+;; Convert a POSIX class name to regex character set (for inside [...])
+(def (posix-class->regex-chars name)
+  (cond
+    ((string=? name "alpha")  "a-zA-Z")
+    ((string=? name "digit")  "0-9")
+    ((string=? name "alnum")  "a-zA-Z0-9")
+    ((string=? name "upper")  "A-Z")
+    ((string=? name "lower")  "a-z")
+    ((string=? name "xdigit") "0-9a-fA-F")
+    ((string=? name "space")  " \t\n\r\x0b;\x0c;")
+    ((string=? name "blank")  " \t")
+    ((string=? name "print")  " -~")
+    ((string=? name "graph")  "!-~")
+    ((string=? name "cntrl")  "\x00;-\x1f;\x7f;")
+    ((string=? name "punct")  "!-/:-@\\[-`{-~")
+    ((string=? name "ascii")  "\x00;-\x7f;")
+    (else #f)))
+
+;;; --- Extended glob helpers ---
+
+;; Find the matching close paren for an extglob pattern, starting after the '('
+;; Handles nested parens and escapes
+(def (find-extglob-close pattern start)
+  (let ((len (string-length pattern)))
+    (let loop ((i start) (depth 1))
+      (cond
+        ((>= i len) #f)
+        ((char=? (string-ref pattern i) #\\)
+         (loop (+ i 2) depth))  ;; skip escaped char
+        ((char=? (string-ref pattern i) #\()
+         (loop (+ i 1) (+ depth 1)))
+        ((char=? (string-ref pattern i) #\))
+         (if (= depth 1)
+           i
+           (loop (+ i 1) (- depth 1))))
+        (else (loop (+ i 1) depth))))))
+
+;; Split extglob body by | at the top level (not inside nested parens)
+(def (extglob-split-pipes body)
+  (let ((len (string-length body)))
+    (let loop ((i 0) (start 0) (depth 0) (parts []))
+      (cond
+        ((>= i len)
+         (reverse (cons (substring body start i) parts)))
+        ((char=? (string-ref body i) #\\)
+         (loop (+ i 2) start depth parts))
+        ((char=? (string-ref body i) #\()
+         (loop (+ i 1) start (+ depth 1) parts))
+        ((char=? (string-ref body i) #\))
+         (loop (+ i 1) start (- depth 1) parts))
+        ((and (char=? (string-ref body i) #\|) (= depth 0))
+         (loop (+ i 1) (+ i 1) depth
+               (cons (substring body start i) parts)))
+        (else (loop (+ i 1) start depth parts))))))
+
+;; Convert a glob sub-pattern (inside extglob) to a pregexp fragment (no ^ or $)
+(def (glob-sub-pattern->pregexp pattern path-mode? extglob?)
+  (let ((rx (open-output-string))
+        (len (string-length pattern)))
+    (let loop ((i 0))
+      (if (>= i len)
+        (get-output-string rx)
+        (let ((ch (string-ref pattern i)))
+          (cond
+            ((char=? ch #\\)
+             (if (< (+ i 1) len)
+               (begin
+                 (display (pregexp-quote-char (string-ref pattern (+ i 1))) rx)
+                 (loop (+ i 2)))
+               (begin
+                 (display "\\\\" rx)
+                 (loop (+ i 1)))))
+            ;; Nested extglob
+            ((and extglob?
+                  (< (+ i 1) len)
+                  (char=? (string-ref pattern (+ i 1)) #\()
+                  (or (char=? ch #\?) (char=? ch #\*) (char=? ch #\+)
+                      (char=? ch #\@) (char=? ch #\!)))
+             (let ((close (find-extglob-close pattern (+ i 2))))
+               (if close
+                 (let* ((body (substring pattern (+ i 2) close))
+                        (alternatives (extglob-split-pipes body))
+                        (rx-alts (glob-join-alternatives
+                                  (map (lambda (alt)
+                                         (glob-sub-pattern->pregexp alt path-mode? extglob?))
+                                       alternatives)
+                                  "|")))
+                   (cond
+                     ((char=? ch #\?) (display (string-append "(?:" rx-alts ")?") rx))
+                     ((char=? ch #\*) (display (string-append "(?:" rx-alts ")*") rx))
+                     ((char=? ch #\+) (display (string-append "(?:" rx-alts ")+") rx))
+                     ((char=? ch #\@) (display (string-append "(?:" rx-alts ")") rx))
+                     ((char=? ch #\!)
+                      (let ((rest-rx (glob-sub-pattern->pregexp
+                                      (substring pattern (+ close 1) len)
+                                      path-mode? extglob?)))
+                        (display (string-append "(?!(?:" rx-alts ")" rest-rx "$)"
+                                                (if path-mode? "[^/]*" ".*"))
+                                 rx))))
+                   (loop (+ close 1)))
+                 (begin
+                   (display (pregexp-quote-char ch) rx)
+                   (loop (+ i 1))))))
+            ((char=? ch #\*)
+             (display (if path-mode? "[^/]*" ".*") rx)
+             (loop (+ i 1)))
+            ((char=? ch #\?)
+             (display (if path-mode? "[^/]" ".") rx)
+             (loop (+ i 1)))
+            ((char=? ch #\[)
+             ;; Pass through bracket expression
+             (display "[" rx)
+             (let bloop ((j (+ i 1)))
+               (cond
+                 ((>= j len) (loop j))
+                 ((char=? (string-ref pattern j) #\])
+                  (display "]" rx)
+                  (loop (+ j 1)))
+                 (else
+                  (display (string-ref pattern j) rx)
+                  (bloop (+ j 1))))))
+            (else
+             (display (pregexp-quote-char ch) rx)
+             (loop (+ i 1)))))))))
+
+;; Join strings with a separator
+(def (glob-join-alternatives strs sep)
+  (if (null? strs)
+    ""
+    (let loop ((rest (cdr strs)) (result (car strs)))
+      (if (null? rest)
+        result
+        (loop (cdr rest) (string-append result sep (car rest)))))))
+
 ;;; --- Path expansion ---
 
 ;; Expand a glob pattern against the filesystem
 ;; Handles path components separately: dir/pattern
-(def (glob-expand-path pattern)
+(def (glob-expand-path pattern (dotglob? #f) (nocase? #f) (extglob? #f))
   (let ((parts (split-glob-path pattern)))
     (if (null? parts)
       []
@@ -110,7 +338,8 @@
                             (char=? (string-ref pattern 0) #\/))
                      "/"
                      ".")))
-        (glob-expand-parts parts start (char=? (string-ref pattern 0) #\/))))))
+        (glob-expand-parts parts start (char=? (string-ref pattern 0) #\/)
+                           dotglob? nocase? extglob?)))))
 
 ;; Split a glob path into components
 (def (split-glob-path path)
@@ -129,13 +358,13 @@
        (loop (+ i 1) start parts)))))
 
 ;; Expand a list of path components against the filesystem
-(def (glob-expand-parts parts base absolute?)
+(def (glob-expand-parts parts base absolute? (dotglob? #f) (nocase? #f) (extglob? #f))
   (if (null? parts)
     [(if absolute? base
          (if (string=? base ".") "" base))]
     (let* ((pattern (car parts))
            (rest (cdr parts))
-           (entries (glob-match-dir base pattern)))
+           (entries (glob-match-dir base pattern dotglob? nocase? extglob?)))
       (let loop ((entries entries) (results []))
         (if (null? entries)
           results
@@ -150,23 +379,34 @@
               ;; More components: recurse only if this is a directory
               (if (directory-exists? full)
                 (loop (cdr entries)
-                      (append (glob-expand-parts rest full absolute?) results))
+                      (append (glob-expand-parts rest full absolute?
+                                                 dotglob? nocase? extglob?) results))
                 (loop (cdr entries) results)))))))))
 
 ;; Match entries in a directory against a glob pattern
-(def (glob-match-dir dir pattern)
+(def (glob-match-dir dir pattern (dotglob? #f) (nocase? #f) (extglob? #f))
   (with-catch
    (lambda (e) [])
    (lambda ()
-     (let* ((rx (glob-pattern->pregexp pattern))
-            (entries (directory-files dir))
-            (show-dots? (and (> (string-length pattern) 0)
-                            (char=? (string-ref pattern 0) #\.))))
+     ;; For case-insensitive matching, lowercase both pattern and entries
+     (let* ((rx (glob-pattern->pregexp (if nocase? (string-downcase pattern) pattern) #t extglob?))
+            (show-dots? (or dotglob?
+                           (and (> (string-length pattern) 0)
+                                (char=? (string-ref pattern 0) #\.))))
+            ;; Use ignore-hidden: #f to get dotfiles when needed
+            (entries (if show-dots?
+                      (directory-files [path: dir ignore-hidden: #f])
+                      (directory-files dir))))
        (filter
         (lambda (entry)
-          (and (or show-dots?
-                   (not (char=? (string-ref entry 0) #\.)))
-               (pregexp-match rx entry)))
+          (and ;; Exclude . and .. always
+               (not (string=? entry "."))
+               (not (string=? entry ".."))
+               ;; Dotfile filter (when not showing dots)
+               (or show-dots?
+                   (not (and (> (string-length entry) 0)
+                             (char=? (string-ref entry 0) #\.))))
+               (pregexp-match rx (if nocase? (string-downcase entry) entry))))
         entries)))))
 
 ;; Check if path is a directory
@@ -176,9 +416,55 @@
    (lambda ()
      (eq? (file-info-type (file-info path)) 'directory))))
 
+;;; --- GLOBIGNORE filtering ---
+
+;; Filter glob results by GLOBIGNORE (colon-separated patterns)
+;; Removes entries whose basename matches any GLOBIGNORE pattern
+(def (glob-ignore-filter paths globignore-str)
+  (let ((patterns (string-split-colon globignore-str)))
+    (if (null? patterns)
+      paths
+      (filter
+       (lambda (path)
+         (let ((base (path-basename path)))
+           (not (glob-any? (lambda (pat) (glob-match? pat base #f))
+                        patterns))))
+       paths))))
+
+;; Split a string by colons
+(def (string-split-colon str)
+  (let ((len (string-length str)))
+    (let loop ((i 0) (start 0) (parts []))
+      (cond
+        ((>= i len)
+         (reverse (if (> i start)
+                    (cons (substring str start i) parts)
+                    parts)))
+        ((char=? (string-ref str i) #\:)
+         (loop (+ i 1) (+ i 1)
+               (if (> i start)
+                 (cons (substring str start i) parts)
+                 parts)))
+        (else (loop (+ i 1) start parts))))))
+
+;; Get the basename of a path
+(def (path-basename path)
+  (let ((pos (let loop ((i (- (string-length path) 1)))
+               (cond ((< i 0) #f)
+                     ((char=? (string-ref path i) #\/) i)
+                     (else (loop (- i 1)))))))
+    (if pos
+      (substring path (+ pos 1) (string-length path))
+      path)))
+
+;; Check if any element satisfies predicate (glob-local helper)
+(def (glob-any? pred lst)
+  (and (pair? lst)
+       (or (pred (car lst))
+           (glob-any? pred (cdr lst)))))
+
 ;;; --- Extended glob patterns (extglob) ---
 ;; ?(pat) *(pat) +(pat) @(pat) !(pat)
-;; These are deferred to Phase 14 (advanced features)
 
 ;;; --- Utility ---
 

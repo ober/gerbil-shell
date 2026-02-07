@@ -20,14 +20,15 @@
    want-more?   ;; #t if input is incomplete (open quote, heredoc, etc.)
    line         ;; current line number
    col          ;; current column number
+   extglob?     ;; #t if extglob shopt is enabled (for ?()/*()/+()/@()/!() patterns)
    )
   transparent: #t)
 
 ;;; --- Public interface ---
 
 ;; Create a new lexer for the given input string
-(def (make-shell-lexer input)
-  (make-lexer input 0 (string-length input) [] #f [] #f 1 0))
+(def (make-shell-lexer input (extglob? #f))
+  (make-lexer input 0 (string-length input) [] #f [] #f 1 0 extglob?))
 
 ;; Get the next token, or 'eof
 (def (lexer-next! lex)
@@ -157,6 +158,53 @@
 (def (operator-start? ch)
   (memq ch '(#\| #\& #\; #\( #\) #\< #\> #\!)))
 
+;;; Read the body of a process substitution <(...) or >(...)
+;;; The opening ( has already been consumed. Reads until matching ).
+(def (read-procsub-body! lex)
+  (let ((buf (open-output-string)))
+    (let loop ((depth 1))
+      (cond
+        ((at-end? lex) (set! (lexer-want-more? lex) #t))
+        ((char=? (current-char lex) #\()
+         (display #\( buf) (advance! lex) (loop (+ depth 1)))
+        ((char=? (current-char lex) #\))
+         (if (= depth 1)
+           (advance! lex)  ;; consume final ), done
+           (begin (display #\) buf) (advance! lex) (loop (- depth 1)))))
+        ((char=? (current-char lex) #\')
+         (display #\' buf) (advance! lex)
+         (let inner ()
+           (cond
+             ((at-end? lex) #!void)
+             ((char=? (current-char lex) #\')
+              (display #\' buf) (advance! lex))
+             (else (display (current-char lex) buf) (advance! lex) (inner))))
+         (loop depth))
+        ((char=? (current-char lex) #\\)
+         (display #\\ buf) (advance! lex)
+         (unless (at-end? lex)
+           (display (current-char lex) buf) (advance! lex))
+         (loop depth))
+        ((char=? (current-char lex) #\")
+         (display #\" buf) (advance! lex)
+         (let inner ()
+           (cond
+             ((at-end? lex) #!void)
+             ((char=? (current-char lex) #\")
+              (display #\" buf) (advance! lex))
+             ((char=? (current-char lex) #\\)
+              (display #\\ buf) (advance! lex)
+              (unless (at-end? lex)
+                (display (current-char lex) buf) (advance! lex))
+              (inner))
+             (else (display (current-char lex) buf) (advance! lex) (inner))))
+         (loop depth))
+        (else
+         (display (current-char lex) buf)
+         (advance! lex)
+         (loop depth))))
+    (get-output-string buf)))
+
 (def (read-operator! lex)
   (let* ((pos (cons (lexer-line lex) (lexer-col lex)))
          (ch (current-char lex)))
@@ -215,7 +263,7 @@
           (make-token 'LESSGREAT "<>" pos))
          ((and (not (at-end? lex)) (char=? (current-char lex) #\())
           (advance! lex)
-          (make-token 'PROCSUB_IN "<(" pos))
+          (make-token 'PROCSUB_IN (read-procsub-body! lex) pos))
          (else
           (make-token 'LESS "<" pos))))
       ((#\>)
@@ -231,18 +279,82 @@
           (make-token 'CLOBBER ">|" pos))
          ((and (not (at-end? lex)) (char=? (current-char lex) #\())
           (advance! lex)
-          (make-token 'PROCSUB_OUT ">(" pos))
+          (make-token 'PROCSUB_OUT (read-procsub-body! lex) pos))
          (else
           (make-token 'GREAT ">" pos))))
       (else
        (make-token 'WORD (string ch) pos)))))
+
+;;; --- Extglob helpers ---
+
+;; Check if the previous character in the input (before current pos) is an extglob prefix
+(def (extglob-prefix-before? lex)
+  (let ((p (lexer-pos lex)))
+    (and (> p 0)
+         (let ((prev-ch (char-at lex (- p 1))))
+           (or (char=? prev-ch #\?) (char=? prev-ch #\*)
+               (char=? prev-ch #\+) (char=? prev-ch #\@)
+               (char=? prev-ch #\!))))))
+
+;; Read an extglob body: ( already peeked, reads everything up to matching )
+;; Writes the ( ... ) into buf, respecting nested parens and quoting
+(def (read-extglob-body! lex buf)
+  (display (current-char lex) buf)  ;; write the (
+  (advance! lex)
+  (let loop ((depth 1))
+    (cond
+      ((at-end? lex)
+       (set! (lexer-want-more? lex) #t))
+      (else
+       (let ((ch (current-char lex)))
+         (cond
+           ((char=? ch #\\)
+            (display ch buf) (advance! lex)
+            (unless (at-end? lex)
+              (display (current-char lex) buf) (advance! lex))
+            (loop depth))
+           ((char=? ch #\')
+            ;; Read single-quoted content preserving markers
+            (let ((quoted (read-single-quoted-content! lex)))
+              (display "'" buf)
+              (display quoted buf)
+              (display "'" buf))
+            (loop depth))
+           ((char=? ch #\")
+            ;; Read double-quoted content preserving markers
+            (let ((quoted (read-double-quoted-content! lex)))
+              (display "\"" buf)
+              (display quoted buf)
+              (display "\"" buf))
+            (loop depth))
+           ((char=? ch #\()
+            (display ch buf) (advance! lex)
+            (loop (+ depth 1)))
+           ((char=? ch #\))
+            (display ch buf) (advance! lex)
+            (when (> depth 1) (loop (- depth 1))))
+           ;; | is a separator inside extglob, write it as-is
+           ((char=? ch #\|)
+            (display ch buf) (advance! lex)
+            (loop depth))
+           ;; $ for variables/substitutions
+           ((char=? ch #\$)
+            (display (read-dollar! lex) buf)
+            (loop depth))
+           ;; Backtick
+           ((char=? ch #\`)
+            (display (read-backtick! lex) buf)
+            (loop depth))
+           (else
+            (display ch buf) (advance! lex)
+            (loop depth))))))))
 
 ;;; --- Word reading ---
 
 (def (read-word! lex)
   (let* ((pos (cons (lexer-line lex) (lexer-col lex)))
          (buf (open-output-string)))
-    (let loop ()
+    (let loop ((has-content? #f))
       (if (at-end? lex)
         (finish-word buf pos)
         (let ((ch (current-char lex)))
@@ -251,24 +363,38 @@
             ((or (char-whitespace? ch)
                  (and (operator-start? ch)
                       ;; Don't break on ! inside a word
-                      (not (and (char=? ch #\!)
-                                (> (string-length (get-output-string buf)) 0)))))
+                      (not (and (char=? ch #\!) has-content?))
+                      ;; Don't break on !( when extglob is enabled
+                      (not (and (lexer-extglob? lex)
+                                (char=? ch #\!)
+                                (< (+ (lexer-pos lex) 1) (lexer-len lex))
+                                (char=? (char-at lex (+ (lexer-pos lex) 1)) #\()))
+                      ;; Don't break on ( when extglob prefix char precedes it
+                      (not (and (lexer-extglob? lex)
+                                (char=? ch #\()
+                                (extglob-prefix-before? lex)))))
              (finish-word buf pos))
+            ;; Extglob: ?(pat|...) *(pat|...) +(pat|...) @(pat|...) !(pat|...)
+            ((and (lexer-extglob? lex)
+                  (char=? ch #\()
+                  (extglob-prefix-before? lex))
+             (read-extglob-body! lex buf)
+             (loop #t))
             ;; Single quote inside word — preserve quote markers
             ((char=? ch #\')
              (let ((quoted (read-single-quoted-content! lex)))
                (display "'" buf)
                (display quoted buf)
                (display "'" buf)
-               (loop)))
+               (loop #t)))
             ;; Double quote inside word — preserve quote markers
             ((char=? ch #\")
              (let ((quoted (read-double-quoted-content! lex)))
                (display "\"" buf)
                (display quoted buf)
                (display "\"" buf)
-               (loop)))
-            ;; Backslash escape
+               (loop #t)))
+            ;; Backslash escape — preserve backslash in token for expander
             ((char=? ch #\\)
              (advance! lex)
              (if (at-end? lex)
@@ -276,24 +402,44 @@
                       (finish-word buf pos))
                (if (char=? (current-char lex) #\newline)
                  ;; Line continuation inside word
-                 (begin (advance! lex) (loop))
+                 (begin (advance! lex) (loop has-content?))
                  (begin
+                   (display "\\" buf)
                    (display (current-char lex) buf)
                    (advance! lex)
-                   (loop)))))
-            ;; Dollar (variable, command sub, arith)
+                   (loop #t)))))
+            ;; Dollar (variable, command sub, arith, $'...', $"...")
             ((char=? ch #\$)
-             (display (read-dollar! lex) buf)
-             (loop))
+             (if (< (+ (lexer-pos lex) 1) (lexer-len lex))
+               (let ((next (char-at lex (+ (lexer-pos lex) 1))))
+                 (cond
+                   ((char=? next #\')
+                    ;; $'...' ANSI-C quoting inside word
+                    (display (read-ansi-c-quoted-content! lex) buf)
+                    (loop #t))
+                   ((char=? next #\")
+                    ;; $"..." locale translation (treated as double-quote)
+                    (advance! lex) ;; skip $
+                    (let ((quoted (read-double-quoted-content! lex)))
+                      (display "\"" buf)
+                      (display quoted buf)
+                      (display "\"" buf)
+                      (loop #t)))
+                   (else
+                    (display (read-dollar! lex) buf)
+                    (loop #t))))
+               (begin
+                 (display (read-dollar! lex) buf)
+                 (loop #t))))
             ;; Backtick command substitution
             ((char=? ch #\`)
              (display (read-backtick! lex) buf)
-             (loop))
+             (loop #t))
             ;; Regular character
             (else
              (display ch buf)
              (advance! lex)
-             (loop))))))))
+             (loop #t))))))))
 
 (def (finish-word buf pos)
   (let ((word (get-output-string buf)))
@@ -325,6 +471,12 @@
 ;; Override the main token reader to use parameterize
 (def (lexer-read-token-impl! lex)
   (parameterize ((current-lexer lex))
+    ;; Return queued tokens first (from heredoc collection)
+    (if (pair? (lexer-tokens lex))
+      (let ((tok (car (lexer-tokens lex))))
+        (set! (lexer-tokens lex) (cdr (lexer-tokens lex)))
+        tok)
+    (begin
     (skip-whitespace! lex)
     (if (>= (lexer-pos lex) (lexer-len lex))
       (if (pair? (lexer-heredocs lex))
@@ -337,23 +489,29 @@
            (advance! lex)
            (when (pair? (lexer-heredocs lex)) (collect-heredocs! lex))
            (make-token 'NEWLINE "\n" (cons (lexer-line lex) (lexer-col lex))))
+          ;; Extglob: !( at start of token should be read as word, not BANG
+          ((and (lexer-extglob? lex)
+                (char=? ch #\!)
+                (< (+ (lexer-pos lex) 1) (lexer-len lex))
+                (char=? (char-at lex (+ (lexer-pos lex) 1)) #\())
+           (read-word! lex))
           ((operator-start? ch) (read-operator! lex))
-          ((char=? ch #\') (read-single-quoted! lex))
-          ((char=? ch #\") (read-double-quoted! lex))
+          ((char=? ch #\') (read-word! lex))
+          ((char=? ch #\") (read-word! lex))
           ((and (char=? ch #\$)
                 (< (+ (lexer-pos lex) 1) (lexer-len lex))
                 (char=? (char-at lex (+ (lexer-pos lex) 1)) #\'))
-           (read-ansi-c-quoted! lex))
+           (read-word! lex))
           ((and (char=? ch #\$)
                 (< (+ (lexer-pos lex) 1) (lexer-len lex))
                 (char=? (char-at lex (+ (lexer-pos lex) 1)) #\"))
-           (advance! lex) (read-double-quoted! lex))
+           (read-word! lex))
           ((char=? ch #\\)
            (if (and (< (+ (lexer-pos lex) 1) (lexer-len lex))
                     (char=? (char-at lex (+ (lexer-pos lex) 1)) #\newline))
              (begin (advance! lex) (advance! lex) (lexer-read-token-impl! lex))
              (read-word! lex)))
-          (else (read-word! lex)))))))
+          (else (read-word! lex)))))))))
 
 ;; Replace the main entry point
 (set! lexer-read-token! lexer-read-token-impl!)
@@ -420,59 +578,93 @@
          (advance! lex)
          (loop))))))
 
+;; Write a literal character to buf for ANSI-C quoted output.
+;; The output is wrapped in double quotes, so escape chars that
+;; expand-string would interpret inside double quotes: $ ` \ "
+(def (ansi-c-emit-char! ch buf)
+  (if (memq ch '(#\" #\$ #\` #\\))
+    (begin (display "\\" buf) (display ch buf))
+    (display ch buf)))
+
+;; Read $'...' content and return the double-quote-wrapped string.
+;; Advances past $ and '.  Returns "\"...\"" string.
+(def (read-ansi-c-quoted-content! lex)
+  (advance! lex)  ;; skip $
+  (advance! lex)  ;; skip '
+  (let ((buf (open-output-string)))
+    (display "\"" buf)
+    (let loop ()
+      (cond
+        ((at-end? lex)
+         (set! (lexer-want-more? lex) #t)
+         (display "\"" buf)
+         (get-output-string buf))
+        ((char=? (current-char lex) #\')
+         (advance! lex)
+         (display "\"" buf)
+         (get-output-string buf))
+        ((char=? (current-char lex) #\\)
+         (advance! lex)
+         (if (at-end? lex)
+           (begin (display "\\\\" buf)
+                  (display "\"" buf)
+                  (get-output-string buf))
+           (let ((esc (current-char lex)))
+             (advance! lex)
+             (case esc
+               ((#\n) (ansi-c-emit-char! #\newline buf))
+               ((#\t) (ansi-c-emit-char! #\tab buf))
+               ((#\r) (ansi-c-emit-char! #\return buf))
+               ((#\a) (display (string (integer->char 7)) buf))
+               ((#\b) (display (string (integer->char 8)) buf))
+               ((#\e #\E) (display (string (integer->char #x1b)) buf))
+               ((#\f) (display (string (integer->char #xc)) buf))
+               ((#\v) (display (string (integer->char #xb)) buf))
+               ((#\\) (display "\\\\" buf))
+               ((#\') (display "'" buf))  ;; ' is safe inside "..."
+               ((#\") (display "\\\"" buf))
+               ((#\x)
+                ;; Hex escape
+                (let-values (((val cnt) (read-hex-digits lex 2)))
+                  (if (> cnt 0)
+                    (ansi-c-emit-char! (integer->char val) buf)
+                    (begin (display "\\\\x" buf)))))
+               ((#\u #\U)
+                ;; Unicode escape
+                (let* ((max-digits (if (char=? esc #\u) 4 8)))
+                  (let-values (((val cnt) (read-hex-digits lex max-digits)))
+                    (if (> cnt 0)
+                      (ansi-c-emit-char! (integer->char val) buf)
+                      (begin (display "\\\\" buf) (display esc buf))))))
+               ((#\c)
+                ;; Control character: \cX = X & 0x1f
+                (if (at-end? lex)
+                  (begin (display "\\\\c" buf))
+                  (let ((ctrl-ch (current-char lex)))
+                    (advance! lex)
+                    (ansi-c-emit-char!
+                     (integer->char (bitwise-and (char->integer ctrl-ch) #x1f))
+                     buf))))
+               ((#\0 #\1 #\2 #\3 #\4 #\5 #\6 #\7)
+                ;; Octal escape: \nnn (up to 3 total digits)
+                ;; esc is the first digit, read up to 2 more
+                (let* ((first-digit (- (char->integer esc) (char->integer #\0)))
+                       (more (read-octal-digits-with-init lex 2 first-digit)))
+                  (ansi-c-emit-char! (integer->char (bitwise-and more #xff)) buf)))
+               (else
+                ;; Unknown escape — keep literal
+                (display "\\" buf)
+                (ansi-c-emit-char! esc buf)))
+             (loop))))
+        (else
+         (ansi-c-emit-char! (current-char lex) buf)
+         (advance! lex)
+         (loop))))))
+
 (def (read-ansi-c-quoted! lex)
-  (let ((pos (cons (lexer-line lex) (lexer-col lex))))
-    (advance! lex)  ;; skip $
-    (advance! lex)  ;; skip '
-    (let ((buf (open-output-string)))
-      (let loop ()
-        (cond
-          ((at-end? lex)
-           (set! (lexer-want-more? lex) #t)
-           (make-token 'WORD (get-output-string buf) pos))
-          ((char=? (current-char lex) #\')
-           (advance! lex)
-           (make-token 'WORD (get-output-string buf) pos))
-          ((char=? (current-char lex) #\\)
-           (advance! lex)
-           (if (at-end? lex)
-             (begin (display "\\" buf)
-                    (make-token 'WORD (get-output-string buf) pos))
-             (let ((esc (current-char lex)))
-               (advance! lex)
-               (case esc
-                 ((#\n) (display "\n" buf))
-                 ((#\t) (display "\t" buf))
-                 ((#\r) (display "\r" buf))
-                 ((#\a) (display "\a" buf))
-                 ((#\b) (display "\b" buf))
-                 ((#\e #\E) (display "\x1b;" buf))
-                 ((#\f) (display "\f" buf))
-                 ((#\v) (display "\x0b;" buf))
-                 ((#\\) (display "\\" buf))
-                 ((#\') (display "'" buf))
-                 ((#\") (display "\"" buf))
-                 ((#\x)
-                  ;; Hex escape
-                  (let-values (((val end) (read-hex-digits lex 2)))
-                    (display (string (integer->char val)) buf)))
-                 ((#\u #\U)
-                  ;; Unicode escape
-                  (let* ((max-digits (if (char=? esc #\u) 4 8)))
-                    (let-values (((val end) (read-hex-digits lex max-digits)))
-                      (display (string (integer->char val)) buf))))
-                 ((#\0)
-                  ;; Octal escape
-                  (let-values (((val end) (read-octal-digits lex 3)))
-                    (display (string (integer->char val)) buf)))
-                 (else
-                  (display "\\" buf)
-                  (display (string esc) buf)))
-               (loop))))
-          (else
-           (display (current-char lex) buf)
-           (advance! lex)
-           (loop)))))))
+  (let ((pos (cons (lexer-line lex) (lexer-col lex)))
+        (content (read-ansi-c-quoted-content! lex)))
+    (make-token 'WORD content pos)))
 
 ;;; --- Dollar expansions (kept as literal text in tokens) ---
 
@@ -509,29 +701,76 @@
             (loop depth))))
        (get-output-string buf))
       ;; $(  command substitution
+      ;; Tracks paren depth AND case/esac nesting so that ) in case
+      ;; patterns doesn't prematurely close the command substitution.
       ((char=? (current-char lex) #\()
        (display "(" buf)
        (advance! lex)
-       (let loop ((depth 1))
+       (let loop ((depth 1) (case-depth 0) (word ""))
+         (define (update-case-depth w cd)
+           (cond ((string=? w "case") (+ cd 1))
+                 ((string=? w "esac") (max 0 (- cd 1)))
+                 (else cd)))
          (cond
            ((at-end? lex) (set! (lexer-want-more? lex) #t))
            ((char=? (current-char lex) #\()
-            (display "(" buf) (advance! lex) (loop (+ depth 1)))
+            (let ((cd (update-case-depth word case-depth)))
+              (display "(" buf) (advance! lex)
+              (loop (+ depth 1) cd "")))
            ((char=? (current-char lex) #\))
-            (display ")" buf) (advance! lex)
-            (when (> depth 1) (loop (- depth 1))))
+            (let ((cd (update-case-depth word case-depth)))
+              (if (and (= depth 1) (> cd 0))
+                ;; Inside a case block: ) is a case pattern delimiter, not closing
+                (begin (display ")" buf) (advance! lex)
+                       (loop depth cd ""))
+                ;; Normal: close paren
+                (begin (display ")" buf) (advance! lex)
+                       (when (> depth 1) (loop (- depth 1) cd ""))))))
            ((char=? (current-char lex) #\')
-            (display "'" buf)
-            (advance! lex)
-            (let inner ()
-              (cond
-                ((at-end? lex) #!void)
-                ((char=? (current-char lex) #\')
-                 (display "'" buf) (advance! lex))
-                (else (display (current-char lex) buf) (advance! lex) (inner))))
-            (loop depth))
+            (let ((cd (update-case-depth word case-depth)))
+              (display "'" buf)
+              (advance! lex)
+              (let inner ()
+                (cond
+                  ((at-end? lex) #!void)
+                  ((char=? (current-char lex) #\')
+                   (display "'" buf) (advance! lex))
+                  (else (display (current-char lex) buf) (advance! lex) (inner))))
+              (loop depth cd "")))
+           ((char=? (current-char lex) #\")
+            (let ((cd (update-case-depth word case-depth)))
+              (display "\"" buf)
+              (advance! lex)
+              (let inner ()
+                (cond
+                  ((at-end? lex) #!void)
+                  ((char=? (current-char lex) #\\)
+                   (display "\\" buf) (advance! lex)
+                   (unless (at-end? lex)
+                     (display (current-char lex) buf) (advance! lex))
+                   (inner))
+                  ((char=? (current-char lex) #\")
+                   (display "\"" buf) (advance! lex))
+                  (else (display (current-char lex) buf) (advance! lex) (inner))))
+              (loop depth cd "")))
+           ((char=? (current-char lex) #\\)
+            (let ((cd (update-case-depth word case-depth)))
+              (display "\\" buf) (advance! lex)
+              (unless (at-end? lex)
+                (display (current-char lex) buf) (advance! lex))
+              (loop depth cd "")))
+           ;; Word characters: accumulate for keyword detection
+           ((or (char-alphabetic? (current-char lex))
+                (char=? (current-char lex) #\_))
+            (let ((ch (current-char lex)))
+              (display ch buf)
+              (advance! lex)
+              (loop depth case-depth (string-append word (string ch)))))
+           ;; Non-word char: flush word and check keywords
            (else
-            (display (current-char lex) buf) (advance! lex) (loop depth))))
+            (let ((cd (update-case-depth word case-depth)))
+              (display (current-char lex) buf) (advance! lex)
+              (loop depth cd "")))))
        (get-output-string buf))
       ;; ${  parameter expansion
       ((char=? (current-char lex) #\{)
@@ -595,19 +834,21 @@
 ;;; --- Here-documents ---
 
 (def (collect-heredocs! lex)
-  ;; Collect heredoc bodies after a newline
-  (let loop ((specs (reverse (lexer-heredocs lex))))
-    (when (pair? specs)
+  ;; Collect heredoc bodies after a newline, in registration order
+  (let loop ((specs (reverse (lexer-heredocs lex)))
+             (acc []))
+    (if (pair? specs)
       (let* ((spec (car specs))
              (delimiter (car spec))
              (strip-tabs? (cadr spec))
              (body (collect-heredoc-body! lex delimiter strip-tabs?)))
-        ;; Store as a token — the parser will pick it up
-        (set! (lexer-tokens lex)
-          (cons (make-token 'HEREDOC_BODY body
-                           (cons (lexer-line lex) (lexer-col lex)))
-                (lexer-tokens lex)))
-        (loop (cdr specs)))))
+        (loop (cdr specs)
+              (cons (make-token 'HEREDOC_BODY body
+                               (cons (lexer-line lex) (lexer-col lex)))
+                    acc)))
+      ;; acc is reversed (last processed first), reverse for correct order
+      (set! (lexer-tokens lex)
+        (append (reverse acc) (lexer-tokens lex)))))
   (set! (lexer-heredocs lex) []))
 
 (def (collect-heredoc-body! lex delimiter strip-tabs?)
@@ -623,7 +864,7 @@
             (if (string=? trimmed delimiter)
               (get-output-string buf)
               (begin
-                (display line buf)
+                (display trimmed buf)
                 (display "\n" buf)
                 (loop)))))))))
 
@@ -657,7 +898,7 @@
                   (loop (+ i 1)))))))
 
 (def (assignment-word? word)
-  ;; Check for NAME=value or NAME+=value pattern
+  ;; Check for NAME=value, NAME+=value, NAME[expr]=value, NAME[expr]+=value pattern
   (let ((eq-pos (string-find-char word #\=)))
     (and eq-pos
          (> eq-pos 0)
@@ -665,7 +906,23 @@
                                    (char=? (string-ref word (- eq-pos 1)) #\+))
                            (substring word 0 (- eq-pos 1))
                            (substring word 0 eq-pos))))
-           (valid-shell-name? name-part)))))
+           ;; Check for NAME or NAME[expr]
+           (let ((bracket-pos (string-find-char-in-name name-part #\[)))
+             (if bracket-pos
+               ;; NAME[expr] — validate name before bracket
+               (and (> bracket-pos 0)
+                    (valid-shell-name? (substring name-part 0 bracket-pos))
+                    ;; Must have closing ]
+                    (let ((close (string-find-char-in-name name-part #\])))
+                      (and close (= close (- (string-length name-part) 1)))))
+               ;; Plain NAME
+               (valid-shell-name? name-part)))))))
+
+(def (string-find-char-in-name str ch)
+  (let loop ((i 0))
+    (cond ((>= i (string-length str)) #f)
+          ((char=? (string-ref str i) ch) i)
+          (else (loop (+ i 1))))))
 
 (def (valid-shell-name? str)
   (and (> (string-length str) 0)
@@ -686,17 +943,21 @@
 
 ;;; --- Hex/octal digit reading ---
 
+;; Returns (values val count) — val is the accumulated value, count is digits read
 (def (read-hex-digits lex max-count)
   (let loop ((count 0) (val 0))
     (if (or (>= count max-count) (at-end? lex)
             (not (hex-char? (current-char lex))))
-      val
+      (values val count)
       (let ((digit (hex-val (current-char lex))))
         (advance! lex)
         (loop (+ count 1) (+ (* val 16) digit))))))
 
 (def (read-octal-digits lex max-count)
-  (let loop ((count 0) (val 0))
+  (read-octal-digits-with-init lex max-count 0))
+
+(def (read-octal-digits-with-init lex max-count init)
+  (let loop ((count 0) (val init))
     (if (or (>= count max-count) (at-end? lex)
             (not (octal-char? (current-char lex))))
       val
@@ -723,7 +984,7 @@
   '("if" "then" "elif" "else" "fi"
     "do" "done" "case" "esac"
     "while" "until" "for" "in"
-    "select" "function" "time"
+    "select" "function" "time" "coproc"
     "{" "}" "!" "[[" "]]"))
 
 (def (reserved-word? word)

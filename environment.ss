@@ -4,6 +4,7 @@
 (import :std/sugar
         :std/iter
         :std/format
+        :std/sort
         :std/misc/hash
         :gsh/ffi)
 
@@ -29,8 +30,13 @@
 
 ;;; --- Shell variable ---
 ;; Attributes: exported?, readonly?, local?, integer?, uppercase?, lowercase?, nameref?
+;;             array?, assoc?
+;; For scalar vars, value is a string.
+;; For indexed arrays (array? = #t), value is a hash-table with integer keys.
+;; For associative arrays (assoc? = #t), value is a hash-table with string keys.
 (defstruct shell-var (value exported? readonly? local?
-                      integer? uppercase? lowercase? nameref?) transparent: #t)
+                      integer? uppercase? lowercase? nameref?
+                      array? assoc?) transparent: #t)
 
 ;;; --- Shell environment ---
 (defclass shell-environment (vars        ;; hash-table: name -> shell-var
@@ -70,6 +76,17 @@
     (set! self.traps (if parent (shell-environment-traps parent) (make-hash-table)))
     (set! self.dir-stack (if parent (shell-environment-dir-stack parent) []))))
 
+;;; --- Nameref resolution ---
+
+;; Resolve a nameref chain: if `name` is a nameref variable, follow the chain
+;; until we find a non-nameref (or hit the cycle guard). Returns the final name.
+(def (resolve-nameref name env (depth 0))
+  (if (> depth 10) name  ;; cycle guard — matches bash behavior
+    (let ((var (find-var-in-chain env name)))
+      (if (and var (shell-var-nameref? var) (string? (shell-var-value var)))
+        (resolve-nameref (shell-var-value var) env (+ depth 1))
+        name))))
+
 ;;; --- Variable operations ---
 
 ;; Get a variable's value, checking scope chain
@@ -80,6 +97,8 @@
     ((string=? name "$") (number->string (shell-environment-shell-pid env)))
     ((string=? name "!") (number->string (shell-environment-last-bg-pid env)))
     ((string=? name "#") (number->string (vector-length (shell-environment-positional env))))
+    ((string=? name "@") (string-join-with " " (env-positional-list env)))
+    ((string=? name "*") (env-star env))
     ((string=? name "0") (shell-environment-shell-name env))
     ((string=? name "-") (options->flag-string env))
     ((string=? name "_") (env-get-local env "_"))  ;; last arg of prev command
@@ -96,25 +115,38 @@
             (if (and (> idx 0) (<= idx (vector-length pos)))
               (vector-ref pos (- idx 1))
               ""))))
-    ;; Regular variable lookup
+    ;; Regular variable lookup — resolve namerefs first
     (else
-     (env-get-chain env name))))
+     (let ((resolved (resolve-nameref name env)))
+       ;; If the resolved name is still a nameref, we hit a cycle — treat as unset
+       (let ((var (find-var-in-chain env resolved)))
+         (if (and var (shell-var-nameref? var))
+           #f
+           (env-get-chain env resolved)))))))
 
 ;; Get from local scope only
 (def (env-get-local env name)
   (let ((var (hash-get (shell-environment-vars env) name)))
-    (and var (shell-var-value var))))
+    (and var (shell-var-scalar-value var))))
 
 ;; Get from scope chain
 (def (env-get-chain env name)
   (let ((var (hash-get (shell-environment-vars env) name)))
     (if var
-      (shell-var-value var)
+      (shell-var-scalar-value var)
       (let ((parent (shell-environment-parent env)))
         (if parent
           (env-get-chain parent name)
           ;; Fall back to OS environment
           (getenv name #f))))))
+
+;; Get the scalar value of a shell-var.
+;; For arrays, returns element [0] (bash behavior: $arr == ${arr[0]}).
+(def (shell-var-scalar-value var)
+  (let ((v (shell-var-value var)))
+    (if (hash-table? v)
+      (or (hash-get v 0) (hash-get v "0") "")
+      v)))
 
 ;; Apply variable attributes (integer, uppercase, lowercase) to a value
 ;; env is optional — when provided, arithmetic evaluation can reference variables
@@ -148,8 +180,10 @@
           (if parent (env-get-var parent name) #f)))))
 
 ;; Set a variable — respects scope chain for non-local vars
+;; Resolves namerefs: if `name` is a nameref, sets the target variable instead.
 (def (env-set! env name value)
-  (let ((existing (hash-get (shell-environment-vars env) name)))
+  (let* ((resolved (resolve-nameref name env))
+         (existing (hash-get (shell-environment-vars env) resolved)))
     (cond
       ((and existing (shell-var-readonly? existing))
        (error (format "~a: readonly variable" name)))
@@ -158,31 +192,31 @@
          (set! (shell-var-value existing) final-value)
          ;; If exported, also update OS env
          (when (shell-var-exported? existing)
-           (setenv name final-value))))
+           (setenv resolved final-value))))
       (else
        ;; Not in local scope — check parent chain
-       (let ((owner (find-var-owner-in-chain (shell-environment-parent env) name)))
+       (let ((owner (find-var-owner-in-chain (shell-environment-parent env) resolved)))
          (if owner
            ;; Variable exists in an ancestor scope — modify it there
-           (let ((parent-var (hash-get (shell-environment-vars owner) name)))
+           (let ((parent-var (hash-get (shell-environment-vars owner) resolved)))
              (when (and parent-var (shell-var-readonly? parent-var))
-               (error (format "~a: readonly variable" name)))
+               (error (format "~a: readonly variable" resolved)))
              (let ((final-value (apply-var-attrs parent-var value env)))
                (set! (shell-var-value parent-var) final-value)
                (when (shell-var-exported? parent-var)
-                 (setenv name final-value))))
+                 (setenv resolved final-value))))
            ;; Variable doesn't exist anywhere in the chain
            ;; Create in ROOT scope (bash behavior: vars in functions are global)
            (let* ((root (env-root env))
-                  (os-val (getenv name #f)))
+                  (os-val (getenv resolved #f)))
              (if os-val
                ;; Exists in OS env — create as exported
                (begin
-                 (hash-put! (shell-environment-vars root) name
-                            (make-shell-var value #t #f #f #f #f #f #f))
-                 (setenv name value))
-               (hash-put! (shell-environment-vars root) name
-                          (make-shell-var value #f #f #f #f #f #f #f))))))))))
+                 (hash-put! (shell-environment-vars root) resolved
+                            (make-shell-var value #t #f #f #f #f #f #f #f #f))
+                 (setenv resolved value))
+               (hash-put! (shell-environment-vars root) resolved
+                          (make-shell-var value #f #f #f #f #f #f #f #f #f))))))))))
 
 ;; Set the shell name ($0)
 (def (env-set-shell-name! env name)
@@ -199,11 +233,20 @@
       ;; Create empty exported variable
       (when value
         (hash-put! (shell-environment-vars env) name
-                   (make-shell-var value #t #f #f #f #f #f #f))
+                   (make-shell-var value #t #f #f #f #f #f #f #f #f))
         (setenv name value)))))
 
-;; Unset a variable
+;; Unset a variable — resolves namerefs (unsets the target, not the ref)
+;; Use env-unset-nameref! to unset the nameref itself.
 (def (env-unset! env name)
+  (let ((resolved (resolve-nameref name env)))
+    (let ((var (hash-get (shell-environment-vars env) resolved)))
+      (when (and var (shell-var-readonly? var))
+        (error (format "~a: readonly variable" resolved)))
+      (hash-remove! (shell-environment-vars env) resolved))))
+
+;; Unset a nameref variable itself (not the target) — used by `unset -n`
+(def (env-unset-nameref! env name)
   (let ((var (hash-get (shell-environment-vars env) name)))
     (when (and var (shell-var-readonly? var))
       (error (format "~a: readonly variable" name)))
@@ -233,7 +276,7 @@
   (hash-for-each
    (lambda (name var)
      (when (shell-var-exported? var)
-       (hash-put! target name (shell-var-value var))))
+       (hash-put! target name (or (shell-var-scalar-value var) ""))))
    (shell-environment-vars env)))
 
 ;; Push a new scope (for function calls)
@@ -272,14 +315,18 @@
   (hash-for-each
    (lambda (name var)
      (hash-put! target name
-                (make-shell-var (shell-var-value var)
+                (make-shell-var (let ((v (shell-var-value var)))
+                                  ;; Deep-copy array hash-tables for subshell isolation
+                                  (if (hash-table? v) (hash-copy v) v))
                                 (shell-var-exported? var)
                                 (shell-var-readonly? var)
                                 (shell-var-local? var)
                                 (shell-var-integer? var)
                                 (shell-var-uppercase? var)
                                 (shell-var-lowercase? var)
-                                (shell-var-nameref? var))))
+                                (shell-var-nameref? var)
+                                (shell-var-array? var)
+                                (shell-var-assoc? var))))
    (shell-environment-vars env)))
 
 ;; Pop back to parent scope
@@ -325,7 +372,8 @@
 ;;; --- Set last status ---
 
 (def (env-set-last-status! env status)
-  (set! (shell-environment-last-status env) status))
+  ;; Truncate to 8 bits (0-255) per POSIX
+  (set! (shell-environment-last-status env) (bitwise-and status #xFF)))
 
 (def (env-set-last-bg-pid! env pid)
   (set! (shell-environment-last-bg-pid env) pid))
@@ -341,7 +389,7 @@
   (for-each
    (lambda (pair)
      (hash-put! (shell-environment-vars env) (car pair)
-                (make-shell-var (cdr pair) #t #f #f #f #f #f #f)))
+                (make-shell-var (cdr pair) #t #f #f #f #f #f #f #f #f)))
    (get-environment-variables))
   ;; Set defaults if not present
   (unless (env-get-local env "IFS")
@@ -371,6 +419,7 @@
   (env-set! env "SHELL" (or (getenv "SHELL" #f) "/bin/gsh"))
   ;; Default shell options
   (env-option-set! env "hashall" #t)
+  (env-option-set! env "braceexpand" #t)
   (env-option-set! env "interactive-comments" #t)
   ;; Default shopt options
   (env-shopt-set! env "cmdhist" #t)
@@ -429,3 +478,198 @@
       (let loop ((rest (cdr lst)) (acc (car lst)))
         (if (null? rest) acc
             (loop (cdr rest) (string-append acc sep (car rest)))))))
+
+;;; --- Array operations ---
+
+;; Get an array element by index.
+;; For indexed arrays, index should be an integer.
+;; For assoc arrays, index should be a string.
+(def (env-array-get env name index)
+  (let* ((name (resolve-nameref name env))
+         (var (find-var-in-chain env name)))
+    (if (and var (or (shell-var-array? var) (shell-var-assoc? var)))
+      (let ((tbl (shell-var-value var))
+            (key (if (shell-var-assoc? var)
+                   index  ;; string key for assoc
+                   (if (string? index) (or (string->number index) 0) index))))
+        (or (hash-get tbl key) ""))
+      ;; Not an array — if index is 0, return scalar value
+      (if (and var (or (equal? index "0") (equal? index 0)))
+        (or (shell-var-scalar-value var) "")
+        ""))))
+
+;; Set an array element.
+;; Creates the array if it doesn't exist.
+(def (env-array-set! env name index value)
+  (let* ((name (resolve-nameref name env))
+         (var (find-var-in-chain env name)))
+    (cond
+      ((and var (shell-var-readonly? var))
+       (error (format "~a: readonly variable" name)))
+      ((and var (or (shell-var-array? var) (shell-var-assoc? var)))
+       ;; Existing array — set element
+       (let* ((tbl (shell-var-value var))
+              (key (if (shell-var-assoc? var)
+                     index
+                     (if (string? index) (or (string->number index) 0) index)))
+              (final-val (apply-var-attrs var value env)))
+         (hash-put! tbl key final-val)))
+      (var
+       ;; Existing scalar — convert to indexed array
+       (let ((tbl (make-hash-table))
+             (key (if (string? index) (or (string->number index) 0) index)))
+         (hash-put! tbl key (apply-var-attrs var value env))
+         (set! (shell-var-value var) tbl)
+         (set! (shell-var-array? var) #t)))
+      (else
+       ;; New variable — create indexed array in root scope
+       (let* ((root (env-root env))
+              (tbl (make-hash-table))
+              (key (if (string? index) (or (string->number index) 0) index))
+              (new-var (make-shell-var tbl #f #f #f #f #f #f #f #t #f)))
+         (hash-put! tbl key value)
+         (hash-put! (shell-environment-vars root) name new-var))))))
+
+;; Get all values of an array (sorted by key for indexed arrays)
+(def (env-array-values env name)
+  (let* ((name (resolve-nameref name env))
+         (var (find-var-in-chain env name)))
+    (if (and var (or (shell-var-array? var) (shell-var-assoc? var)))
+      (let ((tbl (shell-var-value var)))
+        (if (shell-var-assoc? var)
+          ;; Assoc: values in insertion order (hash-table order)
+          (hash-values tbl)
+          ;; Indexed: values sorted by numeric key
+          (let ((keys (sort! (hash-keys tbl) <)))
+            (map (lambda (k) (hash-get tbl k)) keys))))
+      ;; Not an array — return single value as list
+      (if var [(shell-var-scalar-value var)] []))))
+
+;; Get all keys/indices of an array
+(def (env-array-keys env name)
+  (let* ((name (resolve-nameref name env))
+         (var (find-var-in-chain env name)))
+    (if (and var (or (shell-var-array? var) (shell-var-assoc? var)))
+      (let ((tbl (shell-var-value var)))
+        (if (shell-var-assoc? var)
+          (map (lambda (k) (if (string? k) k (number->string k))) (hash-keys tbl))
+          (let ((keys (sort! (hash-keys tbl) <)))
+            (map number->string keys))))
+      ;; Not an array — return ("0") if set
+      (if (and var (shell-var-scalar-value var)) ["0"] []))))
+
+;; Get array length (number of elements)
+(def (env-array-length env name)
+  (let* ((name (resolve-nameref name env))
+         (var (find-var-in-chain env name)))
+    (if (and var (or (shell-var-array? var) (shell-var-assoc? var)))
+      (hash-length (shell-var-value var))
+      ;; Scalar — length is 1 if set, 0 if not
+      (if (and var (shell-var-scalar-value var)) 1 0))))
+
+;; Unset an array element
+(def (env-array-unset-element! env name index)
+  (let* ((name (resolve-nameref name env))
+         (var (find-var-in-chain env name)))
+    (when (and var (shell-var-readonly? var))
+      (error (format "~a: readonly variable" name)))
+    (when (and var (or (shell-var-array? var) (shell-var-assoc? var)))
+      (let ((tbl (shell-var-value var))
+            (key (if (shell-var-assoc? var)
+                   index
+                   (if (string? index) (or (string->number index) 0) index))))
+        (hash-remove! tbl key)))))
+
+;; Set a compound array value: arr=(val1 val2 val3)
+;; For indexed arrays, assigns val1 to [0], val2 to [1], etc.
+;; For items of the form [key]=val, uses explicit key.
+(def (env-array-set-compound! env name values assoc?)
+  (let* ((name (resolve-nameref name env))
+         (var (or (find-var-in-chain env name)
+                 (let ((new-var (make-shell-var (make-hash-table) #f #f #f #f #f #f #f
+                                               (not assoc?) assoc?)))
+                   (hash-put! (shell-environment-vars (env-root env)) name new-var)
+                   new-var))))
+    (when (shell-var-readonly? var)
+      (error (format "~a: readonly variable" name)))
+    ;; Reset to a fresh hash-table
+    (let ((tbl (make-hash-table)))
+      (set! (shell-var-value var) tbl)
+      (set! (shell-var-array? var) (not assoc?))
+      (set! (shell-var-assoc? var) assoc?)
+      ;; Fill in values
+      (let loop ((vals values) (auto-idx 0))
+        (when (pair? vals)
+          (let ((v (car vals)))
+            (if (array-kv-pair? v)
+              ;; [key]=val syntax
+              (let-values (((key val) (parse-array-kv v)))
+                (if assoc?
+                  (hash-put! tbl key val)
+                  (let ((idx (or (string->number key) auto-idx)))
+                    (hash-put! tbl idx val)
+                    (loop (cdr vals) (+ idx 1)))))
+              ;; Plain value — use auto-incrementing index
+              (begin
+                (if assoc?
+                  ;; Assoc arrays require [key]=val syntax; plain values ignored
+                  #!void
+                  (hash-put! tbl auto-idx v))
+                (loop (cdr vals) (+ auto-idx 1))))))))))
+
+;; Append to an array: arr+=(val1 val2)
+(def (env-array-append-compound! env name values)
+  (let* ((name (resolve-nameref name env))
+         (var (find-var-in-chain env name)))
+    (if (and var (or (shell-var-array? var) (shell-var-assoc? var)))
+      (let* ((tbl (shell-var-value var))
+             (assoc? (shell-var-assoc? var))
+             ;; For indexed arrays, find next available index
+             (next-idx (if assoc? 0
+                         (if (> (hash-length tbl) 0)
+                           (+ 1 (apply max (hash-keys tbl)))
+                           0))))
+        (let loop ((vals values) (idx next-idx))
+          (when (pair? vals)
+            (let ((v (car vals)))
+              (if (array-kv-pair? v)
+                (let-values (((key val) (parse-array-kv v)))
+                  (if assoc?
+                    (hash-put! tbl key val)
+                    (let ((kidx (or (string->number key) idx)))
+                      (hash-put! tbl kidx val)
+                      (loop (cdr vals) (+ kidx 1)))))
+                (begin
+                  (unless assoc?
+                    (hash-put! tbl idx v))
+                  (loop (cdr vals) (+ idx 1))))))))
+      ;; Not yet an array — create one
+      (env-array-set-compound! env name values #f))))
+
+;; Check if a compound assignment value has [key]=val syntax
+(def (array-kv-pair? str)
+  (and (> (string-length str) 0)
+       (char=? (string-ref str 0) #\[)
+       (let ((close (string-find-char-in str #\])))
+         (and close
+              (< (+ close 1) (string-length str))
+              (char=? (string-ref str (+ close 1)) #\=)))))
+
+;; Parse [key]=val from a compound assignment element
+(def (parse-array-kv str)
+  (let* ((close (string-find-char-in str #\]))
+         (key (substring str 1 close))
+         (val (substring str (+ close 2) (string-length str))))
+    (values key val)))
+
+(def (string-find-char-in str ch)
+  (let loop ((i 0))
+    (cond ((>= i (string-length str)) #f)
+          ((char=? (string-ref str i) ch) i)
+          (else (loop (+ i 1))))))
+
+;; Check if a variable is an array
+(def (env-is-array? env name)
+  (let* ((name (resolve-nameref name env))
+         (var (find-var-in-chain env name)))
+    (and var (or (shell-var-array? var) (shell-var-assoc? var)))))

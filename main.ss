@@ -88,20 +88,27 @@
   ;; source / . — source a file into the current environment
   (let ((source-handler
          (lambda (args env)
-           (if (null? args)
-             (begin
-               (fprintf (current-error-port) "gsh: source: filename argument required~n")
-               2)
-             (let* ((filename (car args))
-                    ;; Search PATH if file doesn't contain /
-                    (filepath (if (string-contains? filename "/")
-                                filename
-                                (or (which filename) filename))))
-               ;; Set positional params if extra args given
-               (when (pair? (cdr args))
-                 (let ((saved-pos (shell-environment-positional env)))
-                   (env-set-positional! env (cdr args))))
-               (source-file! filepath env))))))
+           ;; Skip leading -- (source accepts/ignores it)
+           (let ((args (if (and (pair? args) (string=? (car args) "--"))
+                         (cdr args)
+                         args)))
+             (if (null? args)
+               (begin
+                 (fprintf (current-error-port) "gsh: source: filename argument required~n")
+                 2)
+               (let* ((filename (car args))
+                      ;; Search PATH if file doesn't contain /
+                      (filepath (if (string-contains? filename "/")
+                                  filename
+                                  (or (which filename) filename))))
+                 ;; Set positional params if extra args given, restore after
+                 (if (pair? (cdr args))
+                   (let ((saved-pos (shell-environment-positional env)))
+                     (env-set-positional! env (cdr args))
+                     (let ((result (source-file! filepath env)))
+                       (set! (shell-environment-positional env) saved-pos)
+                       result))
+                   (source-file! filepath env))))))))
     (builtin-register! "source" source-handler)
     (builtin-register! "." source-handler)))
 
@@ -171,28 +178,39 @@
           ;; Non-empty input
           (else
            ;; History expansion
-           (let ((expanded (with-catch
-                            (lambda (e)
-                              (fprintf (current-error-port) "gsh: ~a~n"
-                                       (exception-message e))
-                              #f)
-                            (lambda () (history-expand input)))))
-             (when expanded
-               ;; Show expanded line if it changed
-               (when (not (string=? expanded input))
-                 (displayln expanded (current-error-port)))
-               ;; Add to history
-               (history-add! expanded)
-               ;; Parse and execute
-               (let ((status (execute-input expanded env)))
-                 (env-set-last-status! env status)
-                 ;; Process pending signals and execute trap commands
-                 (process-traps! env)
-                 ;; ERR trap: execute if last command failed
-                 (when (and (not (= status 0)) (trap-get "ERR"))
-                   (let ((action (trap-get "ERR")))
-                     (when (string? action)
-                       (execute-input action env)))))))
+           ;; history-expand returns (cons expanded-string execute?)
+           (let ((result (with-catch
+                           (lambda (e)
+                             (fprintf (current-error-port) "gsh: ~a~n"
+                                      (exception-message e))
+                             #f)
+                           (lambda () (history-expand input)))))
+             (when result
+               (let ((expanded (car result))
+                     (execute? (cdr result)))
+                 ;; Show expanded line if it changed
+                 (when (not (string=? expanded input))
+                   (displayln expanded (current-error-port)))
+                 ;; Add to history (even for :p)
+                 (history-add! expanded)
+                 ;; Parse and execute (unless :p modifier was used)
+                 (when execute?
+                   (let ((status (with-catch
+                                  (lambda (e)
+                                    (cond
+                                      ((break-exception? e) 0)
+                                      ((continue-exception? e) 0)
+                                      ((return-exception? e) (return-exception-status e))
+                                      (else (raise e))))
+                                  (lambda () (execute-input expanded env)))))
+                     (env-set-last-status! env status)
+                     ;; Process pending signals and execute trap commands
+                     (process-traps! env)
+                     ;; ERR trap: execute if last command failed
+                     (when (and (not (= status 0)) (trap-get "ERR"))
+                       (let ((action (trap-get "ERR")))
+                         (when (string? action)
+                           (execute-input action env)))))))))
            (loop (+ cmd-num 1))))))))
 
 (def (execute-input input env)
@@ -201,6 +219,10 @@
    (lambda (e)
      (cond
        ((errexit-exception? e) (errexit-exception-status e))
+       ((subshell-exit-exception? e) (raise e))
+       ((break-exception? e) (raise e))
+       ((continue-exception? e) (raise e))
+       ((return-exception? e) (raise e))
        (else
         (fprintf (current-error-port) "gsh: ~a~n" (exception-message e))
         1)))
@@ -211,7 +233,7 @@
                             (exception-message e))
                    'error)
                  (lambda ()
-                   (parse-complete-command input)))))
+                   (parse-complete-command input (env-shopt? env "extglob"))))))
        (cond
          ((eq? cmd 'error) 2)
          ((not cmd) 0)
@@ -257,9 +279,18 @@
                   (loop (- i 1)) (+ i 1)))))
     (substring str start end)))
 
+;;; --- Internal fd management ---
+
+;; Move Gambit's internal scheduler pipe fds to high numbers (>= 100)
+;; so fds 3-9 are free for user shell redirects (exec 3>, etc.)
+(def (move-internal-fds-high!)
+  (ffi-move-gambit-fds 255))
+
 ;;; --- Entry point ---
 
 (def (main . args)
+  ;; Move Gambit's internal fds (3-9) to high numbers so user can use exec 3>, etc.
+  (move-internal-fds-high!)
   (let* ((args-hash (parse-args args))
          (command (hash-ref args-hash 'command))
          (script (hash-ref args-hash 'script))
@@ -274,7 +305,14 @@
            (env-set-positional! env (cdr script-args)))
          ;; Load non-interactive startup
          (load-startup-files! env login? #f)
-         (let ((status (execute-input command env)))
+         (let ((status (with-catch
+                        (lambda (e)
+                          (cond
+                            ((break-exception? e) 0)
+                            ((continue-exception? e) 0)
+                            ((return-exception? e) (return-exception-status e))
+                            (else (raise e))))
+                        (lambda () (execute-input command env)))))
            (run-exit-trap! env)
            (exit status))))
       ;; Script file
@@ -316,7 +354,14 @@
         (begin
           (run-exit-trap! env)
           status)
-        (let ((new-status (execute-input line env)))
+        (let ((new-status (with-catch
+                           (lambda (e)
+                             (cond
+                               ((break-exception? e) 0)
+                               ((continue-exception? e) 0)
+                               ((return-exception? e) (return-exception-status e))
+                               (else (raise e))))
+                           (lambda () (execute-input line env)))))
           (env-set-last-status! env new-status)
           ;; Process pending signals and execute trap commands
           (process-traps! env)

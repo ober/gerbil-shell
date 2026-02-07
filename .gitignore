@@ -1,0 +1,31 @@
+# Build artifacts
+.gerbil/
+.gerbil-lsp-cache/
+
+# Test temp files
+_tmp/
+__pycache__/
+*.pyc
+
+# Temp/debug files from shell testing
+*.txt
+1
+1*
+10
+@
+bad_@
+badpath
+cat -n
+cmd
+file1
+foo-bar
+foo-spam
+one-bar
+two-bar
+qq-*-zz
+zz-*-xx
+lib.sh
+test_osh
+
+# Editor / misc
+"\n"

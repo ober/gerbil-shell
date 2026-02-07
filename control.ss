@@ -185,7 +185,7 @@
       #f
       (let ((pat (expand-word-nosplit (car pats) env)))
         (if (or (string=? pat "*")
-                (glob-match? pat word))
+                (glob-match? pat word #f (env-shopt? env "extglob")))
           #t
           (loop (cdr pats)))))))
 

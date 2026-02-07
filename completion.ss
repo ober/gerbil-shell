@@ -353,12 +353,6 @@
             (substring path (+ last-slash 1) (string-length path)))
       (cons "" path))))
 
-(def (string-last-index-of str ch)
-  (let loop ((i (- (string-length str) 1)))
-    (cond
-      ((< i 0) #f)
-      ((char=? (string-ref str i) ch) i)
-      (else (loop (- i 1))))))
 
 (def (string-split-path path-str)
   ;; Split PATH-style colon-separated string

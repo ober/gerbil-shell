@@ -6,10 +6,12 @@
 (import :std/foreign)
 
 (begin-ffi (ffi-waitpid-pid ffi-waitpid-status
-            ffi-dup ffi-dup2 ffi-setpgid ffi-getpgid
+            ffi-dup ffi-dup-above ffi-dup2 ffi-move-gambit-fds ffi-setpgid ffi-getpgid
             ffi-tcsetpgrp ffi-tcgetpgrp ffi-umask ffi-getuid ffi-geteuid
+            ffi-getegid ffi-access
             ffi-isatty ffi-setsid ffi-pipe-raw ffi-close-fd
-            ffi-open-raw
+            ffi-open-raw ffi-mkfifo ffi-unlink ffi-getpid
+            ffi-read-all-from-fd
             WNOHANG WUNTRACED WCONTINUED
             WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG WIFSTOPPED WSTOPSIG)
 
@@ -54,6 +56,35 @@ static int ffi_do_pipe(void) {
 static int ffi_pipe_read_fd(void) { return _pipe_fds[0]; }
 static int ffi_pipe_write_fd(void) { return _pipe_fds[1]; }
 
+/* Move Gambit's scheduler select_abort pipe fds to high fds (>= min_fd).
+   This modifies the ___pstate_os structure directly so Gambit's scheduler
+   continues to work but frees low fds for shell use. */
+static int ___gambit_move_select_abort_fds(int min_fd) {
+    ___processor_state ___ps = ___PSTATE;
+    int old_rfd = ___ps->os.select_abort.reading_fd;
+    int old_wfd = ___ps->os.select_abort.writing_fd;
+    int new_rfd, new_wfd;
+
+    /* Only move if they are below min_fd */
+    if (old_rfd >= min_fd && old_wfd >= min_fd) return 0;
+
+    new_rfd = fcntl(old_rfd, F_DUPFD, min_fd);
+    if (new_rfd < 0) return -1;
+
+    new_wfd = fcntl(old_wfd, F_DUPFD, min_fd);
+    if (new_wfd < 0) { close(new_rfd); return -1; }
+
+    /* Update Gambit's state */
+    ___ps->os.select_abort.reading_fd = new_rfd;
+    ___ps->os.select_abort.writing_fd = new_wfd;
+
+    /* Close the old low fds */
+    close(old_rfd);
+    close(old_wfd);
+
+    return 0;
+}
+
 END-C
   )
 
@@ -86,8 +117,20 @@ END-C
   ;; dup — duplicate fd, returns new fd (next available)
   (define-c-lambda ffi-dup (int) int "dup")
 
+  ;; dup-above — duplicate fd to fd >= min_fd using fcntl(F_DUPFD)
+  ;; Used by save-fd to avoid conflicting with user-visible fds
+  (define-c-lambda ffi-dup-above (int int) int
+    "___return(fcntl(___arg1, F_DUPFD, ___arg2));")
+
   ;; dup2 — duplicate fd onto target fd
   (define-c-lambda ffi-dup2 (int int) int "dup2")
+
+  ;; Move Gambit's internal scheduler pipe fds (select_abort) to high fds.
+  ;; This frees fds 3-9 for user shell redirects (exec 3>, etc.)
+  ;; Accesses ___PSTATE->os.select_abort.reading_fd and writing_fd
+  ;; Returns 0 on success, -1 on error.
+  (define-c-lambda ffi-move-gambit-fds (int) int
+    "___return(___gambit_move_select_abort_fds(___arg1));")
 
   ;; close — close a raw file descriptor
   (define-c-lambda ffi-close-fd (int) int "close")
@@ -106,6 +149,11 @@ END-C
   ;; User IDs
   (define-c-lambda ffi-getuid () int "getuid")
   (define-c-lambda ffi-geteuid () int "geteuid")
+  (define-c-lambda ffi-getegid () int "getegid")
+
+  ;; File access check — access(path, mode) returns 0 on success
+  ;; mode: R_OK=4, W_OK=2, X_OK=1, F_OK=0
+  (define-c-lambda ffi-access (char-string int) int "access")
 
   ;; Terminal check
   (define-c-lambda ffi-isatty (int) int "isatty")
@@ -128,4 +176,46 @@ END-C
       (if (= rc 0)
         (values (_ffi_pipe_read_fd) (_ffi_pipe_write_fd))
         (error "pipe failed" rc))))
+
+  ;; mkfifo — create a named pipe (FIFO)
+  ;; mode: e.g. #o600
+  (define-c-lambda ffi-mkfifo (char-string int) int "mkfifo")
+
+  ;; unlink — remove a file/FIFO
+  (define-c-lambda ffi-unlink (char-string) int "unlink")
+
+  ;; getpid — current process ID
+  (define-c-lambda ffi-getpid () int "getpid")
+
+  ;; Read all bytes from a raw fd into a static buffer.
+  ;; Returns the number of bytes read. Use ffi-get-read-buf to retrieve the string.
+  ;; This avoids open-input-file "/dev/fd/N" which blocks on empty pipes in Gambit.
+  (c-declare #<<END-C2
+#define FFI_READ_BUF_SIZE (1024*1024)
+static char _ffi_read_buf[FFI_READ_BUF_SIZE];
+static size_t _ffi_read_buf_len = 0;
+
+static int ffi_do_read_all(int fd) {
+    _ffi_read_buf_len = 0;
+    char chunk[4096];
+    ssize_t n;
+    while ((n = read(fd, chunk, sizeof(chunk))) > 0) {
+        size_t avail = FFI_READ_BUF_SIZE - 1 - _ffi_read_buf_len;
+        size_t copy = (size_t)n < avail ? (size_t)n : avail;
+        memcpy(_ffi_read_buf + _ffi_read_buf_len, chunk, copy);
+        _ffi_read_buf_len += copy;
+        if (copy < (size_t)n) break;
+    }
+    _ffi_read_buf[_ffi_read_buf_len] = '\0';
+    return (int)_ffi_read_buf_len;
+}
+END-C2
+  )
+
+  (define-c-lambda _ffi_read_all (int) int "ffi_do_read_all")
+  (define-c-lambda _ffi_get_read_buf () char-string "___return(_ffi_read_buf);")
+
+  (define (ffi-read-all-from-fd fd)
+    (_ffi_read_all fd)
+    (_ffi_get_read_buf))
 )

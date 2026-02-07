@@ -8,6 +8,7 @@
         :std/format
         :std/sugar
         :std/iter
+        :std/error
         :gsh/ffi)
 
 ;;; --- waitpid status decoders (shell-level) ---
@@ -66,6 +67,14 @@
       (let loop ((rest (cdr lst)) (acc (car lst)))
         (if (null? rest) acc
             (loop (cdr rest) (string-append acc sep (car rest)))))))
+
+;; Find last occurrence of character in string
+(def (string-last-index-of str ch)
+  (let loop ((i (- (string-length str) 1)))
+    (cond
+      ((< i 0) #f)
+      ((char=? (string-ref str i) ch) i)
+      (else (loop (- i 1))))))
 
 ;;; --- Path / filesystem utilities ---
 
@@ -139,6 +148,8 @@
 ;; Extract a message string from any exception
 (def (exception-message e)
   (cond
+    ((Error? e)
+     (Error-message e))
     ((error-exception? e)
      (error-exception-message e))
     ((string? e) e)

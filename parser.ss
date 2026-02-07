@@ -21,13 +21,52 @@
 
 ;; Parse a complete command from input string
 ;; Returns an AST node (command-list, and-or-list, etc.) or #f for empty input
-(def (parse-complete-command input)
-  (let* ((lex (if (string? input) (make-shell-lexer input) input))
+(def (parse-complete-command input (extglob? #f))
+  (let* ((lex (if (string? input) (make-shell-lexer input extglob?) input))
          (ps (make-parser-state lex #f #f [])))
     (let ((result (parse-list ps)))
       (when (lexer-needs-more? lex)
         (set! (parser-state-needs-more? ps) #t))
       result)))
+
+;; Parse one "line" — semicolon-separated commands, stopping at newline.
+;; This allows execution between lines so shopt changes take effect.
+(def (parse-one-line input (extglob? #f))
+  (let* ((lex (if (string? input) (make-shell-lexer input extglob?) input))
+         (ps (make-parser-state lex #f #f [])))
+    (skip-newlines! ps)
+    (let ((first (parse-and-or ps)))
+      (if (not first)
+        (begin
+          (when (lexer-needs-more? lex)
+            (set! (parser-state-needs-more? ps) #t))
+          #f)
+        (let loop ((items [(cons 'sequential first)]))
+          (cond
+            ;; Semicolon — continue on same line
+            ((parser-check? ps 'SEMI)
+             (parser-consume! ps)
+             (let ((next (parse-and-or ps)))
+               (if next
+                 (loop (cons (cons 'sequential next) items))
+                 (if (= (length items) 1) (cdar items)
+                     (make-command-list (reverse items))))))
+            ;; Ampersand — background
+            ((parser-check? ps 'AMP)
+             (parser-consume! ps)
+             (let ((updated (cons (cons 'background (cdar items)) (cdr items))))
+               (if (= (length updated) 1) (cdar updated)
+                   (make-command-list (reverse updated)))))
+            ;; Newline — stop, let caller execute before parsing next line
+            ((parser-check? ps 'NEWLINE)
+             (parser-consume! ps)
+             (if (= (length items) 1) (cdar items)
+                 (make-command-list (reverse items))))
+            (else
+             (when (lexer-needs-more? lex)
+               (set! (parser-state-needs-more? ps) #t))
+             (if (= (length items) 1) (cdar items)
+                 (make-command-list (reverse items))))))))))
 
 ;; Check if parser needs more input (incomplete command)
 (def (parser-needs-more? ps)
@@ -74,9 +113,27 @@
 ;; Skip newline tokens
 (def (skip-newlines! ps)
   (let loop ()
-    (when (parser-check? ps 'NEWLINE)
-      (parser-consume! ps)
-      (loop))))
+    (cond
+      ((parser-check? ps 'NEWLINE)
+       (parser-consume! ps)
+       (loop))
+      ((and (pair? (parser-state-heredoc-queue ps))
+            (parser-check? ps 'HEREDOC_BODY))
+       (consume-heredoc-bodies! ps)
+       (loop))
+      (else (void)))))
+
+;; After a newline triggers heredoc body collection, consume the
+;; HEREDOC_BODY tokens and patch the pending redirect targets.
+(def (consume-heredoc-bodies! ps)
+  (let loop ((queue (parser-state-heredoc-queue ps)))
+    (when (pair? queue)
+      (let ((redir (car queue)))
+        (when (parser-check? ps 'HEREDOC_BODY)
+          (let ((tok (parser-next! ps)))
+            (set! (redir-target redir) (token-value tok)))))
+      (loop (cdr queue))))
+  (set! (parser-state-heredoc-queue ps) []))
 
 ;; Check if at end of input or separator
 (def (at-end-or-sep? ps)
@@ -161,20 +218,21 @@
          (first (parse-command ps)))
     (if (not first)
       (if bang? (error "parse error: expected command after !") #f)
-      (let loop ((cmds [first]))
+      (let loop ((cmds [first]) (ptypes []))
         (cond
           ((or (parser-check? ps 'PIPE) (parser-check? ps 'PIPEAMP))
            (let ((pipe-type (token-type (parser-next! ps))))
              (skip-newlines! ps)
              (let ((next (parse-command ps)))
                (if next
-                 (loop (cons next cmds))
+                 (loop (cons next cmds) (cons pipe-type ptypes))
                  (error "parse error: expected command after |")))))
           (else
-           (let ((commands (reverse cmds)))
+           (let ((commands (reverse cmds))
+                 (pipe-types (reverse ptypes)))
              (if (and (= (length commands) 1) (not bang?))
                (car commands)
-               (make-ast-pipeline commands bang?)))))))))
+               (make-ast-pipeline commands bang? pipe-types)))))))))
 
 ;; command : compound_command redirect*
 ;;         | function_def
@@ -188,7 +246,18 @@
       ((parser-check-word? ps "{")
        (parse-brace-group ps))
       ((parser-check? ps 'LPAREN)
-       (parse-subshell ps))
+       ;; Consume ( and check for (( = arithmetic command
+       (parser-consume! ps)
+       (if (parser-check? ps 'LPAREN)
+         (parse-arith-command ps)
+         ;; Regular subshell — ( already consumed, parse body directly
+         (let ((body (parse-list ps)))
+           (skip-newlines! ps)
+           (unless (parser-check? ps 'RPAREN)
+             (error "parse error: expected ')'"))
+           (parser-consume! ps)
+           (let ((redirs (parse-redirect-list ps)))
+             (make-subshell body)))))
       ((parser-check-word? ps "if")
        (parse-if ps))
       ((parser-check-word? ps "while")
@@ -201,8 +270,12 @@
        (parse-case ps))
       ((parser-check-word? ps "select")
        (parse-select ps))
+      ((parser-check-word? ps "[[")
+       (parse-cond-command ps))
       ((parser-check-word? ps "function")
        (parse-function-def-keyword ps))
+      ((parser-check-word? ps "coproc")
+       (parse-coproc ps))
       ;; Check for function def: word ( )
       ;; (handled in simple-command when we see WORD LPAREN RPAREN)
       (else
@@ -223,9 +296,25 @@
       (let ((tok (parser-peek ps)))
         (cond
           ((parser-check? ps 'ASSIGNMENT_WORD)
-           (let ((tok (parser-next! ps)))
-             (set! assignments (cons (parse-assignment-token tok) assignments))
-             (prefix-loop)))
+           (let* ((tok (parser-next! ps))
+                  (asgn (parse-assignment-token tok)))
+             ;; Check for compound array assignment: NAME=( ... )
+             (if (and (string=? (assignment-value asgn) "")
+                      (not (assignment-index asgn))
+                      (parser-check? ps 'LPAREN))
+               ;; Compound assignment: NAME=(val1 val2 ...)
+               (begin
+                 (parser-consume! ps) ;; skip (
+                 (let ((values (parse-compound-array-values ps)))
+                   (set! assignments
+                     (cons (make-assignment (assignment-name asgn) #f values
+                                           (assignment-op asgn))
+                           assignments))
+                   (prefix-loop)))
+               ;; Regular assignment
+               (begin
+                 (set! assignments (cons asgn assignments))
+                 (prefix-loop)))))
           ((redirect-token? tok)
            (set! redirections (cons (parse-redirect! ps) redirections))
            (prefix-loop))
@@ -259,12 +348,22 @@
               (let ((tok (parser-peek ps)))
                 (cond
                   ((and (token? tok)
-                        (or (and (eq? (token-type tok) 'WORD)
-                                 (not (reserved-word? (token-value tok))))
+                        (or (eq? (token-type tok) 'WORD)
                             ;; ASSIGNMENT_WORD as argument to builtins like
                             ;; local, export, readonly, declare
                             (eq? (token-type tok) 'ASSIGNMENT_WORD)))
                    (set! words (cons (token-value (parser-next! ps)) words))
+                   (suffix-loop))
+                  ;; Process substitution <(cmd) or >(cmd)
+                  ((and (token? tok)
+                        (eq? (token-type tok) 'PROCSUB_IN))
+                   (let ((t (parser-next! ps)))
+                     (set! words (cons (make-word-process-sub 'in (token-value t)) words)))
+                   (suffix-loop))
+                  ((and (token? tok)
+                        (eq? (token-type tok) 'PROCSUB_OUT))
+                   (let ((t (parser-next! ps)))
+                     (set! words (cons (make-word-process-sub 'out (token-value t)) words)))
                    (suffix-loop))
                   ((redirect-token? tok)
                    (set! redirections (cons (parse-redirect! ps) redirections))
@@ -278,22 +377,41 @@
        (reverse words)
        (reverse redirections))))))
 
-;; Parse an assignment token "NAME=VALUE" or "NAME+=VALUE"
+;; Parse an assignment token "NAME=VALUE", "NAME+=VALUE",
+;; "NAME[idx]=VALUE", or "NAME[idx]+=VALUE"
 (def (parse-assignment-token tok)
   (let* ((word (token-value tok))
-         (eq-pos (string-find-eq word)))
-    (if (and eq-pos (> eq-pos 0)
-             (char=? (string-ref word (- eq-pos 1)) #\+))
-      ;; NAME+=VALUE
-      (make-assignment
-       (substring word 0 (- eq-pos 1))
-       (substring word (+ eq-pos 1) (string-length word))
-       '+=)
-      ;; NAME=VALUE
-      (make-assignment
-       (substring word 0 eq-pos)
-       (substring word (+ eq-pos 1) (string-length word))
-       '=))))
+         (eq-pos (string-find-eq word))
+         (append? (and eq-pos (> eq-pos 0)
+                       (char=? (string-ref word (- eq-pos 1)) #\+)))
+         (name-end (if append? (- eq-pos 1) eq-pos))
+         (name-part (substring word 0 name-end))
+         (value (substring word (+ eq-pos 1) (string-length word)))
+         (op (if append? '+= '=)))
+    ;; Check for array index: NAME[expr]
+    (let ((bracket-pos (string-find-bracket name-part)))
+      (if bracket-pos
+        ;; NAME[expr]=VALUE
+        (let* ((name (substring name-part 0 bracket-pos))
+               (close (string-find-close-bracket name-part (+ bracket-pos 1)))
+               (index (if close
+                        (substring name-part (+ bracket-pos 1) close)
+                        "")))
+          (make-assignment name index value op))
+        ;; NAME=VALUE (no index)
+        (make-assignment name-part #f value op)))))
+
+(def (string-find-bracket str)
+  (let loop ((i 0))
+    (cond ((>= i (string-length str)) #f)
+          ((char=? (string-ref str i) #\[) i)
+          (else (loop (+ i 1))))))
+
+(def (string-find-close-bracket str start)
+  (let loop ((i start))
+    (cond ((>= i (string-length str)) #f)
+          ((char=? (string-ref str i) #\]) i)
+          (else (loop (+ i 1))))))
 
 (def (string-find-eq str)
   (let loop ((i 0))
@@ -302,7 +420,52 @@
       ((char=? (string-ref str i) #\=) i)
       (else (loop (+ i 1))))))
 
+;; Parse compound array values between ( and )
+;; Returns a list of strings (words or [key]=val)
+(def (parse-compound-array-values ps)
+  (skip-newlines! ps)
+  (let loop ((values []))
+    (cond
+      ((parser-check? ps 'RPAREN)
+       (parser-consume! ps)
+       (reverse values))
+      ((parser-check? ps 'NEWLINE)
+       (parser-consume! ps)
+       (skip-newlines! ps)
+       (loop values))
+      ((or (parser-check? ps 'WORD)
+           (parser-check? ps 'ASSIGNMENT_WORD))
+       (let ((tok (parser-next! ps)))
+         (loop (cons (token-value tok) values))))
+      (else
+       ;; Unexpected token — close the compound
+       (reverse values)))))
+
 ;;; --- Redirections ---
+
+;; Check if a heredoc delimiter contains quoting characters
+(def (heredoc-delimiter-quoted? delim)
+  (let ((len (string-length delim)))
+    (let loop ((i 0))
+      (if (>= i len)
+        #f
+        (let ((ch (string-ref delim i)))
+          (if (or (char=? ch #\') (char=? ch #\"))
+            #t
+            (loop (+ i 1))))))))
+
+;; Strip quote characters from a heredoc delimiter
+(def (strip-heredoc-quotes delim)
+  (let ((out (open-output-string))
+        (len (string-length delim)))
+    (let loop ((i 0))
+      (if (>= i len)
+        (get-output-string out)
+        (let ((ch (string-ref delim i)))
+          (if (or (char=? ch #\') (char=? ch #\"))
+            (loop (+ i 1))
+            (begin (display ch out)
+                   (loop (+ i 1)))))))))
 
 (def (redirect-token? tok)
   (and (token? tok)
@@ -318,24 +481,48 @@
       (set! fd (string->number (token-value (parser-next! ps)))))
     (let ((op-tok (parser-next! ps)))
       (let ((op-type (token-type op-tok)))
-        (let ((target-tok (parser-next! ps)))
-          (make-redir
-           (case op-type
-             ((LESS) '<)
-             ((GREAT) '>)
-             ((DGREAT) '>>)
-             ((CLOBBER) 'clobber)
-             ((LESSAND) '<&)
-             ((GREATAND) '>&)
-             ((LESSGREAT) '<>)
-             ((DLESS) '<<)
-             ((DLESSDASH) '<<-)
-             ((TLESS) '<<<)
-             ((AMPGREAT) '&>)
-             ((AMPGREAT_GREAT) '&>>)
-             (else '>))
-           fd
-           (if (token? target-tok) (token-value target-tok) "")))))))
+        ;; Target word is required — syntax error if missing
+        (let* ((target-tok (parser-peek ps))
+               (_ (when (or (not target-tok) (not (token? target-tok))
+                            (memq (token-type target-tok) '(NEWLINE SEMI EOF)))
+                    (error "parse error: redirect target missing")))
+               (target-tok (parser-next! ps))
+               (target (token-value target-tok))
+               (r (make-redir
+                   (case op-type
+                     ((LESS) '<)
+                     ((GREAT) '>)
+                     ((DGREAT) '>>)
+                     ((CLOBBER) 'clobber)
+                     ((LESSAND) '<&)
+                     ((GREATAND) '>&)
+                     ((LESSGREAT) '<>)
+                     ((DLESS) '<<)
+                     ((DLESSDASH) '<<-)
+                     ((TLESS) '<<<)
+                     ((AMPGREAT) '&>)
+                     ((AMPGREAT_GREAT) '&>>)
+                     (else '>))
+                   fd
+                   target)))
+          ;; For heredocs, register spec with lexer for body collection
+          (when (memq op-type '(DLESS DLESSDASH))
+            (let* ((lex (parser-state-lexer ps))
+                   (strip-tabs? (eq? op-type 'DLESSDASH))
+                   (quoted? (heredoc-delimiter-quoted? target))
+                   (bare-delim (if quoted?
+                                 (strip-heredoc-quotes target)
+                                 target)))
+              ;; Register with lexer using the unquoted delimiter
+              (set! (lexer-heredocs lex)
+                (cons (list bare-delim strip-tabs? quoted?)
+                      (lexer-heredocs lex)))
+              ;; Mark quoted heredocs with different op (no expansion)
+              (when quoted?
+                (set! (redir-op r) (if strip-tabs? '<<-q '<<q)))
+              (set! (parser-state-heredoc-queue ps)
+                (append (parser-state-heredoc-queue ps) (list r)))))
+          r)))))
 
 (def (parse-redirect-list ps)
   (let loop ((redirs []))
@@ -346,13 +533,53 @@
 ;;; --- Compound commands ---
 
 ;; { list ; }
+;; coproc [NAME] compound-command
+;; coproc simple-command    (NAME defaults to COPROC)
+;; With a simple command, no NAME is allowed.
+;; With a compound command, an optional NAME can precede it.
+;;
+;; Strategy: parse what follows "coproc" as a normal command. If the result is
+;; a simple-command with exactly one bare word and the next token starts a
+;; compound command, treat that word as the NAME and parse the compound command
+;; as the body. Otherwise, use the default name COPROC.
+(def (parse-coproc ps)
+  (parser-expect-word! ps "coproc")
+  (skip-newlines! ps)
+  ;; Parse the body (which might actually be a name followed by a compound command)
+  (let ((first (parse-command ps)))
+    ;; Check if "first" is really a name: simple-command with one bare word,
+    ;; no assignments, no redirections, followed by a compound command
+    (if (and (simple-command? first)
+             (let ((words (simple-command-words first)))
+               (and (pair? words) (null? (cdr words))
+                    (string? (car words))))
+             (null? (simple-command-assignments first))
+             (null? (simple-command-redirections first))
+             (coproc-compound-start? ps))
+      ;; The single word was a name — parse the real body
+      (let ((name (car (simple-command-words first)))
+            (body (parse-command ps)))
+        (make-coproc-command name body))
+      ;; Use default name
+      (make-coproc-command "COPROC" first))))
+
+;; Check if the next token starts a compound command (for coproc name detection)
+(def (coproc-compound-start? ps)
+  (let ((tok (parser-peek ps)))
+    (and (token? tok)
+         (or (parser-check? ps 'LPAREN)
+             (and (eq? (token-type tok) 'WORD)
+                  (member (token-value tok) '("{" "while" "until" "if" "for")))))))
+
 (def (parse-brace-group ps)
   (parser-expect-word! ps "{")
   (let ((body (parse-list ps)))
     (skip-newlines! ps)
     (parser-expect-word! ps "}")
     (let ((redirs (parse-redirect-list ps)))
-      (make-brace-group body))))
+      (if (pair? redirs)
+        (make-redirected-command (make-brace-group body) redirs)
+        (make-brace-group body)))))
 
 ;; ( list )
 (def (parse-subshell ps)
@@ -363,7 +590,9 @@
       (error "parse error: expected ')'"))
     (parser-consume! ps)
     (let ((redirs (parse-redirect-list ps)))
-      (make-subshell body))))
+      (if (pair? redirs)
+        (make-redirected-command (make-subshell body) redirs)
+        (make-subshell body)))))
 
 ;; if list ; then list [elif list ; then list]* [else list] fi
 (def (parse-if ps)
@@ -384,10 +613,14 @@
              (let ((else-body (parse-list ps)))
                (skip-newlines! ps)
                (parser-expect-word! ps "fi")
-               (make-if-command (reverse new-clauses) else-body)))
+               (let* ((cmd (make-if-command (reverse new-clauses) else-body))
+                      (redirs (parse-redirect-list ps)))
+                 (if (pair? redirs) (make-redirected-command cmd redirs) cmd))))
             (else
              (parser-expect-word! ps "fi")
-             (make-if-command (reverse new-clauses) #f))))))))
+             (let* ((cmd (make-if-command (reverse new-clauses) #f))
+                    (redirs (parse-redirect-list ps)))
+               (if (pair? redirs) (make-redirected-command cmd redirs) cmd)))))))))
 
 ;; while list ; do list ; done
 (def (parse-while ps)
@@ -398,7 +631,9 @@
     (let ((body (parse-list ps)))
       (skip-newlines! ps)
       (parser-expect-word! ps "done")
-      (make-while-command test body))))
+      (let* ((cmd (make-while-command test body))
+             (redirs (parse-redirect-list ps)))
+        (if (pair? redirs) (make-redirected-command cmd redirs) cmd)))))
 
 ;; until list ; do list ; done
 (def (parse-until ps)
@@ -409,11 +644,26 @@
     (let ((body (parse-list ps)))
       (skip-newlines! ps)
       (parser-expect-word! ps "done")
-      (make-until-command test body))))
+      (let* ((cmd (make-until-command test body))
+             (redirs (parse-redirect-list ps)))
+        (if (pair? redirs) (make-redirected-command cmd redirs) cmd)))))
 
 ;; for name [in word ...] ; do list ; done
+;; for (( init; test; update )) ; do list ; done
 (def (parse-for ps)
   (parser-expect-word! ps "for")
+  ;; Check for (( = arithmetic for-loop
+  (if (parser-check? ps 'LPAREN)
+    (let ((saved (parser-next! ps)))
+      (if (parser-check? ps 'LPAREN)
+        (parse-arith-for ps)
+        (begin
+          (set! (parser-state-peeked ps) saved)
+          (parse-for-in ps))))
+    (parse-for-in ps)))
+
+;; Regular for-in loop
+(def (parse-for-in ps)
   (let ((name-tok (parser-next! ps)))
     (unless (and (token? name-tok) (eq? (token-type name-tok) 'WORD))
       (error "parse error: expected variable name after 'for'"))
@@ -443,7 +693,154 @@
         (let ((body (parse-list ps)))
           (skip-newlines! ps)
           (parser-expect-word! ps "done")
-          (make-for-command var-name words body))))))
+          (let* ((cmd (make-for-command var-name words body))
+                 (redirs (parse-redirect-list ps)))
+            (if (pair? redirs) (make-redirected-command cmd redirs) cmd)))))))
+
+;; (( expr )) — arithmetic command (returns 0 if non-zero, 1 if zero)
+;; Called after consuming both opening LPAREN tokens
+(def (parse-arith-command ps)
+  (parser-consume! ps)  ;; skip second (
+  ;; Read tokens until we see )) — collect as raw text
+  (let ((expr (read-arith-body ps)))
+    (make-arith-command expr)))
+
+;; for (( init; test; update )) ; do list ; done
+;; Called after consuming "for" and both LPAREN tokens
+(def (parse-arith-for ps)
+  (parser-consume! ps)  ;; skip second (
+  ;; Read three semicolon-separated expressions until ))
+  (let* ((init-expr (read-arith-until-semi ps))
+         (test-expr (read-arith-until-semi ps))
+         (update-expr (read-arith-until-close ps)))
+    ;; Skip optional ; or newlines before do
+    (when (parser-check? ps 'SEMI) (parser-consume! ps))
+    (skip-newlines! ps)
+    (parser-expect-word! ps "do")
+    (let ((body (parse-list ps)))
+      (skip-newlines! ps)
+      (parser-expect-word! ps "done")
+      (make-arith-for-command init-expr test-expr update-expr body))))
+
+;; Read raw characters from lexer input, bypassing shell tokenization.
+;; Arithmetic expressions contain <, >, |, & which the shell lexer
+;; would incorrectly treat as operators.
+
+;; Helper: get current char from lexer, or #f at end
+(def (lexer-raw-char lex)
+  (if (>= (lexer-pos lex) (lexer-len lex))
+    #f
+    (string-ref (lexer-input lex) (lexer-pos lex))))
+
+;; Helper: advance lexer position by 1
+(def (lexer-raw-advance! lex)
+  (set! (lexer-pos lex) (+ 1 (lexer-pos lex))))
+
+;; Helper: clear any peeked token from both parser and lexer
+;; (since we're reading raw, any peeked token is stale)
+(def (parser-clear-peeked! ps)
+  (set! (parser-state-peeked ps) #f)
+  (set! (lexer-peeked (parser-state-lexer ps)) #f))
+
+;; Read arithmetic body until )) — returns expression string
+;; Reads raw characters from lexer input, tracking nested parens.
+(def (read-arith-body ps)
+  (parser-clear-peeked! ps)
+  (let ((lex (parser-state-lexer ps))
+        (buf (open-output-string)))
+    (let loop ((depth 0))
+      (let ((ch (lexer-raw-char lex)))
+        (cond
+          ((not ch)
+           (error "parse error: expected '))'"))
+          ((char=? ch #\()
+           (lexer-raw-advance! lex)
+           (display ch buf)
+           (loop (+ depth 1)))
+          ((char=? ch #\))
+           (if (> depth 0)
+             (begin (lexer-raw-advance! lex)
+                    (display ch buf)
+                    (loop (- depth 1)))
+             ;; depth=0: check for second )
+             (begin
+               (lexer-raw-advance! lex)
+               (let ((ch2 (lexer-raw-char lex)))
+                 (if (and ch2 (char=? ch2 #\)))
+                   (begin (lexer-raw-advance! lex)
+                          (string-trim-ws (get-output-string buf)))
+                   (begin (display ")" buf)
+                          (loop depth)))))))
+          (else
+           (lexer-raw-advance! lex)
+           (display ch buf)
+           (loop depth)))))))
+
+;; Read arithmetic expression until ; inside (( )) for for-loops
+(def (read-arith-until-semi ps)
+  (parser-clear-peeked! ps)
+  (let ((lex (parser-state-lexer ps))
+        (buf (open-output-string)))
+    (let loop ((depth 0))
+      (let ((ch (lexer-raw-char lex)))
+        (cond
+          ((not ch)
+           (error "parse error: expected ';' in for (( ))"))
+          ((char=? ch #\()
+           (lexer-raw-advance! lex)
+           (display ch buf)
+           (loop (+ depth 1)))
+          ((char=? ch #\))
+           (lexer-raw-advance! lex)
+           (display ch buf)
+           (loop (if (> depth 0) (- depth 1) depth)))
+          ((and (char=? ch #\;) (= depth 0))
+           (lexer-raw-advance! lex)
+           (string-trim-ws (get-output-string buf)))
+          (else
+           (lexer-raw-advance! lex)
+           (display ch buf)
+           (loop depth)))))))
+
+;; Read arithmetic expression until )) — handles the close of for (( ))
+(def (read-arith-until-close ps)
+  (parser-clear-peeked! ps)
+  (let ((lex (parser-state-lexer ps))
+        (buf (open-output-string)))
+    (let loop ((depth 0))
+      (let ((ch (lexer-raw-char lex)))
+        (cond
+          ((not ch)
+           (error "parse error: expected '))' in for (( ))"))
+          ((char=? ch #\()
+           (lexer-raw-advance! lex)
+           (display ch buf)
+           (loop (+ depth 1)))
+          ((char=? ch #\))
+           (if (> depth 0)
+             (begin (lexer-raw-advance! lex)
+                    (display ch buf)
+                    (loop (- depth 1)))
+             ;; depth=0: check for ))
+             (begin
+               (lexer-raw-advance! lex)
+               (let ((ch2 (lexer-raw-char lex)))
+                 (if (and ch2 (char=? ch2 #\)))
+                   (begin (lexer-raw-advance! lex)
+                          (string-trim-ws (get-output-string buf)))
+                   (begin (display ")" buf)
+                          (loop depth)))))))
+          (else
+           (lexer-raw-advance! lex)
+           (display ch buf)
+           (loop depth)))))))
+
+(def (string-trim-ws str)
+  (let* ((len (string-length str))
+         (end (let loop ((i (- len 1)))
+                (if (and (>= i 0) (char-whitespace? (string-ref str i)))
+                  (loop (- i 1)) (+ i 1)))))
+    (substring str 0 end)))
 
 ;; case word in [[(] pattern [| pattern]* ) list ;;]* esac
 (def (parse-case ps)
@@ -459,7 +856,9 @@
         (cond
           ((parser-check-word? ps "esac")
            (parser-consume! ps)
-           (make-case-command word (reverse clauses)))
+           (let* ((cmd (make-case-command word (reverse clauses)))
+                  (redirs (parse-redirect-list ps)))
+             (if (pair? redirs) (make-redirected-command cmd redirs) cmd)))
           (else
            ;; Parse pattern list
            (when (parser-check? ps 'LPAREN) (parser-consume! ps))  ;; optional (
@@ -538,5 +937,149 @@
     (let ((body (parse-command ps))
           (redirs (parse-redirect-list ps)))
       (make-function-def (token-value name-tok) body redirs))))
+
+;;; --- [[ ]] conditional command ---
+
+;; [[ expr ]]
+;; Grammar (precedence low to high):
+;;   or_expr   : and_expr ('||' and_expr)*
+;;   and_expr  : not_expr ('&&' not_expr)*
+;;   not_expr  : '!' not_expr | primary
+;;   primary   : '(' or_expr ')' | unary_test | binary_test | word
+(def (parse-cond-command ps)
+  (parser-consume! ps)  ;; skip [[
+  (let ((expr (parse-cond-or ps)))
+    (unless (parser-check-word? ps "]]")
+      (error "parse error: expected ']]'"))
+    (parser-consume! ps)
+    (make-cond-command expr)))
+
+(def (parse-cond-or ps)
+  (let loop ((left (parse-cond-and ps)))
+    (cond
+      ((parser-check? ps 'OR_IF)
+       (parser-consume! ps)
+       (loop (make-cond-binary "||" left (parse-cond-and ps))))
+      (else left))))
+
+(def (parse-cond-and ps)
+  (let loop ((left (parse-cond-not ps)))
+    (cond
+      ((parser-check? ps 'AND_IF)
+       (parser-consume! ps)
+       (loop (make-cond-binary "&&" left (parse-cond-not ps))))
+      (else left))))
+
+(def (parse-cond-not ps)
+  (if (parser-check? ps 'BANG)
+    (begin
+      (parser-consume! ps)
+      (make-cond-not (parse-cond-not ps)))
+    (parse-cond-primary ps)))
+
+(def (cond-unary-op? s)
+  (member s '("-a" "-b" "-c" "-d" "-e" "-f" "-g" "-h" "-k" "-p" "-r" "-s"
+              "-t" "-u" "-w" "-x" "-G" "-L" "-N" "-O" "-S" "-z" "-n"
+              "-o" "-v" "-R")))
+
+(def (cond-binary-op? s)
+  (member s '("=" "==" "!=" "<" ">" "=~"
+              "-eq" "-ne" "-lt" "-gt" "-le" "-ge"
+              "-ef" "-nt" "-ot")))
+
+;; Peek at next token to see if it's a binary operator
+;; Handles WORD-based ops, LESS/GREAT tokens, and BANG= (!=)
+(def (cond-peek-binary-op ps)
+  (let ((peek (parser-peek ps)))
+    (and peek
+         (cond
+           ((and (eq? (token-type peek) 'WORD) (cond-binary-op? (token-value peek)))
+            (token-value peek))
+           ((eq? (token-type peek) 'LESS) "<")
+           ((eq? (token-type peek) 'GREAT) ">")
+           ;; != is tokenized as BANG + WORD "="
+           ((eq? (token-type peek) 'BANG) "!=")
+           (else #f)))))
+
+(def (parse-cond-primary ps)
+  ;; Grouping
+  (cond
+    ((parser-check? ps 'LPAREN)
+     (parser-consume! ps)
+     (let ((expr (parse-cond-or ps)))
+       (unless (parser-check? ps 'RPAREN)
+         (error "parse error: expected ')' in [[ ]] expression"))
+       (parser-consume! ps)
+       expr))
+    ;; Need a word token
+    ((or (parser-check? ps 'WORD) (parser-check? ps 'ASSIGNMENT_WORD))
+     (let* ((tok (parser-next! ps))
+            (val (token-value tok)))
+       ;; Check for unary operator
+       (if (cond-unary-op? val)
+         ;; Unary test: -f file, -z str, etc.
+         (let ((arg-tok (parser-next! ps)))
+           (make-cond-unary-test val (token-value arg-tok)))
+         ;; Could be binary test: word OP word
+         ;; Or bare word
+         (let ((op (cond-peek-binary-op ps)))
+           (if op
+             ;; Binary test
+             (begin
+               (parser-consume! ps) ;; skip operator token
+               ;; != is BANG + WORD "=" — need to consume the "=" too
+               (when (string=? op "!=")
+                 (parser-consume! ps))
+               ;; For =~ and pattern ops, collect RHS liberally
+               ;; (parens can appear in regex patterns)
+               (let ((right (cond-collect-rhs ps op)))
+                 (make-cond-binary-test op val right)))
+             ;; Bare word (truthy if non-empty after expansion)
+             (make-cond-word val))))))
+    (else
+     (error "parse error: unexpected token in [[ ]] expression"
+            (let ((t (parser-peek ps))) (and t (token-value t)))))))
+
+;; Collect right-hand side for binary ops in [[ ]]
+;; For =~, ==, !=: parens and other operators can appear as part of the value
+(def (cond-collect-rhs ps op)
+  (if (member op '("=~" "==" "=" "!="))
+    ;; Collect tokens liberally — parens/angles are part of pattern/regex
+    (let loop ((parts []))
+      (let ((peek (parser-peek ps)))
+        (cond
+          ((not peek) (apply string-append (reverse parts)))
+          ;; Stop at ]] && ||
+          ((and (eq? (token-type peek) 'WORD)
+                (member (token-value peek) '("]]")))
+           (apply string-append (reverse parts)))
+          ((memq (token-type peek) '(AND_AND OR_OR))
+           (apply string-append (reverse parts)))
+          ;; RPAREN at top level could be grouping close — stop
+          ;; But for regex, we want to include parens.
+          ;; Heuristic: if we already have content, RPAREN is part of it
+          ((eq? (token-type peek) 'RPAREN)
+           (if (null? parts)
+             ;; standalone ) — probably grouping, stop
+             (apply string-append (reverse parts))
+             ;; continuation — include it
+             (begin (parser-consume! ps) (loop (cons ")" parts)))))
+          ((eq? (token-type peek) 'LPAREN)
+           (parser-consume! ps) (loop (cons "(" parts)))
+          ((eq? (token-type peek) 'LESS)
+           (parser-consume! ps) (loop (cons "<" parts)))
+          ((eq? (token-type peek) 'GREAT)
+           (parser-consume! ps) (loop (cons ">" parts)))
+          ((eq? (token-type peek) 'BANG)
+           (parser-consume! ps) (loop (cons "!" parts)))
+          ((eq? (token-type peek) 'PIPE)
+           (parser-consume! ps) (loop (cons "|" parts)))
+          ((memq (token-type peek) '(WORD ASSIGNMENT_WORD))
+           (parser-consume! ps) (loop (cons (token-value peek) parts)))
+          (else
+           (apply string-append (reverse parts))))))
+    ;; For other ops (<, >, -eq, etc.), just read one token
+    (let ((tok (parser-next! ps)))
+      (token-value tok))))
 
 ;;; --- Helpers ---

@@ -37,7 +37,13 @@
     (if (null? redirs)
       (reverse saved)
       (let* ((redir (car redirs))
-             (result (apply-single-redirect! redir env)))
+             (result (with-catch
+                      (lambda (e)
+                        ;; Redirect failed — restore already-applied redirections
+                        (restore-redirections (reverse saved))
+                        (raise e))
+                      (lambda ()
+                        (apply-single-redirect! redir env)))))
         (cond
           ((not result) (loop (cdr redirs) saved))
           ;; Multi-save: &> and &>> return a list of save entries
@@ -51,16 +57,27 @@
            (loop (cdr redirs) (append (reverse result) saved))))))))
 
 ;; Restore redirections from saved state
+;; Each entry: (fd saved-real-fd saved-port) or (fd saved-real-fd saved-port new-port)
 (def (restore-redirections saved)
   (for-each
    (lambda (entry)
      (let ((fd (car entry))
            (saved-real-fd (cadr entry))
-           (saved-port (caddr entry)))
+           (saved-port (caddr entry))
+           (new-port (and (> (length entry) 3) (cadddr entry))))
+       ;; Flush and close any new port we created (before restoring fd)
+       (when new-port
+         (with-catch void (lambda () (force-output new-port)))
+         (with-catch void (lambda () (close-port new-port))))
        ;; Restore the real fd
-       (when (>= saved-real-fd 0)
-         (ffi-dup2 saved-real-fd fd)
-         (ffi-close-fd saved-real-fd))
+       (if (>= saved-real-fd 0)
+         (begin
+           (ffi-dup2 saved-real-fd fd)
+           (ffi-close-fd saved-real-fd))
+         ;; saved-real-fd is -1: fd wasn't open before, close it to restore
+         ;; Only close non-standard fds (never close 0/1/2)
+         (when (> fd 2)
+           (ffi-close-fd fd)))
        ;; Restore the Gambit port parameter
        (when saved-port
          (case fd
@@ -69,12 +86,40 @@
            ((2) (current-error-port saved-port))))))
    (reverse saved)))
 
+;; Apply redirections permanently (for exec without command)
+;; Does not save original fds — changes are permanent
+(def (apply-redirections-permanent! redirs env)
+  (for-each
+   (lambda (redir) (apply-single-redirect-permanent! redir env))
+   redirs))
+
 ;;; --- Single redirection ---
 
 (def (apply-single-redirect! redir env)
   (let* ((op (redir-op redir))
          (fd (or (redir-fd redir) (default-fd-for-op op)))
-         (target-str (expand-word-nosplit (redir-target redir) env)))
+         (target-str (cond
+                       ((memq op '(<< <<- <<< <<q <<-q))
+                        ;; Heredocs/herestrings: expand but no word splitting validation
+                        (cond
+                          ((memq op '(<<q <<-q)) (redir-target redir))
+                          ((eq? op '<<<)
+                           (expand-word-nosplit (redir-target redir) env))
+                          (else (expand-heredoc-body (redir-target redir) env))))
+                       ;; Fd dup targets (&> / <&): don't validate as file
+                       ((memq op '(>& <&))
+                        (expand-word-nosplit (redir-target redir) env))
+                       (else
+                        ;; File redirect: validate target
+                        (let ((words (expand-word (redir-target redir) env)))
+                          (cond
+                            ((or (null? words) (> (length words) 1))
+                             (error (string-append (redir-target redir) ": ambiguous redirect")))
+                            (else
+                             (let ((w (car words)))
+                               (when (string=? w "")
+                                 (error ": No such file or directory"))
+                               w))))))))
     (case op
       ;; < file — input from file
       ((<)
@@ -87,9 +132,10 @@
       ;; > file — output to file (truncate)
       ((>)
        (let ((save (save-fd fd)))
-         ;; Check noclobber
+         ;; Check noclobber — only block regular files (not /dev/null etc.)
          (when (and (env-option? env "noclobber")
-                    (file-exists? target-str))
+                    (file-exists? target-str)
+                    (eq? (file-info-type (file-info target-str)) 'regular))
            (fprintf (current-error-port) "gsh: ~a: cannot overwrite existing file~n" target-str)
            (restore-single! save)
            (error "cannot overwrite existing file"))
@@ -144,7 +190,7 @@
            (current-error-port port))
          (list save1 save2)))
       ;; << heredoc — here-document
-      ((<< <<-)
+      ((<< <<- <<q <<-q)
        (let ((save (save-fd 0)))
          ;; For heredoc, we use a pipe: write content, read from pipe
          (let-values (((read-fd write-fd) (ffi-pipe-raw)))
@@ -176,6 +222,7 @@
          (current-input-port (open-input-string (string-append target-str "\n")))
          save))
       ;; >& n — dup fd (or close with >& -)
+      ;; >& word — when word is not a number or -, redirect both stdout+stderr to file
       ((>&)
        (cond
          ((string=? target-str "-")
@@ -185,15 +232,42 @@
             save))
          (else
           (let ((target-fd (string->number target-str)))
-            (if target-fd
-              (let ((save (save-fd fd)))
-                (ffi-dup2 target-fd fd)
-                ;; Also update Gambit port
-                (dup-gambit-port! target-fd fd)
-                save)
-              (begin
-                (fprintf (current-error-port) "gsh: ~a: bad file descriptor~n" target-str)
-                #f))))))
+            (cond
+              (target-fd
+               (let ((save (save-fd fd)))
+                 (let ((r (ffi-dup2 target-fd fd)))
+                   (when (< r 0)
+                     (restore-single! save)
+                     (error (string-append (number->string target-fd) ": Bad file descriptor")))
+                   ;; Update Gambit port: if the source fd is not a standard
+                   ;; Gambit port (0/1/2), create a fresh port via /dev/fd/N
+                   ;; to avoid sendto-on-non-socket errors when Gambit cached
+                   ;; the fd type at startup. Track the new port in save for cleanup.
+                   (if (and (<= 0 fd 2) (not (<= 0 target-fd 2)))
+                     ;; High fd → standard fd: need fresh Gambit port
+                     (let ((new-port (make-port-for-fd fd)))
+                       (set-current-port-for-fd! fd new-port)
+                       (append save (list new-port)))
+                     ;; Standard fd → standard fd: copy existing Gambit port
+                     (begin (dup-gambit-port! target-fd fd)
+                            save)))))
+              ;; Only treat as &> if fd was NOT explicitly specified
+              ;; 1>&file → error (bad file descriptor)
+              ;; >&file → equivalent to &>file
+              ((redir-fd redir)
+               (error (string-append target-str ": Bad file descriptor")))
+              (else
+               ;; Not a number, no explicit fd → treat as &> (redirect stdout+stderr to file)
+               (let ((save1 (save-fd 1))
+                     (save2 (save-fd 2)))
+                 (redirect-fd-to-file! 1 target-str
+                                       (bitwise-ior O_WRONLY O_CREAT O_TRUNC)
+                                       #o666)
+                 (ffi-dup2 1 2)
+                 (let ((port (open-output-file [path: target-str truncate: #t])))
+                   (current-output-port port)
+                   (current-error-port port))
+                 (list save1 save2))))))))
       ;; <& n — dup fd for input
       ((<&)
        (cond
@@ -205,9 +279,16 @@
           (let ((target-fd (string->number target-str)))
             (if target-fd
               (let ((save (save-fd fd)))
-                (ffi-dup2 target-fd fd)
-                (dup-gambit-port! target-fd fd)
-                save)
+                (let ((r (ffi-dup2 target-fd fd)))
+                  (when (< r 0)
+                    (restore-single! save)
+                    (error (string-append (number->string target-fd) ": Bad file descriptor")))
+                  (if (and (<= 0 fd 2) (not (<= 0 target-fd 2)))
+                    (let ((new-port (make-port-for-fd fd)))
+                      (set-current-port-for-fd! fd new-port)
+                      (append save (list new-port)))
+                    (begin (dup-gambit-port! target-fd fd)
+                           save))))
               (begin
                 (fprintf (current-error-port) "gsh: ~a: bad file descriptor~n" target-str)
                 #f))))))
@@ -220,18 +301,114 @@
        (fprintf (current-error-port) "gsh: unsupported redirect operator ~a~n" op)
        #f))))
 
+;; Apply a single redirect permanently (for exec)
+;; Same logic but no save/restore
+(def (apply-single-redirect-permanent! redir env)
+  (let* ((op (redir-op redir))
+         (fd (or (redir-fd redir) (default-fd-for-op op)))
+         (target-str (cond
+                       ((memq op '(<< <<- <<< <<q <<-q))
+                        (cond
+                          ((memq op '(<<q <<-q)) (redir-target redir))
+                          ((eq? op '<<<)
+                           (expand-word-nosplit (redir-target redir) env))
+                          (else (expand-heredoc-body (redir-target redir) env))))
+                       ((memq op '(>& <&))
+                        (expand-word-nosplit (redir-target redir) env))
+                       (else
+                        (let ((words (expand-word (redir-target redir) env)))
+                          (cond
+                            ((or (null? words) (> (length words) 1))
+                             (error (string-append (redir-target redir) ": ambiguous redirect")))
+                            (else
+                             (let ((w (car words)))
+                               (when (string=? w "")
+                                 (error ": No such file or directory"))
+                               w))))))))
+    (case op
+      ((<) (redirect-fd-to-file! fd target-str O_RDONLY 0)
+           (when (= fd 0)
+             (current-input-port (open-input-file target-str))))
+      ((>) (redirect-fd-to-file! fd target-str
+                                 (bitwise-ior O_WRONLY O_CREAT O_TRUNC) #o666)
+           (when (or (= fd 1) (= fd 2))
+             (set-port-for-fd! fd target-str 'truncate)))
+      ((>>) (redirect-fd-to-file! fd target-str
+                                  (bitwise-ior O_WRONLY O_CREAT O_APPEND) #o666)
+            (when (or (= fd 1) (= fd 2))
+              (set-port-for-fd! fd target-str 'append)))
+      ((clobber) (redirect-fd-to-file! fd target-str
+                                       (bitwise-ior O_WRONLY O_CREAT O_TRUNC) #o666)
+                 (when (or (= fd 1) (= fd 2))
+                   (set-port-for-fd! fd target-str 'truncate)))
+      ((&>) (redirect-fd-to-file! 1 target-str
+                                  (bitwise-ior O_WRONLY O_CREAT O_TRUNC) #o666)
+            (ffi-dup2 1 2)
+            (let ((port (open-output-file [path: target-str truncate: #t])))
+              (current-output-port port)
+              (current-error-port port)))
+      ((&>>) (redirect-fd-to-file! 1 target-str
+                                   (bitwise-ior O_WRONLY O_CREAT O_APPEND) #o666)
+             (ffi-dup2 1 2)
+             (let ((port (open-output-file [path: target-str append: #t])))
+               (current-output-port port)
+               (current-error-port port)))
+      ((>&)
+       (cond
+         ((string=? target-str "-")
+          (ffi-close-fd fd))
+         (else
+          (let ((target-fd (string->number target-str)))
+            (cond
+              (target-fd
+               (let ((r (ffi-dup2 target-fd fd)))
+                 (when (< r 0)
+                   (error (string-append (number->string target-fd) ": Bad file descriptor")))
+                 ;; Create fresh Gambit port for standard fds
+                 ;; For permanent redirect, create fresh port if needed
+                 (if (and (<= 0 fd 2) (not (<= 0 target-fd 2)))
+                   (set-current-port-for-fd! fd (make-port-for-fd fd))
+                   (dup-gambit-port! target-fd fd))))
+              ((redir-fd redir)
+               (error (string-append target-str ": Bad file descriptor")))
+              (else
+               ;; >&word → redirect both stdout+stderr to file
+               (redirect-fd-to-file! 1 target-str
+                                     (bitwise-ior O_WRONLY O_CREAT O_TRUNC) #o666)
+               (ffi-dup2 1 2)
+               (let ((port (open-output-file [path: target-str truncate: #t])))
+                 (current-output-port port)
+                 (current-error-port port))))))))
+      ((<&)
+       (cond
+         ((string=? target-str "-")
+          (ffi-close-fd fd))
+         (else
+          (let ((target-fd (string->number target-str)))
+            (if target-fd
+              (let ((r (ffi-dup2 target-fd fd)))
+                (when (< r 0)
+                  (error (string-append (number->string target-fd) ": Bad file descriptor")))
+                (if (and (<= 0 fd 2) (not (<= 0 target-fd 2)))
+                  (set-current-port-for-fd! fd (make-port-for-fd fd))
+                  (dup-gambit-port! target-fd fd)))
+              (fprintf (current-error-port) "gsh: ~a: bad file descriptor~n" target-str))))))
+      ((<>) (redirect-fd-to-file! fd target-str O_RDWR #o666))
+      (else (fprintf (current-error-port) "gsh: unsupported redirect operator ~a~n" op)))))
+
 ;;; --- Helpers ---
 
 (def (default-fd-for-op op)
   (case op
-    ((< << <<- <<< <& <>) 0)
+    ((< << <<- <<q <<-q <<< <& <>) 0)
     ((> >> clobber >& &> &>>) 1)
     (else 0)))
 
 ;; Save the real fd + Gambit port for later restoration
 ;; Returns (fd saved-real-fd saved-port)
+;; Uses ffi-dup-above to save to fd >= 10, avoiding conflicts with user fds
 (def (save-fd fd)
-  (let ((saved-real-fd (ffi-dup fd))
+  (let ((saved-real-fd (ffi-dup-above fd 10))
         (saved-port (case fd
                       ((0) (current-input-port))
                       ((1) (current-output-port))
@@ -271,6 +448,21 @@
     (case fd
       ((1) (current-output-port port))
       ((2) (current-error-port port)))))
+
+;; Create a fresh Gambit port for a standard fd (0/1/2) after dup2
+;; Uses /dev/fd/N so Gambit creates a proper port with write() not sendto()
+(def (make-port-for-fd fd)
+  (case fd
+    ((0) (open-input-file [path: (string-append "/dev/fd/" (number->string fd))]))
+    ((1 2) (open-output-file [path: (string-append "/dev/fd/" (number->string fd))
+                              append: #t]))))
+
+;; Set current-input/output/error-port for a standard fd
+(def (set-current-port-for-fd! fd port)
+  (case fd
+    ((0) (current-input-port port))
+    ((1) (current-output-port port))
+    ((2) (current-error-port port))))
 
 ;; Duplicate Gambit port from source-fd to dest-fd
 (def (dup-gambit-port! source-fd dest-fd)

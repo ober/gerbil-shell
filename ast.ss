@@ -12,8 +12,9 @@
 (defstruct simple-command (assignments words redirections) transparent: #t)
 
 ;; Pipeline: list of commands connected by | or |&
-(defstruct ast-pipeline (commands bang?) transparent: #t)
+(defstruct ast-pipeline (commands bang? pipe-types) transparent: #t)
 ;; bang? = #t if preceded by !
+;; pipe-types: list of 'PIPE or 'PIPEAMP for each connection (length = commands - 1)
 
 ;; And-or list: pipeline && pipeline || pipeline ...
 (defstruct and-or-list (first rest) transparent: #t)
@@ -22,6 +23,9 @@
 ;; Command list: and-or-lists separated by ; or &
 (defstruct command-list (items) transparent: #t)
 ;; items: list of (cons 'sequential and-or-list) or (cons 'background and-or-list)
+
+;;; --- Compound command redirect wrapper ---
+(defstruct redirected-command (command redirections) transparent: #t)
 
 ;;; --- Compound commands ---
 (defstruct subshell (body) transparent: #t)              ; ( list )
@@ -32,6 +36,17 @@
 (defstruct until-command (test body) transparent: #t)      ; until test; do body; done
 (defstruct case-command (word clauses) transparent: #t)    ; case word in pattern) body;; esac
 (defstruct select-command (var words body) transparent: #t) ; select var in words; do body; done
+(defstruct arith-command (expression) transparent: #t)      ; (( expr ))
+(defstruct arith-for-command (init test update body) transparent: #t) ; for ((init; test; update))
+(defstruct cond-command (expr) transparent: #t)             ; [[ expr ]]
+(defstruct coproc-command (name command) transparent: #t)    ; coproc [NAME] cmd
+
+;;; --- Conditional expression nodes (for [[ ]]) ---
+(defstruct cond-binary (op left right) transparent: #t)     ; expr && expr, expr || expr
+(defstruct cond-not (expr) transparent: #t)                 ; ! expr
+(defstruct cond-unary-test (op arg) transparent: #t)        ; -f file, -z str, -n str
+(defstruct cond-binary-test (op left right) transparent: #t) ; str1 = str2, n1 -eq n2
+(defstruct cond-word (value) transparent: #t)               ; bare word (truthy if non-empty)
 
 ;; Case clause: list of patterns -> body
 (defstruct case-clause (patterns body terminator) transparent: #t)
@@ -47,7 +62,9 @@
 ;; target: string (word) or heredoc-body string
 
 ;;; --- Assignment ---
-(defstruct assignment (name value op) transparent: #t)
+(defstruct assignment (name index value op) transparent: #t)
+;; index: #f for scalar, string for array index (e.g. "0", "key")
+;; value: string for scalar, list of strings for compound array assignment
 ;; op: '= or '+=
 
 ;;; --- Word parts (a "word" is a list of these for expansion) ---

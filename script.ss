@@ -62,7 +62,7 @@
 ;; Parse and execute a string of shell commands.
 ;; Used by both execute-script and source-file!
 (def (execute-string input env)
-  (let ((lexer (make-shell-lexer input)))
+  (let ((lexer (make-shell-lexer input (env-shopt? env "extglob"))))
     (let loop ((status 0))
       (let ((cmd (with-catch
                   (lambda (e)
@@ -70,7 +70,9 @@
                              (exception-message e))
                     'error)
                   (lambda ()
-                    (parse-complete-command lexer)))))
+                    ;; Update lexer extglob flag in case shopt changed it
+                    (set! (lexer-extglob? lexer) (env-shopt? env "extglob"))
+                    (parse-one-line lexer (env-shopt? env "extglob"))))))
         (cond
           ((eq? cmd 'error) 2)  ;; syntax error
           ((not cmd) status)     ;; end of input
