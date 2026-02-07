@@ -6,6 +6,7 @@
 (import :std/sugar
         :std/format
         :std/pregexp
+        :std/srfi/1
         :gsh/ast
         :gsh/util
         :gsh/environment
@@ -83,23 +84,29 @@
                  ;; Special handling for "$@" — expands to multiple words
                  (if (word-has-quoted-at? w)
                    (expand-word-with-at w env)
-                   (let* ((expanded (expand-string w env))
-                          (quoted? (word-has-quotes? w))
-                          (split (if quoted? [expanded] (word-split expanded env)))
-                          (globbed (if quoted?
-                                     split
-                                     (let ((raw (with-catch
-                                                 (lambda (e)
-                                                   ;; failglob: print error, re-raise to abort command
-                                                   (if (and (pair? e) (eq? (car e) 'failglob))
-                                                     (begin
-                                                       (fprintf (current-error-port) "gsh: ~a: no match~n" (cdr e))
-                                                       (raise e))
-                                                     (raise e)))
-                                                 (lambda ()
-                                                   (append-map
-                                                    (lambda (s)
-                                                      (if (and (glob-pattern? s (env-shopt? env "extglob"))
+                   ;; Use segment-aware expansion for proper mixed quote handling
+                   (let* ((segments (expand-string-segments w env))
+                          (all-quoted? (every (lambda (seg) (eq? (cdr seg) 'quoted)) segments))
+                          (any-quoted? (any (lambda (seg) (eq? (cdr seg) 'quoted)) segments))
+                          ;; Split segments: unquoted parts undergo IFS splitting,
+                          ;; quoted parts are preserved
+                          (split (split-expanded-segments segments env))
+                          ;; Glob expansion: only on words from unquoted context
+                          ;; split returns (text . has-unquoted?) pairs
+                          (globbed (let ((raw (with-catch
+                                               (lambda (e)
+                                                 (if (and (pair? e) (eq? (car e) 'failglob))
+                                                   (begin
+                                                     (fprintf (current-error-port) "gsh: ~a: no match~n" (cdr e))
+                                                     (raise e))
+                                                   (raise e)))
+                                               (lambda ()
+                                                 (append-map
+                                                  (lambda (item)
+                                                    (let ((s (car item))
+                                                          (can-glob? (cdr item)))
+                                                      (if (and can-glob?
+                                                               (glob-pattern? s (env-shopt? env "extglob"))
                                                                (not (env-option? env "noglob")))
                                                         (glob-expand s
                                                           dotglob?: (env-shopt? env "dotglob")
@@ -107,20 +114,20 @@
                                                           failglob?: (env-shopt? env "failglob")
                                                           nocase?: (env-shopt? env "nocaseglob")
                                                           extglob?: (env-shopt? env "extglob"))
-                                                        [s]))
-                                                    split)))))
-                                       ;; Apply GLOBIGNORE filtering
-                                       (let ((gi (env-get env "GLOBIGNORE")))
-                                         (if (and gi (not (string=? gi "")))
-                                           (glob-ignore-filter raw gi)
-                                           raw))))))
+                                                        [s])))
+                                                  split)))))
+                                    ;; Apply GLOBIGNORE filtering
+                                    (let ((gi (env-get env "GLOBIGNORE")))
+                                      (if (and gi (not (string=? gi "")))
+                                        (glob-ignore-filter raw gi)
+                                        raw)))))
                      ;; For quoted words, preserve empty string [""]
                      ;; For unquoted words that expand to empty/nothing, remove them
                      (cond
                        ((null? globbed)
-                        (if quoted? [""] []))
+                        (if any-quoted? [""] []))
                        ;; Unquoted word that expanded to single empty string → remove
-                       ((and (not quoted?)
+                       ((and (not any-quoted?)
                              (= (length globbed) 1)
                              (string=? (car globbed) ""))
                         [])
@@ -131,6 +138,126 @@
     ((word-process-sub? word)
      [(expand-process-sub word env)])
     (else [word])))
+
+;;; --- Segment-aware expansion ---
+;;; Segments are (text . type) where type is:
+;;;   'quoted   — from "..." or '...' — no IFS splitting, no globbing
+;;;   'literal  — literal unquoted text, tilde, backslash-escape — no IFS splitting, yes globbing
+;;;   'expanded — from unquoted $var, $(cmd), $((arith)) — yes IFS splitting, yes globbing
+
+;; Check if a segment type allows IFS splitting
+(def (seg-splittable? type) (eq? type 'expanded))
+;; Check if a segment type allows glob expansion
+(def (seg-globbable? type) (not (eq? type 'quoted)))
+(def (expand-string-segments word env)
+  (let ((len (string-length word)))
+    (let loop ((i 0) (segments []))
+      (if (>= i len)
+        (reverse segments)
+        (let ((ch (string-ref word i)))
+          (cond
+            ;; Tilde at start — literal (no split, yes glob)
+            ((and (= i 0) (char=? ch #\~))
+             (let-values (((expanded end) (expand-tilde-in word i env)))
+               (loop end (cons (cons expanded 'literal) segments))))
+            ;; Dollar expansion — unquoted, subject to splitting
+            ((char=? ch #\$)
+             (let-values (((expanded end) (expand-dollar word i env)))
+               (loop end (cons (cons expanded 'expanded) segments))))
+            ;; Backtick command substitution — unquoted
+            ((char=? ch #\`)
+             (let-values (((expanded end) (expand-backtick word i env)))
+               (loop end (cons (cons expanded 'expanded) segments))))
+            ;; Backslash escape — literal (quoted)
+            ((char=? ch #\\)
+             (if (< (+ i 1) len)
+               (loop (+ i 2) (cons (cons (string (string-ref word (+ i 1))) 'quoted) segments))
+               (loop (+ i 1) (cons (cons "\\" 'literal) segments))))
+            ;; Single quote — literal (quoted)
+            ((char=? ch #\')
+             (let-values (((content end) (read-single-quote word (+ i 1))))
+               (loop end (cons (cons content 'quoted) segments))))
+            ;; Double quote — contents are quoted (no splitting)
+            ((char=? ch #\")
+             (let-values (((content end) (expand-double-quote word (+ i 1) env)))
+               (loop end (cons (cons content 'quoted) segments))))
+            ;; Regular character — literal (quoted, not split)
+            (else
+             ;; Accumulate consecutive literal chars
+             (let lit-loop ((j (+ i 1)))
+               (if (and (< j len)
+                        (let ((c (string-ref word j)))
+                          (not (or (char=? c #\$) (char=? c #\`) (char=? c #\\)
+                                   (char=? c #\') (char=? c #\") (char=? c #\~)))))
+                 (lit-loop (+ j 1))
+                 (loop j (cons (cons (substring word i j) 'literal) segments)))))))))))
+
+;; Split expanded segments according to IFS rules.
+;; Input: list of (text . quoted?) pairs
+;; Output: list of (text . has-unquoted?) pairs (after IFS splitting)
+;; Unquoted segments are split on IFS; quoted segments are not.
+;; Adjacent segments join into the same word (no split boundary between them).
+(def (split-expanded-segments segments env)
+  (if (null? segments)
+    [(cons "" #f)]
+    (let ((ifs (or (env-get env "IFS") " \t\n")))
+      (if (string=? ifs "")
+        ;; Empty IFS: no splitting at all, just concatenate
+        (let ((text (apply string-append (map car segments)))
+              (can-glob? (any (lambda (seg) (seg-globbable? (cdr seg))) segments)))
+          [(cons text can-glob?)])
+        ;; Normal IFS splitting
+        (let ((words [])      ;; completed words (reversed)
+              (current (open-output-string))  ;; current word being built
+              (cur-can-glob? #f))  ;; does current word have unquoted content?
+          ;; Process each segment
+          (let seg-loop ((segs segments)
+                         (words [])
+                         (current (open-output-string))
+                         (cur-can-glob? #f)
+                         (word-started? #f))
+            (if (null? segs)
+              ;; Done: emit final word if anything was accumulated
+              (let ((final (get-output-string current)))
+                (if (or word-started? (> (string-length final) 0))
+                  (reverse (cons (cons final cur-can-glob?) words))
+                  (reverse words)))
+              (let* ((seg (car segs))
+                     (text (car seg))
+                     (type (cdr seg)))
+                (if (not (seg-splittable? type))
+                  ;; Quoted segment: append directly to current word, never split
+                  (begin
+                    (display text current)
+                    (seg-loop (cdr segs) words current (or cur-can-glob? (seg-globbable? type))
+                              (or word-started? #t)))
+                  ;; Unquoted segment: apply IFS splitting
+                  (let* ((split-words (word-split text env))
+                         (n (length split-words)))
+                    (cond
+                      ;; Empty expansion: nothing to add, but mark as having unquoted content
+                      ((= n 0)
+                       (seg-loop (cdr segs) words current (or cur-can-glob? #t) word-started?))
+                      ;; Single word: append to current (joining with adjacent)
+                      ((= n 1)
+                       (display (car split-words) current)
+                       (seg-loop (cdr segs) words current (or cur-can-glob? #t)
+                                 (or word-started? (> (string-length (car split-words)) 0))))
+                      ;; Multiple words: first joins with current, rest are separate
+                      (else
+                       (display (car split-words) current)
+                       ;; Emit current word
+                       (let ((w (get-output-string current)))
+                         (let inner-loop ((rest (cdr split-words))
+                                          (words (cons (cons w #t) words)))
+                           (if (null? (cdr rest))
+                             ;; Last split word: start a new current
+                             (let ((new-current (open-output-string)))
+                               (display (car rest) new-current)
+                               (seg-loop (cdr segs) words new-current #t #t))
+                             ;; Middle split words: complete words
+                             (inner-loop (cdr rest)
+                                         (cons (cons (car rest) #t) words)))))))))))))))))
 
 ;; Expand a word without word splitting or globbing
 ;; Used for assignments, here-docs, etc.
@@ -720,28 +847,75 @@
 
 ;;; --- Word splitting ---
 
+;; POSIX IFS field splitting algorithm:
+;; - IFS whitespace chars (space, tab, newline in IFS): collapse consecutive, trim leading/trailing
+;; - IFS non-whitespace chars: each is a delimiter, adjacent ones produce empty fields
+;; - Mixed: IFS whitespace around non-whitespace delimiter is trimmed (doesn't create extra fields)
+;; - Leading non-whitespace IFS char produces leading empty field
+;; - Trailing non-whitespace IFS char does NOT produce trailing empty field
 (def (word-split str env)
   (let ((ifs (or (env-get env "IFS") " \t\n")))
     (if (string=? ifs "")
       [str]  ;; empty IFS = no splitting
       (let ((len (string-length str)))
-        (let loop ((i 0) (start 0) (words []))
-          (cond
-            ((>= i len)
-             (reverse (if (> i start)
-                        (cons (substring str start i) words)
-                        words)))
-            ((ifs-char? (string-ref str i) ifs)
-             (let ((new-words (if (> i start)
+        (if (= len 0) [str]
+          ;; Classify IFS characters
+          (let ((ifs-ws? (lambda (ch) (and (ifs-char? ch ifs)
+                                           (or (char=? ch #\space)
+                                               (char=? ch #\tab)
+                                               (char=? ch #\newline)))))
+                (ifs-nws? (lambda (ch) (and (ifs-char? ch ifs)
+                                            (not (or (char=? ch #\space)
+                                                     (char=? ch #\tab)
+                                                     (char=? ch #\newline)))))))
+            ;; Algorithm: scan left to right.
+            ;; State: accumulating non-IFS chars into a field, or at a delimiter boundary.
+            (let loop ((i 0) (start 0) (words []))
+              (cond
+                ((>= i len)
+                 ;; End of string — trailing IFS delimiters do NOT produce empty fields
+                 (let ((words (if (> i start)
                                 (cons (substring str start i) words)
                                 words)))
-               ;; Skip IFS whitespace
-               (let skip ((j (+ i 1)))
-                 (if (and (< j len) (ifs-whitespace? (string-ref str j) ifs))
-                   (skip (+ j 1))
-                   (loop j j new-words)))))
-            (else
-             (loop (+ i 1) start words))))))))
+                   (reverse words)))
+                ;; Non-whitespace IFS delimiter
+                ((ifs-nws? (string-ref str i))
+                 ;; Add the field before this delimiter (may be empty for leading/adjacent)
+                 (let ((words (cons (substring str start i) words)))
+                   ;; Skip any IFS whitespace after the delimiter
+                   (let skip-ws ((j (+ i 1)))
+                     (if (and (< j len) (ifs-ws? (string-ref str j)))
+                       (skip-ws (+ j 1))
+                       (loop j j words)))))
+                ;; IFS whitespace
+                ((ifs-ws? (string-ref str i))
+                 ;; Skip all consecutive IFS whitespace
+                 (let skip-ws ((j (+ i 1)))
+                   (cond
+                     ;; Whitespace followed by non-whitespace IFS delimiter:
+                     ;; the nws delimiter is the actual field separator
+                     ((and (< j len) (ifs-nws? (string-ref str j)))
+                      ;; Add field before whitespace if there's content
+                      (let ((words (if (> i start)
+                                     (cons (substring str start i) words)
+                                     words)))
+                        ;; Skip past the nws delimiter and any trailing ws
+                        (let skip-ws2 ((k (+ j 1)))
+                          (if (and (< k len) (ifs-ws? (string-ref str k)))
+                            (skip-ws2 (+ k 1))
+                            (loop k k words)))))
+                     ;; Plain whitespace delimiter (no adjacent nws)
+                     ((and (< j len) (ifs-ws? (string-ref str j)))
+                      (skip-ws (+ j 1)))
+                     ;; End of whitespace run - it's a plain ws delimiter
+                     (else
+                      (let ((words (if (> i start)
+                                     (cons (substring str start i) words)
+                                     words)))
+                        (loop j j words))))))
+                ;; Regular character
+                (else
+                 (loop (+ i 1) start words))))))))))
 
 (def (ifs-char? ch ifs)
   (let loop ((i 0))

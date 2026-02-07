@@ -6,7 +6,7 @@ BASH       := /bin/bash
 # --- Build ---
 
 build:
-	gerbil build
+	LIBRARY_PATH="$$(brew --prefix openssl@3 2>/dev/null)/lib:$$LIBRARY_PATH" gerbil build
 
 # --- Spec test targets ---
 
