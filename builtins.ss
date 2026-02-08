@@ -116,10 +116,13 @@
            (let ((fmt (car rest))
                  (fmt-args (cdr rest)))
              ;; Format with argument recycling: repeat format until all args consumed
-             (let ((output (shell-printf fmt fmt-args)))
-               (if var-name
-                 (begin (env-set! env var-name output) 0)
-                 (begin (display output) (force-output) 0))))))))))
+             (parameterize ((*printf-conversion-error* #f))
+               (let ((output (shell-printf fmt fmt-args)))
+                 (if var-name
+                   (begin (env-set! env var-name output)
+                          (if (*printf-conversion-error*) 1 0))
+                   (begin (display output) (force-output)
+                          (if (*printf-conversion-error*) 1 0))))))))))))
 
 ;; Helper: strip trailing slash (except for root /)
 (def (strip-trailing-slash path)
@@ -1382,24 +1385,37 @@
                   (let ((hv (hex-digit-value (string-ref str j))))
                     (if hv
                       (hloop (+ j 1) (+ (* val 16) hv) (+ count 1))
-                      (begin (display (string (integer->char val)) buf) (loop j))))
-                  (begin (display (string (integer->char val)) buf) (loop j)))))
+                      (if (= count 0)
+                        ;; No hex digits after \x → literal \x
+                        (begin (display "\\x" buf) (loop j))
+                        (begin (display (string (integer->char val)) buf) (loop j)))))
+                  (if (= count 0)
+                    (begin (display "\\x" buf) (loop j))
+                    (begin (display (string (integer->char val)) buf) (loop j))))))
              ((#\u) ;; \uNNNN - unicode (up to 4 hex digits)
               (let hloop ((j (+ i 2)) (val 0) (count 0))
                 (if (and (< j len) (< count 4))
                   (let ((hv (hex-digit-value (string-ref str j))))
                     (if hv
                       (hloop (+ j 1) (+ (* val 16) hv) (+ count 1))
-                      (begin (display-unicode-char val buf) (loop j))))
-                  (begin (display-unicode-char val buf) (loop j)))))
+                      (if (= count 0)
+                        (begin (display "\\u" buf) (loop j))
+                        (begin (display-unicode-char val buf) (loop j)))))
+                  (if (= count 0)
+                    (begin (display "\\u" buf) (loop j))
+                    (begin (display-unicode-char val buf) (loop j))))))
              ((#\U) ;; \UNNNNNNNN - unicode (up to 8 hex digits)
               (let hloop ((j (+ i 2)) (val 0) (count 0))
                 (if (and (< j len) (< count 8))
                   (let ((hv (hex-digit-value (string-ref str j))))
                     (if hv
                       (hloop (+ j 1) (+ (* val 16) hv) (+ count 1))
-                      (begin (display-unicode-char val buf) (loop j))))
-                  (begin (display-unicode-char val buf) (loop j)))))
+                      (if (= count 0)
+                        (begin (display "\\U" buf) (loop j))
+                        (begin (display-unicode-char val buf) (loop j)))))
+                  (if (= count 0)
+                    (begin (display "\\U" buf) (loop j))
+                    (begin (display-unicode-char val buf) (loop j))))))
              ((#\c) (cons (get-output-string buf) #t))  ;; \c = stop all output
              (else (display "\\" buf) (display (string next) buf) (loop (+ i 2))))))
         (else
@@ -1412,17 +1428,20 @@
 ;; Supports argument recycling: if more args than format specifiers, repeat format
 (def (shell-printf fmt args)
   (let ((buf (open-output-string)))
-    (if (null? args)
-      ;; No args: just process format escapes once
-      (begin (printf-format-once fmt [] buf)
-             (get-output-string buf))
-      ;; With args: loop until all consumed (argument recycling)
-      (let loop ((remaining args))
-        (let ((leftover (printf-format-once fmt remaining buf)))
-          (if (or (null? leftover)
-                  (equal? leftover remaining)) ;; no args consumed → stop
+    (parameterize ((*printf-stop* #f))
+      (if (null? args)
+        ;; No args: just process format escapes once
+        (begin (printf-format-once fmt [] buf)
+               (get-output-string buf))
+        ;; With args: loop until all consumed (argument recycling)
+        (let loop ((remaining args))
+          (if (*printf-stop*)
             (get-output-string buf)
-            (loop leftover)))))))
+            (let ((leftover (printf-format-once fmt remaining buf)))
+              (if (or (null? leftover)
+                      (equal? leftover remaining)) ;; no args consumed → stop
+                (get-output-string buf)
+                (loop leftover)))))))))
 
 ;; Process format string once, consuming args as needed
 ;; Returns remaining args after one pass through format
@@ -1430,7 +1449,7 @@
   (let ((flen (string-length fmt)))
     (let loop ((i 0) (args args))
       (cond
-        ((>= i flen) args)
+        ((or (>= i flen) (*printf-stop*)) args)
         ;; Format specifier
         ((and (char=? (string-ref fmt i) #\%) (< (+ i 1) flen))
          (let-values (((end consumed-arg) (printf-format-spec fmt (+ i 1) args buf)))
@@ -1559,8 +1578,9 @@
                         (values (+ i 1) rest))
                        ;; %b - interpret backslash escapes in argument
                        ((#\b)
-                        (printf-interpret-escapes (if (string? arg) arg "") buf)
-                        (values (+ i 1) rest))
+                        (let ((stopped? (printf-interpret-b-escapes (if (string? arg) arg "") buf)))
+                          (when stopped? (*printf-stop* #t))
+                          (values (+ i 1) rest)))
                        ;; %q - shell-quoted
                        ((#\q)
                         (display (shell-quote-string (if (string? arg) arg "")) buf)
@@ -1575,8 +1595,8 @@
                           (values (+ i 1) rest)))
                        ;; Unknown specifier
                        (else
-                        (display "%" buf)
-                        (display (string spec) buf)
+                        (fprintf (current-error-port) "printf: %~a: invalid format character~n" (string spec))
+                        (*printf-conversion-error* #t)
                         (values (+ i 1) args))))))))))))))
 
 ;; Parse a number (or * for arg-supplied width/precision) in format string
@@ -1678,16 +1698,50 @@
           ((#\c) (+ i 1))  ;; caller should check for this
           (else (display "\\" buf) (display (string ch) buf) (+ i 1)))))))
 
-;; Interpret backslash escapes in a string (for %b)
-(def (printf-interpret-escapes str buf)
+;; Interpret backslash escapes in a string (for %b format)
+;; Returns #t if \c was encountered (stop all output), #f otherwise
+;; %b differences from format-string escapes:
+;; - \c stops ALL remaining printf output
+;; - \NNN (3-digit octal without leading 0) is supported
+;; - \0NNN (4-digit with leading 0) is also supported
+(def (printf-interpret-b-escapes str buf)
   (let ((len (string-length str)))
     (let loop ((i 0))
-      (when (< i len)
+      (if (>= i len)
+        #f  ;; normal completion
         (let ((ch (string-ref str i)))
           (if (char=? ch #\\)
             (if (< (+ i 1) len)
-              (let ((next (printf-escape str (+ i 1) buf)))
-                (loop next))
+              (let ((next-ch (string-ref str (+ i 1))))
+                (cond
+                  ;; \c - stop all output
+                  ((char=? next-ch #\c) #t)
+                  ;; \0NNN - 4-digit octal (up to 3 after the 0)
+                  ((char=? next-ch #\0)
+                   (let oloop ((j (+ i 2)) (val 0) (count 0))
+                     (if (and (< j len) (< count 3)
+                              (char>=? (string-ref str j) #\0)
+                              (char<=? (string-ref str j) #\7))
+                       (oloop (+ j 1)
+                              (+ (* val 8) (- (char->integer (string-ref str j)) 48))
+                              (+ count 1))
+                       (begin (display (string (integer->char (modulo val 256))) buf)
+                              (loop j)))))
+                  ;; \NNN - 3-digit octal (without leading 0, 1-7 start)
+                  ((and (char>=? next-ch #\1) (char<=? next-ch #\7))
+                   (let oloop ((j (+ i 1)) (val 0) (count 0))
+                     (if (and (< j len) (< count 3)
+                              (char>=? (string-ref str j) #\0)
+                              (char<=? (string-ref str j) #\7))
+                       (oloop (+ j 1)
+                              (+ (* val 8) (- (char->integer (string-ref str j)) 48))
+                              (+ count 1))
+                       (begin (display (string (integer->char (modulo val 256))) buf)
+                              (loop j)))))
+                  ;; All other escapes: delegate to printf-escape
+                  (else
+                   (let ((next (printf-escape str (+ i 1) buf)))
+                     (loop next)))))
               (begin (display "\\" buf) (loop (+ i 1))))
             (begin (display ch buf) (loop (+ i 1)))))))))
 
@@ -1710,6 +1764,11 @@
             (string-append padding s)))))))
 
 ;; Convert string to integer safely (handles 0x, 0, 'c' char literal, +prefix, leading spaces)
+;; Parameter to track conversion errors during printf
+(def *printf-conversion-error* (make-parameter #f))
+;; Parameter to signal \c (stop all output) from %b
+(def *printf-stop* (make-parameter #f))
+
 (def (string->integer-safe s)
   (if (or (not (string? s)) (string=? s ""))
     0
@@ -1727,25 +1786,47 @@
               (or (char=? (string-ref s 0) #\')
                   (char=? (string-ref s 0) #\")))
          (char->integer (string-ref s 1)))
+        ;; Reject base#value syntax (e.g. 64#a)
+        ((let loop ((i 0)) (and (< i (string-length s))
+                                (or (char=? (string-ref s i) #\#) (loop (+ i 1)))))
+         (fprintf (current-error-port) "printf: ~a: invalid number~n" s)
+         (*printf-conversion-error* #t)
+         0)
         (else
          ;; Handle optional sign prefix
          (let* ((neg? (and (> (string-length s) 0) (char=? (string-ref s 0) #\-)))
                 (pos? (and (> (string-length s) 0) (char=? (string-ref s 0) #\+)))
                 (s2 (if (or neg? pos?) (substring s 1 (string-length s)) s)))
-           (let ((val
+           ;; Try strict parse first; if it fails, try partial (leading digits)
+           (let ((strict-val
                   (cond
-                    ((string=? s2 "") 0)
+                    ((string=? s2 "") #f)
                     ;; Hex: 0x...
                     ((and (>= (string-length s2) 2)
                           (char=? (string-ref s2 0) #\0)
                           (or (char=? (string-ref s2 1) #\x)
                               (char=? (string-ref s2 1) #\X)))
-                     (or (string->number (substring s2 2 (string-length s2)) 16) 0))
+                     (string->number (substring s2 2 (string-length s2)) 16))
                     ;; Octal: 0...
                     ((and (> (string-length s2) 1) (char=? (string-ref s2 0) #\0))
-                     (or (string->number s2 8) (or (string->number s2) 0)))
-                    (else (or (string->number s2) 0)))))
-             (if neg? (- val) val))))))))
+                     (or (string->number s2 8) (string->number s2)))
+                    (else (string->number s2)))))
+             (if strict-val
+               (if neg? (- strict-val) strict-val)
+               ;; Partial parse: extract leading digits
+               (let ((partial (parse-leading-integer s2)))
+                 (fprintf (current-error-port) "printf: ~a: invalid number~n" s)
+                 (*printf-conversion-error* #t)
+                 (if neg? (- partial) partial))))))))))
+
+;; Parse leading decimal digits from a string, returning the integer value
+(def (parse-leading-integer s)
+  (let loop ((i 0) (n 0))
+    (if (and (< i (string-length s))
+             (char>=? (string-ref s i) #\0)
+             (char<=? (string-ref s i) #\9))
+      (loop (+ i 1) (+ (* n 10) (- (char->integer (string-ref s i)) 48)))
+      n)))
 
 ;; Convert string to float safely
 (def (string->number-safe s)
@@ -1759,11 +1840,32 @@
         ((#\f #\F) (format-fixed n precision))
         ((#\e #\E) (format-scientific n precision (char=? spec #\E)))
         ((#\g #\G) ;; Use %e if exponent < -4 or >= precision, else %f
-         (let ((e (if (= n 0.0) 0 (floor (/ (log (abs n)) (log 10))))))
-           (if (or (< e -4) (>= e (or precision 6)))
-             (format-scientific n precision (char=? spec #\G))
-             (format-fixed n precision))))
+         (let* ((p (max 1 (or precision 6)))
+                (e (if (= n 0.0) 0 (inexact->exact (floor (/ (log (abs n)) (log 10)))))))
+           (if (or (< e -4) (>= e p))
+             (strip-trailing-zeros (format-scientific n (- p 1) (char=? spec #\G)))
+             (strip-trailing-zeros (format-fixed n (max 0 (- p 1 (inexact->exact e))))))))
         (else (number->string n))))))
+
+;; Remove trailing zeros after decimal point for %g format
+(def (string-contains-char? s ch)
+  (let loop ((i 0))
+    (and (< i (string-length s))
+         (or (char=? (string-ref s i) ch) (loop (+ i 1))))))
+
+(def (strip-trailing-zeros s)
+  (if (string-contains-char? s #\.)
+    (let* ((s (let loop ((i (- (string-length s) 1)))
+               (if (and (>= i 0) (char=? (string-ref s i) #\0))
+                 (loop (- i 1))
+                 (substring s 0 (+ i 1)))))
+           ;; Remove trailing dot too
+           (s (if (and (> (string-length s) 0)
+                       (char=? (string-ref s (- (string-length s) 1)) #\.))
+                (substring s 0 (- (string-length s) 1))
+                s)))
+      s)
+    s))
 
 ;; Simple fixed-point formatting
 (def (format-fixed n precision)

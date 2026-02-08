@@ -14,6 +14,8 @@
         :gsh/environment
         :gsh/expander
         :gsh/redirect
+        :gsh/builtins
+        :gsh/functions
         :gsh/util)
 
 ;;; --- Public interface ---
@@ -133,7 +135,12 @@
      (let* ((words (expand-words (simple-command-words cmd) env))
             (cmd-name (if (pair? words) (car words) #f))
             (redirections (simple-command-redirections cmd)))
-       (if (and cmd-name (which cmd-name))
+       (if (or (not cmd-name)
+               (builtin-lookup cmd-name)
+               (function-lookup env cmd-name)
+               (not (which cmd-name)))
+         ;; Built-in, function, or unknown — run in thread with Gambit ports
+         (launch-thread-piped cmd env execute-fn has-pipe-in? has-pipe-out?)
          ;; External command — inherits real fds 0/1 directly
          ;; Apply command-level redirections (e.g. echo hi 1>&2 | wc -l)
          (let* ((path (which cmd-name))
@@ -153,9 +160,7 @@
            ;; Restore redirections in parent (child already inherited the fds)
            (when (pair? redir-saved)
              (restore-redirections redir-saved))
-           proc)
-         ;; Built-in or function — run in thread with Gambit ports
-         (launch-thread-piped cmd env execute-fn has-pipe-in? has-pipe-out?))))
+           proc))))
     (else
      (launch-thread-piped cmd env execute-fn has-pipe-in? has-pipe-out?))))
 
