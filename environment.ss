@@ -106,8 +106,10 @@
     ((string=? name "$") (number->string (shell-environment-shell-pid env)))
     ((string=? name "!") (number->string (shell-environment-last-bg-pid env)))
     ((string=? name "#") (number->string (vector-length (shell-environment-positional env))))
-    ((string=? name "@") (string-join-with " " (env-positional-list env)))
-    ((string=? name "*") (env-star env))
+    ((string=? name "@") (let ((pos (env-positional-list env)))
+                           (if (null? pos) #f (string-join-with " " pos))))
+    ((string=? name "*") (let ((pos (env-positional-list env)))
+                           (if (null? pos) #f (env-star env))))
     ((string=? name "0") (shell-environment-shell-name env))
     ((string=? name "-") (options->flag-string env))
     ((string=? name "_") (env-get-local env "_"))  ;; last arg of prev command
@@ -224,15 +226,23 @@
            ;; Variable doesn't exist anywhere in the chain
            ;; Create in ROOT scope (bash behavior: vars in functions are global)
            (let* ((root (env-root env))
-                  (os-val (getenv resolved #f)))
-             (if os-val
-               ;; Exists in OS env — create as exported
+                  (os-val (getenv resolved #f))
+                  (export? (or os-val (env-option? env "allexport"))))
+             (if export?
+               ;; Exists in OS env or allexport is on — create as exported
                (begin
                  (hash-put! (shell-environment-vars root) resolved
                             (make-shell-var value #t #f #f #f #f #f #f #f #f))
                  (setenv resolved value))
                (hash-put! (shell-environment-vars root) resolved
-                          (make-shell-var value #f #f #f #f #f #f #f #f #f))))))))))
+                          (make-shell-var value #f #f #f #f #f #f #f #f #f))))))))
+    ;; If allexport is on, ensure the variable is exported
+    (when (env-option? env "allexport")
+      (let ((var (hash-get (shell-environment-vars env) resolved)))
+        (when (and var (not (shell-var-exported? var)))
+          (set! (shell-var-exported? var) #t)
+          (when (shell-var-value var)
+            (setenv resolved (shell-var-value var))))))))
 
 ;; Set the shell name ($0)
 (def (env-set-shell-name! env name)
@@ -385,6 +395,31 @@
 (def (env-option? env name)
   (hash-get (shell-environment-options env) name))
 
+(def (env-all-options env)
+  ;; Return known options with their status
+  (let ((opts (shell-environment-options env))
+        (known '("allexport" "braceexpand" "emacs" "errexit" "errtrace"
+                  "functrace" "hashall" "histexpand" "interactive-comments"
+                  "keyword" "monitor" "noclobber" "noexec" "noglob"
+                  "nolog" "notify" "nounset" "onecmd" "physical"
+                  "pipefail" "posix" "privileged" "verbose" "vi" "xtrace")))
+    (map (lambda (name)
+           (cons name (and (hash-get opts name) #t)))
+         known)))
+
+(def (env-all-variables env)
+  ;; Return all scalar variables sorted by name
+  (let ((result []))
+    (hash-for-each
+     (lambda (name var)
+       (when (and (shell-var? var)
+                  (not (shell-var-array? var))
+                  (not (shell-var-assoc? var))
+                  (shell-var-value var))
+         (set! result (cons (cons name (shell-var-value var)) result))))
+     (shell-environment-vars env))
+    (sort result (lambda (a b) (string<? (car a) (car b))))))
+
 (def (env-shopt-set! env name value)
   (hash-put! (shell-environment-shopts env) name value))
 
@@ -493,6 +528,16 @@
       (else
        (let ((parent (shell-environment-parent env)))
          (and parent (find-var-in-chain parent name)))))))
+
+;; Like find-var-in-chain but also returns vars with unset sentinel
+;; (used for write operations that need to find the var struct to mutate)
+(def (find-var-in-chain-for-write env name)
+  (let ((var (hash-get (shell-environment-vars env) name)))
+    (cond
+      (var var)  ;; return even if unset sentinel
+      (else
+       (let ((parent (shell-environment-parent env)))
+         (and parent (find-var-in-chain-for-write parent name)))))))
 
 ;; Get the root (outermost) environment scope
 (def (env-root env)
@@ -720,3 +765,41 @@
   (let* ((name (resolve-nameref name env))
          (var (find-var-in-chain env name)))
     (and var (or (shell-var-array? var) (shell-var-assoc? var)))))
+
+;; Parse "name[idx]" → (values base-name index-string) or #f
+(def (parse-arith-subscript name)
+  (let ((bpos (string-find-char-in name #\[)))
+    (if (and bpos (> bpos 0)
+             (> (string-length name) (+ bpos 1))
+             (char=? (string-ref name (- (string-length name) 1)) #\]))
+      (values (substring name 0 bpos)
+              (substring name (+ bpos 1) (- (string-length name) 1)))
+      (values #f #f))))
+
+;; Array-aware getter for arithmetic: handles "name[idx]" format
+;; Also handles bare array names as array[0] (decay)
+;; Returns #f for truly undefined variables (for nounset support)
+(def (arith-env-getter env)
+  (lambda (name)
+    (let-values (((base idx) (parse-arith-subscript name)))
+      (if base
+        ;; Array subscript: name[idx]
+        ;; Check if variable exists at all first
+        (let ((var (env-get-var env base)))
+          (if var
+            (let ((key (or (string->number idx) idx)))
+              (env-array-get env base key))
+            #f))  ;; truly undefined → return #f for nounset
+        ;; Plain name — but if it's an array, return element [0]
+        (env-get env name)))))
+
+;; Array-aware setter for arithmetic: handles "name[idx]" format
+(def (arith-env-setter env)
+  (lambda (name val)
+    (let-values (((base idx) (parse-arith-subscript name)))
+      (if base
+        ;; Array subscript: name[idx]
+        (let ((key (or (string->number idx) idx)))
+          (env-array-set! env base key val))
+        ;; Plain name
+        (env-set! env name val)))))

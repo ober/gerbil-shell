@@ -11,7 +11,7 @@
             ffi-getegid ffi-access
             ffi-isatty ffi-setsid ffi-pipe-raw ffi-close-fd
             ffi-open-raw ffi-mkfifo ffi-unlink ffi-getpid
-            ffi-read-all-from-fd ffi-unsetenv
+            ffi-read-all-from-fd ffi-unsetenv ffi-strftime
             WNOHANG WUNTRACED WCONTINUED
             WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG WIFSTOPPED WSTOPSIG)
 
@@ -22,6 +22,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <time.h>
 
 /* We need to store the last waitpid result since we can't easily
    return multiple values from a single C call.
@@ -221,4 +222,19 @@ END-C2
   (define (ffi-read-all-from-fd fd)
     (_ffi_read_all fd)
     (_ffi_get_read_buf))
+
+  ;; strftime — format a time value
+  (c-declare #<<END-STRFTIME
+static char _strftime_buf[4096];
+static char* ffi_do_strftime(const char* fmt, int epoch) {
+    time_t t = (time_t)epoch;
+    struct tm *tm = localtime(&t);
+    if (!tm) { _strftime_buf[0] = '\0'; return _strftime_buf; }
+    strftime(_strftime_buf, sizeof(_strftime_buf), fmt, tm);
+    return _strftime_buf;
+}
+END-STRFTIME
+  )
+  (define-c-lambda _ffi_strftime (char-string int) char-string "ffi_do_strftime")
+  (define (ffi-strftime fmt epoch) (_ffi_strftime fmt epoch))
 )

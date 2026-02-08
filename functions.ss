@@ -74,6 +74,11 @@
 
 (defstruct errexit-exception (status) transparent: #t)
 
+;;; --- Nounset exception ---
+;; Raised when set -u is active and an unbound variable is referenced
+
+(defstruct nounset-exception (status) transparent: #t)
+
 ;;; --- Subshell exit exception ---
 ;; Raised by `exit` builtin when running inside a subshell
 

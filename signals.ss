@@ -43,10 +43,52 @@
    ("TSTP"   SIGTSTP)
    ("TTIN"   SIGTTIN)
    ("TTOU"   SIGTTOU)
-   ("WINCH"  SIGWINCH)))
+   ("WINCH"  SIGWINCH)
+   ("URG"    SIGURG)
+   ("IO"     SIGIO)
+   ("XCPU"   SIGXCPU)
+   ("XFSZ"   SIGXFSZ)
+   ("VTALRM" SIGVTALRM)
+   ("PROF"   SIGPROF)
+   ("SYS"    SIGSYS)))
 
 ;; Pseudo-signals (not real OS signals)
 (def *pseudo-signals* '("EXIT" "DEBUG" "RETURN" "ERR"))
+
+;; Reverse mapping: signal number -> short name
+(def *signal-number-to-name* (make-hash-table))
+(hash-for-each (lambda (name num) (hash-put! *signal-number-to-name* num name)) *signal-names*)
+
+;; Normalize a signal argument to canonical short name (e.g. "INT", "EXIT")
+;; Handles: SIGINT -> INT, INT -> INT, 2 -> INT, 0 -> EXIT, etc.
+(def (normalize-signal-arg arg)
+  (let ((uarg (string-upcase arg)))
+    ;; Strip SIG prefix
+    (let ((stripped (if (and (> (string-length uarg) 3)
+                             (string=? (substring uarg 0 3) "SIG"))
+                     (substring uarg 3 (string-length uarg))
+                     uarg)))
+      ;; Check if it's a number
+      (let ((num (string->number stripped)))
+        (cond
+          ;; Signal number: 0 = EXIT, others look up
+          ((and num (= num 0)) "EXIT")
+          ((and num (hash-get *signal-number-to-name* num))
+           => (lambda (name) name))
+          ;; Known signal name
+          ((hash-get *signal-names* stripped) stripped)
+          ;; Pseudo-signal
+          ((member stripped *pseudo-signals*) stripped)
+          ;; Unknown
+          (else #f))))))
+
+;; Get canonical display name for trap -p output
+;; Pseudo signals: EXIT, DEBUG, RETURN, ERR (no SIG prefix)
+;; Real signals: SIGHUP, SIGINT, SIGTERM, etc.
+(def (signal-display-name short-name)
+  (if (member short-name *pseudo-signals*)
+    short-name
+    (string-append "SIG" short-name)))
 
 ;; Convert signal name to number (or #f for pseudo/unknown)
 (def (signal-name->number name)
@@ -71,13 +113,11 @@
 ;;; --- Trap operations ---
 
 ;; Set a trap for a signal
+;; signal-name should be a normalized short name (e.g. "INT", "EXIT")
 ;; action: string (command), "" or 'ignore (ignore), 'default or #f (reset)
 (def (trap-set! signal-name action)
-  (let ((uname (string-upcase
-                (if (and (> (string-length signal-name) 3)
-                         (string=? (substring signal-name 0 3) "SIG"))
-                  (substring signal-name 3 (string-length signal-name))
-                  signal-name))))
+  (let ((uname (or (normalize-signal-arg signal-name)
+                   (string-upcase signal-name))))
     (cond
       ;; Reset to default
       ((or (eq? action 'default) (not action) (string=? (if (string? action) action "") "-"))
@@ -107,11 +147,8 @@
 
 ;; Get the trap action for a signal
 (def (trap-get signal-name)
-  (let ((uname (string-upcase
-                (if (and (> (string-length signal-name) 3)
-                         (string=? (substring signal-name 0 3) "SIG"))
-                  (substring signal-name 3 (string-length signal-name))
-                  signal-name))))
+  (let ((uname (or (normalize-signal-arg signal-name)
+                   (string-upcase signal-name))))
     (hash-get *trap-table* uname)))
 
 ;; List all traps as alist of (signal-name . action)

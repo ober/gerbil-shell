@@ -88,6 +88,35 @@ def parse_test_file(path):
             # N-I (not implemented) markers and other shell-specific annotations
             # Handle OK, OK-2, OK-3, N-I, N-I-2, BUG, BUG-2, etc.
             elif re.match(r'^(N-I|OK|BUG)(-\d+)?\s', meta):
+                # Parse bash-specific overrides so gsh (which targets bash compat)
+                # uses bash's expected values when they differ from the default
+                m = re.match(r'^(N-I|OK|BUG)(-\d+)?\s+([\w/]+)\s+(.*)', meta)
+                if m:
+                    _kind = m.group(1)
+                    shells = m.group(3).split('/')
+                    rest = m.group(4).strip()
+                    # Only use OK-bash overrides (bash alternative acceptable behavior)
+                    # Skip N-I (not implemented) and BUG (bash has a bug)
+                    if _kind == 'OK' and 'bash' in shells:
+                        # Parse the override value
+                        if rest.startswith('status: '):
+                            current.setdefault('bash_status', int(rest[8:].strip()))
+                        elif rest.startswith('stdout: '):
+                            current.setdefault('bash_stdout', rest[8:] + '\n')
+                        elif rest.startswith('stdout-json: '):
+                            raw = rest[13:]
+                            try:
+                                current.setdefault('bash_stdout', json.loads(raw))
+                            except json.JSONDecodeError:
+                                current.setdefault('bash_stdout', raw)
+                        elif rest == 'STDOUT:':
+                            stdout_lines = []
+                            i += 1
+                            while i < len(lines) and not lines[i].startswith('## '):
+                                stdout_lines.append(lines[i])
+                                i += 1
+                            current.setdefault('bash_stdout', ''.join(stdout_lines))
+                            continue
                 # Check if this annotation has a STDOUT: block that needs skipping
                 if 'STDOUT:' in meta:
                     i += 1
@@ -136,6 +165,8 @@ def run_test(test, shell, spec_dir):
 
     with tempfile.TemporaryDirectory() as tmpdir:
         env['TMP'] = tmpdir
+        # Create _tmp and _tmp/spec-tmp used by many Oils spec tests
+        os.makedirs(os.path.join(tmpdir, '_tmp', 'spec-tmp'), exist_ok=True)
         # Set $SH to the shell being tested (many Oils tests use this)
         env['SH'] = shell
         # Set REPO_ROOT to the Oils vendor directory (for testdata references)
@@ -161,31 +192,54 @@ def run_test(test, shell, spec_dir):
             return ('', str(e), -1)
 
 
-def check_result(test, stdout, stderr, exit_code):
-    """Check if test result matches expectations. Returns (pass, reason)."""
+def check_result(test, stdout, stderr, exit_code, is_reference=False):
+    """Check if test result matches expectations. Returns (pass, reason).
+    For non-reference shells, accept EITHER the default expected values
+    OR the bash overrides (when available)."""
+    # First check against default expected values
+    default_reasons = _check_against(test, stdout, stderr, exit_code,
+                                      test['status'],
+                                      test.get('stdout') or test.get('stdout_json'),
+                                      test.get('stdout_json') is not None)
+
+    if not default_reasons:
+        return (True, '')  # Matches default
+
+    # For non-reference shells, also check against bash overrides
+    if not is_reference and ('bash_status' in test or 'bash_stdout' in test):
+        bash_status = test.get('bash_status', test['status'])
+        bash_stdout = test.get('bash_stdout')
+        if bash_stdout is None:
+            bash_stdout = test.get('stdout') or test.get('stdout_json')
+            use_json = test.get('stdout_json') is not None
+        else:
+            use_json = False
+        bash_reasons = _check_against(test, stdout, stderr, exit_code,
+                                       bash_status, bash_stdout, use_json)
+        if not bash_reasons:
+            return (True, '')  # Matches bash alternative
+
+    return (False, '; '.join(default_reasons))
+
+
+def _check_against(test, stdout, stderr, exit_code,
+                    expected_status, expected_stdout, is_json):
+    """Check result against specific expected values. Returns list of reasons."""
     reasons = []
 
-    # Check status
-    expected_status = test['status']
     if exit_code != expected_status:
         reasons.append(f'status: expected {expected_status}, got {exit_code}')
-
-    # Check stdout
-    expected_stdout = test.get('stdout')
-    if test.get('stdout_json') is not None:
-        expected_stdout = test['stdout_json']
 
     if expected_stdout is not None:
         if stdout != expected_stdout:
             reasons.append(f'stdout mismatch')
 
-    # Check stderr if specified
     if test.get('stderr_json') is not None:
         expected_stderr = test['stderr_json']
         if stderr != expected_stderr:
             reasons.append(f'stderr mismatch')
 
-    return (len(reasons) == 0, '; '.join(reasons))
+    return reasons
 
 
 def main():
@@ -237,9 +291,11 @@ def main():
 
     for idx, test in enumerate(tests):
         test_num = idx + 1
-        for shell, sname in zip(shells, shell_names):
+        for si, (shell, sname) in enumerate(zip(shells, shell_names)):
             stdout, stderr, exit_code = run_test(test, shell, spec_dir)
-            passed, reason = check_result(test, stdout, stderr, exit_code)
+            # First shell is the reference (e.g. bash); others use bash overrides
+            is_ref = (si == 0)
+            passed, reason = check_result(test, stdout, stderr, exit_code, is_reference=is_ref)
             results[sname]['total'] += 1
             if passed:
                 results[sname]['pass'] += 1

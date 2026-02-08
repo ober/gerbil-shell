@@ -15,7 +15,6 @@
         :gsh/expander
         :gsh/redirect
         :gsh/builtins
-        :gsh/functions
         :gsh/util)
 
 ;;; --- Public interface ---
@@ -135,32 +134,33 @@
      (let* ((words (expand-words (simple-command-words cmd) env))
             (cmd-name (if (pair? words) (car words) #f))
             (redirections (simple-command-redirections cmd)))
-       (if (or (not cmd-name)
-               (builtin-lookup cmd-name)
-               (function-lookup env cmd-name)
-               (not (which cmd-name)))
-         ;; Built-in, function, or unknown — run in thread with Gambit ports
-         (launch-thread-piped cmd env execute-fn has-pipe-in? has-pipe-out?)
+       (cond
+         ;; Check builtins FIRST — before external commands
+         ((and cmd-name (builtin-lookup cmd-name))
+          (launch-thread-piped cmd env execute-fn has-pipe-in? has-pipe-out?))
          ;; External command — inherits real fds 0/1 directly
-         ;; Apply command-level redirections (e.g. echo hi 1>&2 | wc -l)
-         (let* ((path (which cmd-name))
-                (args (if (pair? words) (cdr words) []))
-                (redir-saved (if (pair? redirections)
-                               (with-catch
-                                (lambda (e) #f)
-                                (lambda () (apply-redirections redirections env)))
-                               []))
-                (proc (open-process
-                       [path: path
-                        arguments: args
-                        environment: (env-exported-alist env)
-                        stdin-redirection: #f
-                        stdout-redirection: #f
-                        stderr-redirection: #f])))
-           ;; Restore redirections in parent (child already inherited the fds)
-           (when (pair? redir-saved)
-             (restore-redirections redir-saved))
-           proc))))
+         ((and cmd-name (which cmd-name))
+          (let* ((path (which cmd-name))
+                 (args (if (pair? words) (cdr words) []))
+                 (redir-saved (if (pair? redirections)
+                                (with-catch
+                                 (lambda (e) #f)
+                                 (lambda () (apply-redirections redirections env)))
+                                []))
+                 (proc (open-process
+                        [path: path
+                         arguments: args
+                         environment: (env-exported-alist env)
+                         stdin-redirection: #f
+                         stdout-redirection: #f
+                         stderr-redirection: #f])))
+            ;; Restore redirections in parent (child already inherited the fds)
+            (when (pair? redir-saved)
+              (restore-redirections redir-saved))
+            proc))
+         ;; Shell function or unknown — run in thread
+         (else
+          (launch-thread-piped cmd env execute-fn has-pipe-in? has-pipe-out?)))))
     (else
      (launch-thread-piped cmd env execute-fn has-pipe-in? has-pipe-out?))))
 

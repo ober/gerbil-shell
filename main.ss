@@ -218,6 +218,7 @@
   (with-catch
    (lambda (e)
      (cond
+       ((nounset-exception? e) (raise e))
        ((errexit-exception? e) (errexit-exception-status e))
        ((subshell-exit-exception? e) (raise e))
        ((break-exception? e) (raise e))
@@ -308,6 +309,7 @@
          (let ((status (with-catch
                         (lambda (e)
                           (cond
+                            ((nounset-exception? e) (nounset-exception-status e))
                             ((break-exception? e) 0)
                             ((continue-exception? e) 0)
                             ((return-exception? e) (return-exception-status e))
@@ -357,6 +359,7 @@
         (let ((new-status (with-catch
                            (lambda (e)
                              (cond
+                               ((nounset-exception? e) (nounset-exception-status e))
                                ((break-exception? e) 0)
                                ((continue-exception? e) 0)
                                ((return-exception? e) (return-exception-status e))

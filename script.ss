@@ -80,9 +80,13 @@
            (let ((new-status
                   (with-catch
                    (lambda (e)
-                     (if (errexit-exception? e)
-                       (errexit-exception-status e)
-                       (raise e)))
+                     (cond
+                       ((nounset-exception? e) (raise e))
+                       ((errexit-exception? e)
+                        (errexit-exception-status e))
+                       ((break-exception? e) 0)
+                       ((continue-exception? e) 0)
+                       (else (raise e))))
                    (lambda ()
                      (execute-command cmd env)))))
              ;; If errexit triggered, stop executing further commands

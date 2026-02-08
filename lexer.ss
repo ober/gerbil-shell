@@ -234,10 +234,19 @@
          (else
           (make-token 'AMP "&" pos))))
       ((#\;)
-       (if (and (not (at-end? lex)) (char=? (current-char lex) #\;))
-         (begin (advance! lex)
-                (make-token 'DSEMI ";;" pos))
-         (make-token 'SEMI ";" pos)))
+       (cond
+         ((and (not (at-end? lex)) (char=? (current-char lex) #\;))
+          (advance! lex)
+          ;; Check for ;;& (test-next in case)
+          (if (and (not (at-end? lex)) (char=? (current-char lex) #\&))
+            (begin (advance! lex)
+                   (make-token 'DSEMI_AMP ";;&" pos))
+            (make-token 'DSEMI ";;" pos)))
+         ((and (not (at-end? lex)) (char=? (current-char lex) #\&))
+          (advance! lex)
+          (make-token 'SEMI_AMP ";&" pos))
+         (else
+          (make-token 'SEMI ";" pos))))
       ((#\()
        (make-token 'LPAREN "(" pos))
       ((#\))
@@ -680,25 +689,51 @@
             (char=? (char-at lex (+ (lexer-pos lex) 1)) #\())
        (display "((" buf)
        (advance! lex) (advance! lex)
-       (let loop ((depth 1))
+       ;; Track both (( )) nesting and single ( ) nesting
+       (let loop ((paren-depth 0))
          (cond
            ((at-end? lex) (set! (lexer-want-more? lex) #t))
-           ((and (char=? (current-char lex) #\))
+           ;; )) when no open single parens — close the arith
+           ((and (= paren-depth 0)
+                 (char=? (current-char lex) #\))
                  (< (+ (lexer-pos lex) 1) (lexer-len lex))
-                 (char=? (char-at lex (+ (lexer-pos lex) 1)) #\))
-                 (= depth 1))
+                 (char=? (char-at lex (+ (lexer-pos lex) 1)) #\)))
             (display "))" buf)
             (advance! lex) (advance! lex))
-           ((and (char=? (current-char lex) #\()
-                 (< (+ (lexer-pos lex) 1) (lexer-len lex))
-                 (char=? (char-at lex (+ (lexer-pos lex) 1)) #\())
-            (display "((" buf)
-            (advance! lex) (advance! lex)
-            (loop (+ depth 1)))
+           ;; Nested $(( — recurse
+           ((and (char=? (current-char lex) #\$)
+                 (< (+ (lexer-pos lex) 2) (lexer-len lex))
+                 (char=? (char-at lex (+ (lexer-pos lex) 1)) #\()
+                 (char=? (char-at lex (+ (lexer-pos lex) 2)) #\())
+            (display "$((" buf)
+            (advance! lex) (advance! lex) (advance! lex)
+            ;; Scan nested arith
+            (let inner ((pd 0))
+              (cond
+                ((at-end? lex) (set! (lexer-want-more? lex) #t))
+                ((and (= pd 0)
+                      (char=? (current-char lex) #\))
+                      (< (+ (lexer-pos lex) 1) (lexer-len lex))
+                      (char=? (char-at lex (+ (lexer-pos lex) 1)) #\)))
+                 (display "))" buf)
+                 (advance! lex) (advance! lex))
+                ((char=? (current-char lex) #\()
+                 (display (current-char lex) buf) (advance! lex) (inner (+ pd 1)))
+                ((and (char=? (current-char lex) #\)) (> pd 0))
+                 (display (current-char lex) buf) (advance! lex) (inner (- pd 1)))
+                (else
+                 (display (current-char lex) buf) (advance! lex) (inner pd))))
+            (loop paren-depth))
+           ;; Single ( — increase paren depth
+           ((char=? (current-char lex) #\()
+            (display (current-char lex) buf) (advance! lex) (loop (+ paren-depth 1)))
+           ;; Single ) — decrease paren depth
+           ((and (char=? (current-char lex) #\)) (> paren-depth 0))
+            (display (current-char lex) buf) (advance! lex) (loop (- paren-depth 1)))
            (else
             (display (current-char lex) buf)
             (advance! lex)
-            (loop depth))))
+            (loop paren-depth))))
        (get-output-string buf))
       ;; $(  command substitution
       ;; Tracks paren depth AND case/esac nesting so that ) in case

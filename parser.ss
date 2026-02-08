@@ -881,6 +881,10 @@
                        ;; Expect ;; or ;& or ;;&
                        (let ((terminator
                               (cond
+                                ((parser-check? ps 'DSEMI_AMP)
+                                 (parser-consume! ps) 'test-next)
+                                ((parser-check? ps 'SEMI_AMP)
+                                 (parser-consume! ps) 'fallthrough)
                                 ((parser-check? ps 'DSEMI)
                                  (parser-consume! ps) 'break)
                                 (else 'break))))

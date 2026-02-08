@@ -171,6 +171,7 @@
                             ((break-exception? e) (raise e))
                             ((continue-exception? e) (raise e))
                             ((errexit-exception? e) (raise e))
+                            ((nounset-exception? e) (raise e))
                             ((subshell-exit-exception? e) (raise e))
                             (else
                              (fprintf (current-error-port) "gsh: ~a~n" (exception-message e))
@@ -384,6 +385,7 @@
                      (cond
                        ((subshell-exit-exception? e) (subshell-exit-exception-status e))
                        ((errexit-exception? e) (errexit-exception-status e))
+                       ((nounset-exception? e) (nounset-exception-status e))
                        (else (raise e))))
                    (lambda ()
                      (parameterize ((*in-subshell* #t))
@@ -403,6 +405,7 @@
          ((break-exception? e) (raise e))
          ((continue-exception? e) (raise e))
          ((errexit-exception? e) (raise e))
+         ((nounset-exception? e) (raise e))
          ((subshell-exit-exception? e) (raise e))
          (else
           (fprintf (current-error-port) "gsh: ~a~n" (exception-message e))
@@ -556,10 +559,21 @@
     ((string=? op "-ot") (cond-newer-than? (expand-word-nosplit right-raw env) left))
     (else #f)))
 
+;; Evaluate a string as an integer for [[ ]] comparisons
+;; Uses arithmetic evaluation to handle expressions and variable references
+(def (arith-string-to-int str env)
+  (let ((n (string->number str)))
+    (if n n
+      ;; Try arithmetic evaluation (handles "e" where e=1+2)
+      (with-catch
+       (lambda (e) #f)
+       (lambda ()
+         (arith-eval str (arith-env-getter env) (arith-env-setter env)))))))
+
 (def (cond-int-cmp cmp left right-raw env)
   (let ((right (expand-word-nosplit right-raw env)))
-    (let ((a (string->number left))
-          (b (string->number right)))
+    (let ((a (arith-string-to-int left env))
+          (b (arith-string-to-int right env)))
       (and a b (cmp a b)))))
 
 (def (cond-same-file? a b)
@@ -577,25 +591,37 @@
 ;; (( expr )) — arithmetic command
 ;; Returns 0 if expression result is non-zero (true), 1 if zero (false)
 (def (execute-arith-command cmd env)
-  (let ((result (arith-eval (arith-command-expression cmd)
-                            (lambda (name) (env-get env name))
-                            (lambda (name val) (env-set! env name val)))))
-    (if (= result 0) 1 0)))
+  (with-catch
+   (lambda (e)
+     (cond
+       ((nounset-exception? e) (raise e))
+       (else
+        (fprintf (current-error-port) "gsh: ~a~n" (exception-message e))
+        1)))
+   (lambda ()
+     (let* ((raw-expr (arith-command-expression cmd))
+            (expr (expand-arith-expr raw-expr env))
+            (result (arith-eval expr
+                                (arith-env-getter env)
+                                (arith-env-setter env)
+                                (env-option? env "nounset"))))
+       (if (= result 0) 1 0)))))
 
 ;; for (( init; test; update )) ; do body ; done
 (def (execute-arith-for cmd env exec-fn)
-  (let ((getter (lambda (name) (env-get env name)))
-        (setter (lambda (name val) (env-set! env name val))))
+  (let ((getter (arith-env-getter env))
+        (setter (arith-env-setter env))
+        (expand (lambda (expr) (if expr (expand-arith-expr expr env) expr))))
     ;; Execute init expression
     (let ((init-expr (arith-for-command-init cmd)))
       (when (and init-expr (> (string-length init-expr) 0))
-        (arith-eval init-expr getter setter)))
+        (arith-eval (expand init-expr) getter setter)))
     ;; Loop: test, body, update
     (let loop ((status 0))
-      ;; Evaluate test — if empty, treat as always true
+      ;; Evaluate test
       (let* ((test-expr (arith-for-command-test cmd))
              (test-val (if (and test-expr (> (string-length test-expr) 0))
-                         (arith-eval test-expr getter setter)
+                         (arith-eval (expand test-expr) getter setter)
                          1)))  ;; empty test = true
         (if (= test-val 0)
           status  ;; test is false, exit loop
@@ -614,7 +640,7 @@
                   (begin
                     (let ((update-expr (arith-for-command-update cmd)))
                       (when (and update-expr (> (string-length update-expr) 0))
-                        (arith-eval update-expr getter setter)))
+                        (arith-eval (expand update-expr) getter setter)))
                     (loop status))))
                (else (raise e))))
            (lambda ()
@@ -622,14 +648,9 @@
                ;; Execute update expression
                (let ((update-expr (arith-for-command-update cmd)))
                  (when (and update-expr (> (string-length update-expr) 0))
-                   (arith-eval update-expr getter setter)))
+                   (arith-eval (expand update-expr) getter setter)))
                (loop new-status)))))))))
 
-;;; --- Errexit checking ---
-
-;; Check errexit after a command completes.
-;; Raises errexit-exception if set -e is active, status is non-zero,
-;; and we're not in a condition context.
 (def (check-errexit! env status)
   (when (and (not (= status 0))
              (env-option? env "errexit")

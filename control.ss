@@ -62,25 +62,49 @@
 ;; Execute a while-command
 (def (execute-while cmd env execute-fn)
   (let loop ((status 0))
-    (let ((test-status (parameterize ((*in-condition-context* #t))
-                          (execute-fn (while-command-test cmd) env))))
-      (if (= test-status 0)
-        (with-catch
-         (lambda (e)
-           (cond
-             ((break-exception? e)
-              (if (> (break-exception-levels e) 1)
-                (raise (make-break-exception (- (break-exception-levels e) 1)))
-                status))
-             ((continue-exception? e)
-              (if (> (continue-exception-levels e) 1)
-                (raise (make-continue-exception (- (continue-exception-levels e) 1)))
-                (loop status)))
-             (else (raise e))))
-         (lambda ()
-           (let ((new-status (execute-fn (while-command-body cmd) env)))
-             (loop new-status))))
-        status))))
+    (let ((test-status
+           (with-catch
+            (lambda (e)
+              (cond
+                ((break-exception? e)
+                 (if (> (break-exception-levels e) 1)
+                   (raise (make-break-exception (- (break-exception-levels e) 1)))
+                   ;; break in condition → exit loop
+                   (cons 'break-in-condition status)))
+                ((continue-exception? e)
+                 (if (> (continue-exception-levels e) 1)
+                   (raise (make-continue-exception (- (continue-exception-levels e) 1)))
+                   ;; continue in condition → re-test
+                   (cons 'continue-in-condition status)))
+                (else (raise e))))
+            (lambda ()
+              (parameterize ((*in-condition-context* #t))
+                (execute-fn (while-command-test cmd) env))))))
+      (cond
+        ;; break signaled from condition
+        ((and (pair? test-status) (eq? (car test-status) 'break-in-condition))
+         (cdr test-status))
+        ;; continue signaled from condition
+        ((and (pair? test-status) (eq? (car test-status) 'continue-in-condition))
+         (loop (cdr test-status)))
+        ;; Normal test passed
+        ((and (number? test-status) (= test-status 0))
+         (with-catch
+          (lambda (e)
+            (cond
+              ((break-exception? e)
+               (if (> (break-exception-levels e) 1)
+                 (raise (make-break-exception (- (break-exception-levels e) 1)))
+                 status))
+              ((continue-exception? e)
+               (if (> (continue-exception-levels e) 1)
+                 (raise (make-continue-exception (- (continue-exception-levels e) 1)))
+                 (loop status)))
+              (else (raise e))))
+          (lambda ()
+            (let ((new-status (execute-fn (while-command-body cmd) env)))
+              (loop new-status)))))
+        (else status)))))
 
 ;; Execute an until-command
 (def (execute-until cmd env execute-fn)

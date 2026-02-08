@@ -408,22 +408,53 @@
 ;; break [n]
 (builtin-register! "break"
   (lambda (args env)
-    (let ((levels (if (pair? args) (or (string->number (car args)) 1) 1)))
-      (shell-break! levels))))
+    (cond
+      ;; Too many arguments
+      ((> (length args) 1)
+       (fprintf (current-error-port) "break: too many arguments~n")
+       1)
+      ((pair? args)
+       (let ((n (string->number (car args))))
+         (cond
+           ((not n)
+            (fprintf (current-error-port) "break: ~a: numeric argument required~n" (car args))
+            2)
+           ((<= n 0)
+            (fprintf (current-error-port) "break: ~a: loop count out of range~n" (car args))
+            1)
+           (else (shell-break! n)))))
+      (else (shell-break! 1)))))
 
 ;; continue [n]
 (builtin-register! "continue"
   (lambda (args env)
-    (let ((levels (if (pair? args) (or (string->number (car args)) 1) 1)))
-      (shell-continue! levels))))
+    (cond
+      ;; Too many arguments
+      ((> (length args) 1)
+       (fprintf (current-error-port) "continue: too many arguments~n")
+       1)
+      ((pair? args)
+       (let ((n (string->number (car args))))
+         (cond
+           ((not n)
+            (fprintf (current-error-port) "continue: ~a: numeric argument required~n" (car args))
+            2)
+           ((<= n 0)
+            (fprintf (current-error-port) "continue: ~a: loop count out of range~n" (car args))
+            1)
+           (else (shell-continue! n)))))
+      (else (shell-continue! 1)))))
 
 ;; set [options] [-- args...]
 (builtin-register! "set"
   (lambda (args env)
     (if (null? args)
-      ;; No args: display all variables
+      ;; No args: display all variables in re-evaluable format
       (begin
-        ;; TODO: list all variables in posix format
+        (for-each
+         (lambda (pair)
+           (displayln (format "~a=~a" (car pair) (shell-quote-value (cdr pair)))))
+         (env-all-variables env))
         0)
       (let loop ((args args))
         (cond
@@ -432,17 +463,38 @@
            ;; Set positional parameters
            (env-set-positional! env (cdr args))
            0)
-          ;; -o option-name / +o option-name
-          ((and (pair? (cdr args))
-                (or (string=? (car args) "-o")
-                    (string=? (car args) "+o")))
-           (let ((enable? (char=? (string-ref (car args) 0) #\-))
-                 (opt-name (cadr args)))
-             (env-option-set! env opt-name enable?)
-             (loop (cddr args))))
-          ;; -o without argument: print options
-          ((or (string=? (car args) "-o") (string=? (car args) "+o"))
-           ;; TODO: print option status
+          ;; "set -" — equivalent to "set +xv" (turn off xtrace and verbose)
+          ((string=? (car args) "-")
+           (env-option-set! env "xtrace" #f)
+           (env-option-set! env "verbose" #f)
+           ;; Remaining args become positional parameters
+           (when (pair? (cdr args))
+             (env-set-positional! env (cdr args)))
+           0)
+          ;; -o / +o: check if next arg looks like an option name
+          ((or (string=? (car args) "-o")
+               (string=? (car args) "+o"))
+           (let ((enable? (char=? (string-ref (car args) 0) #\-)))
+             (if (and (pair? (cdr args))
+                      ;; Next arg is an option name if it doesn't start with - or +
+                      (not (string-prefix? "-" (cadr args)))
+                      (not (string-prefix? "+" (cadr args))))
+               ;; -o option-name / +o option-name
+               (begin
+                 (env-option-set! env (cadr args) enable?)
+                 (loop (cddr args)))
+               ;; -o / +o without argument: print option list
+               (begin
+                 (for-each
+                  (lambda (opt)
+                    (let ((name (car opt)) (on? (cdr opt)))
+                      (if enable?
+                        (displayln (format "~a\t~a" name (if on? "on" "off")))
+                        (displayln (format "set ~ao ~a" (if on? "-" "+") name)))))
+                  (env-all-options env))
+                 0))))
+          ;; Bare "+" is ignored (like a no-op flag)
+          ((string=? (car args) "+")
            (loop (cdr args)))
           ((and (> (string-length (car args)) 1)
                 (char=? (string-ref (car args) 0) #\-))
@@ -456,6 +508,9 @@
            ;; Positional parameters
            (env-set-positional! env args)
            0))))))
+
+(def (shell-quote-value val)
+  (string-append "'" (string-replace-all val "'" "'\\''") "'"))
 
 ;; shift [n]
 (builtin-register! "shift"
@@ -495,13 +550,21 @@
 
 ;; test / [ — conditional expressions
 (builtin-register! "test"
-  (lambda (args env) (test-eval args)))
+  (lambda (args env)
+    (parameterize ((*test-var-fn* (lambda (name) (env-get env name)))
+                   (*test-option-fn* (lambda (name) (env-option? env name))))
+      (test-eval args))))
 
 (builtin-register! "["
   (lambda (args env)
     (if (and (pair? args)
              (string=? (last-elem* args) "]"))
-      (test-eval (butlast args))
+      (let ((inner (butlast args)))
+        (parameterize ((*test-var-fn* (lambda (name) (env-get env name)))
+                       (*test-option-fn* (lambda (name) (env-option? env name))))
+          (with-catch
+           (lambda (e) 2)  ;; Any evaluation error → exit 2
+           (lambda () (test-eval inner)))))
       (begin
         (fprintf (current-error-port) "[: missing `]'~n")
         2))))
@@ -509,24 +572,57 @@
 ;; type [-afptP] name...
 (builtin-register! "type"
   (lambda (args env)
-    (let loop ((args args) (status 0))
-      (if (null? args)
-        status
-        (let ((name (car args)))
-          (cond
-            ((builtin? name)
-             (displayln (format "~a is a shell builtin" name))
-             (loop (cdr args) status))
-            ((function-lookup env name)
-             (displayln (format "~a is a function" name))
-             (loop (cdr args) status))
-            ((which name)
-             => (lambda (path)
-                  (displayln (format "~a is ~a" name path))
-                  (loop (cdr args) status)))
-            (else
-             (fprintf (current-error-port) "type: ~a: not found~n" name)
-             (loop (cdr args) 1))))))))
+    ;; Parse flags
+    (let parse-flags ((args args) (flags []))
+      (if (and (pair? args) (> (string-length (car args)) 0)
+               (char=? (string-ref (car args) 0) #\-))
+        (parse-flags (cdr args) (cons (car args) flags))
+        (let loop ((args args) (status 0))
+          (if (null? args)
+            status
+            (let ((name (car args)))
+              (cond
+                ;; Shell keywords
+                ((shell-keyword? name)
+                 (displayln (format "~a is a shell keyword" name))
+                 (loop (cdr args) status))
+                ;; Aliases
+                ((alias-get env name)
+                 => (lambda (expansion)
+                      (displayln (format "~a is aliased to `~a'" name expansion))
+                      (loop (cdr args) status)))
+                ;; Shell functions
+                ((function-lookup env name)
+                 (displayln (format "~a is a function" name))
+                 (loop (cdr args) status))
+                ;; Builtins — distinguish special vs regular
+                ((special-builtin? name)
+                 (displayln (format "~a is a special shell builtin" name))
+                 (loop (cdr args) status))
+                ((builtin? name)
+                 (displayln (format "~a is a shell builtin" name))
+                 (loop (cdr args) status))
+                ;; External command
+                ((which name)
+                 => (lambda (path)
+                      (displayln (format "~a is ~a" name path))
+                      (loop (cdr args) status)))
+                ;; Not found — output to stdout (not stderr) per POSIX
+                (else
+                 (displayln (format "~a: not found" name))
+                 (loop (cdr args) 1))))))))))
+
+(def (shell-keyword? name)
+  (member name '("if" "then" "else" "elif" "fi" "case" "esac" "for" "while"
+                  "until" "do" "done" "in" "function" "select" "time"
+                  "{" "}" "!" "[[" "]]" "coproc")))
+
+;; POSIX special builtins (must be handled differently from regular builtins)
+(def (special-builtin? name)
+  (and (member name '("." ":" "break" "continue" "eval" "exec" "exit"
+                       "export" "readonly" "return" "set" "shift" "trap"
+                       "unset"))
+       (builtin? name)))
 
 ;; command [-pvV] cmd [args...]
 (builtin-register! "command"
@@ -587,15 +683,21 @@
        (for-each (lambda (name) (alias-unset! env name)) args)
        0))))
 
-;; read [-r] [-p prompt] [-t timeout] [-d delim] [-n count] [-s] var...
+;; read [-r] [-p prompt] [-t timeout] [-d delim] [-n count] [-N count] [-s] [-a arr] [-u fd] var...
 (builtin-register! "read"
   (lambda (args env)
     (let loop ((args args) (raw? #f) (silent? #f) (prompt "")
-               (nchars #f) (delim #f) (timeout #f) (fd #f) (vars []))
+               (nchars #f) (nchars-raw? #f) (delim #f) (timeout #f)
+               (fd #f) (array-name #f) (vars []))
       (cond
         ((null? args)
-         ;; Show prompt on stderr
-         (when (> (string-length prompt) 0)
+         ;; Validate timeout
+         (when (and timeout (< timeout 0))
+           (fprintf (current-error-port) "read: ~a: invalid timeout specification~n" timeout)
+           (set! timeout #f))
+         ;; Show prompt on stderr (only if input is a terminal)
+         (when (and (> (string-length prompt) 0)
+                    (= (ffi-isatty (or fd 0)) 1))
            (display prompt (current-error-port))
            (force-output (current-error-port)))
          ;; Set up input port
@@ -612,76 +714,218 @@
                ;; Set timeout if requested
                (when timeout
                  (input-port-timeout-set! in-port timeout))
-               (let ((line (cond
-                             ;; -n nchars: read exactly N characters
-                             (nchars
-                              (let ((buf (open-output-string)))
-                                (let rloop ((count 0))
-                                  (if (>= count nchars)
-                                    (get-output-string buf)
-                                    (let ((ch (read-char in-port)))
-                                      (if (eof-object? ch)
-                                        (let ((s (get-output-string buf)))
-                                          (if (string=? s "") ch s))
-                                        (begin (display ch buf)
-                                               (rloop (+ count 1)))))))))
-                             ;; -d delim: read until delimiter
-                             (delim
-                              (let ((delim-ch (string-ref delim 0))
-                                    (buf (open-output-string)))
-                                (let rloop ()
-                                  (let ((ch (read-char in-port)))
-                                    (cond
-                                      ((eof-object? ch)
-                                       (let ((s (get-output-string buf)))
-                                         (if (string=? s "") ch s)))
-                                      ((char=? ch delim-ch)
-                                       (get-output-string buf))
-                                      (else
-                                       (display ch buf)
-                                       (rloop)))))))
-                             ;; Default: read line, with backslash continuation if not -r
-                             (else
-                              (if raw?
-                                (read-line in-port)
-                                ;; Handle backslash-newline continuation
-                                (let ((buf (open-output-string)))
-                                  (let rloop ()
-                                    (let ((l (read-line in-port)))
-                                      (cond
-                                        ((eof-object? l)
-                                         (let ((s (get-output-string buf)))
-                                           (if (string=? s "") l s)))
-                                        ;; Line ends with backslash → continuation
-                                        ((and (> (string-length l) 0)
-                                              (char=? (string-ref l (- (string-length l) 1)) #\\))
-                                         (display (substring l 0 (- (string-length l) 1)) buf)
-                                         (rloop))
-                                        (else
-                                         (display l buf)
-                                         (get-output-string buf)))))))))))
+               (let* ((got-eof? #f)
+                      (line (cond
+                              ;; -N nchars: read exactly N bytes, ignore delimiters
+                              ((and nchars nchars-raw?)
+                               (let ((buf (open-output-string)))
+                                 (let rloop ((count 0))
+                                   (if (>= count nchars)
+                                     (get-output-string buf)
+                                     (let ((ch (read-char in-port)))
+                                       (if (eof-object? ch)
+                                         (begin (set! got-eof? #t)
+                                                (let ((s (get-output-string buf)))
+                                                  (if (string=? s "") ch s)))
+                                         (begin (display ch buf)
+                                                (rloop (+ count 1)))))))))
+                              ;; -n nchars: read N chars, respects delimiters
+                              ;; In non-raw mode, count PROCESSED chars (after backslash removal)
+                              (nchars
+                               (let ((delim-ch (if delim
+                                                 (if (string=? delim "")
+                                                   (integer->char 0)
+                                                   (string-ref delim 0))
+                                                 #\newline))
+                                     (buf (open-output-string)))
+                                 (if raw?
+                                   ;; Raw mode: just count chars
+                                   (let rloop ((count 0))
+                                     (if (>= count nchars)
+                                       (get-output-string buf)
+                                       (let ((ch (read-char in-port)))
+                                         (cond
+                                           ((eof-object? ch)
+                                            (set! got-eof? #t)
+                                            (let ((s (get-output-string buf)))
+                                              (if (string=? s "") ch s)))
+                                           ((char=? ch delim-ch)
+                                            (get-output-string buf))
+                                           (else
+                                            (display ch buf)
+                                            (rloop (+ count 1)))))))
+                                   ;; Non-raw mode: backslash-char counts as 1 processed char
+                                   ;; backslash-newline is line continuation (swallowed, not counted)
+                                   (let rloop ((count 0))
+                                     (if (>= count nchars)
+                                       (get-output-string buf)
+                                       (let ((ch (read-char in-port)))
+                                         (cond
+                                           ((eof-object? ch)
+                                            (set! got-eof? #t)
+                                            (let ((s (get-output-string buf)))
+                                              (if (string=? s "") ch s)))
+                                           ((char=? ch delim-ch)
+                                            (get-output-string buf))
+                                           ((char=? ch #\\)
+                                            (let ((next (read-char in-port)))
+                                              (cond
+                                                ((eof-object? next)
+                                                 (set! got-eof? #t)
+                                                 (get-output-string buf))
+                                                ((char=? next #\newline)
+                                                 ;; Line continuation: swallow, don't count
+                                                 (rloop count))
+                                                (else
+                                                 ;; Escaped char: output the char, count as 1
+                                                 (display next buf)
+                                                 (rloop (+ count 1))))))
+                                           (else
+                                            (display ch buf)
+                                            (rloop (+ count 1))))))))))
+                              ;; -d delim: read until delimiter
+                              (delim
+                               (let ((delim-ch (if (string=? delim "")
+                                                 (integer->char 0)
+                                                 (string-ref delim 0)))
+                                     (buf (open-output-string)))
+                                 (if raw?
+                                   ;; Raw mode: no backslash processing
+                                   (let rloop ()
+                                     (let ((ch (read-char in-port)))
+                                       (cond
+                                         ((eof-object? ch)
+                                          (set! got-eof? #t)
+                                          (let ((s (get-output-string buf)))
+                                            (if (string=? s "") ch s)))
+                                         ((char=? ch delim-ch)
+                                          (get-output-string buf))
+                                         (else
+                                          (display ch buf)
+                                          (rloop)))))
+                                   ;; Non-raw mode: backslash-newline is continuation
+                                   (let rloop ()
+                                     (let ((ch (read-char in-port)))
+                                       (cond
+                                         ((eof-object? ch)
+                                          (set! got-eof? #t)
+                                          (let ((s (get-output-string buf)))
+                                            (if (string=? s "") ch s)))
+                                         ((char=? ch delim-ch)
+                                          (get-output-string buf))
+                                         ((char=? ch #\\)
+                                          (let ((next (read-char in-port)))
+                                            (cond
+                                              ((eof-object? next)
+                                               (set! got-eof? #t)
+                                               (get-output-string buf))
+                                              ((char=? next #\newline)
+                                               ;; Line continuation
+                                               (rloop))
+                                              (else
+                                               ;; Keep escaped char (remove backslash)
+                                               (display next buf)
+                                               (rloop)))))
+                                         (else
+                                          (display ch buf)
+                                          (rloop))))))))
+                              ;; Default: read line
+                              (else
+                               (if raw?
+                                 ;; Raw mode: read char-by-char to detect no-newline
+                                 (let ((buf (open-output-string)))
+                                   (let rloop ()
+                                     (let ((ch (read-char in-port)))
+                                       (cond
+                                         ((eof-object? ch)
+                                          (set! got-eof? #t)
+                                          (let ((s (get-output-string buf)))
+                                            (if (string=? s "") ch s)))
+                                         ((char=? ch #\newline)
+                                          (get-output-string buf))
+                                         (else
+                                          (display ch buf)
+                                          (rloop))))))
+                                 ;; Cooked mode: backslash-newline is continuation
+                                 ;; Read char-by-char to detect no-newline EOF
+                                 (let ((buf (open-output-string)))
+                                   (let rloop ()
+                                     (let ((ch (read-char in-port)))
+                                       (cond
+                                         ((eof-object? ch)
+                                          (set! got-eof? #t)
+                                          (let ((s (get-output-string buf)))
+                                            (if (string=? s "") ch s)))
+                                         ((char=? ch #\newline)
+                                          (get-output-string buf))
+                                         ((char=? ch #\\)
+                                          (let ((next (read-char in-port)))
+                                            (cond
+                                              ((eof-object? next)
+                                               (set! got-eof? #t)
+                                               (get-output-string buf))
+                                              ((char=? next #\newline)
+                                               ;; Line continuation
+                                               (rloop))
+                                              (else
+                                               ;; Keep escaped char WITH backslash
+                                               ;; (backslash removal happens during IFS split)
+                                               (display #\\ buf)
+                                               (display next buf)
+                                               (rloop)))))
+                                         (else
+                                          (display ch buf)
+                                          (rloop)))))))))))
                  ;; Reset timeout
                  (when timeout
                    (input-port-timeout-set! in-port +inf.0))
                  (if (eof-object? line)
                    1
-                   (let* ((var-names (if (null? vars) ["REPLY"] (reverse vars)))
-                          (ifs (or (env-get env "IFS") " \t\n"))
-                          (fields (split-by-ifs line ifs (length var-names))))
-                     (let field-loop ((names var-names) (fields fields))
-                       (cond
-                         ((null? names) 0)
-                         ((null? fields)
-                          (env-set! env (car names) "")
-                          (field-loop (cdr names) []))
-                         ((null? (cdr names))
-                          ;; Last var gets remainder
-                          (env-set! env (car names)
-                                    (string-join-sp fields))
-                          0)
-                         (else
-                          (env-set! env (car names) (car fields))
-                          (field-loop (cdr names) (cdr fields)))))))))
+                   (let* ((var-names (cond
+                                      (array-name [array-name])
+                                      ((null? vars) ["REPLY"])
+                                      (else (reverse vars))))
+                          (use-reply? (and (null? vars) (not array-name)))
+                          (ifs (or (env-get env "IFS") " \t\n")))
+                     (cond
+                       ;; -N mode: no IFS splitting, assign directly to first var
+                       (nchars-raw?
+                        (env-set! env (car var-names) line)
+                        ;; Clear remaining vars
+                        (for-each (lambda (v) (env-set! env v "")) (cdr var-names))
+                        (if got-eof? 1 0))
+                       ;; No vars specified: store in REPLY without splitting
+                       ;; In non-raw mode, strip backslashes for REPLY
+                       (use-reply?
+                        (let ((val (if raw? line (read-strip-backslashes line))))
+                          (env-set! env "REPLY" val)
+                          (if got-eof? 1 0)))
+                       ;; Array mode: split into all fields with IFS
+                       (array-name
+                        (let ((fields (if raw?
+                                       (read-ifs-split-raw line ifs 0)
+                                       (read-ifs-split line ifs 0))))
+                          (env-array-set-compound! env array-name fields #f)
+                          (if got-eof? 1 0)))
+                       ;; Regular variable assignment with IFS splitting
+                       (else
+                        (let ((fields (if raw?
+                                       (read-ifs-split-raw line ifs (length var-names))
+                                       (read-ifs-split line ifs (length var-names)))))
+                          (let field-loop ((names var-names) (fields fields))
+                            (cond
+                              ((null? names) (if got-eof? 1 0))
+                              ((null? fields)
+                               (env-set! env (car names) "")
+                               (field-loop (cdr names) []))
+                              ((null? (cdr names))
+                               ;; Last var gets remainder
+                               (env-set! env (car names)
+                                         (string-join-sp fields))
+                               (if got-eof? 1 0))
+                              (else
+                               (env-set! env (car names) (car fields))
+                               (field-loop (cdr names) (cdr fields))))))))))))
              (lambda ()
                ;; Restore echo if we disabled it
                (when tty?
@@ -689,48 +933,475 @@
                    (lambda () (tty-mode-set! in-port #t #t #f #f 0))))
                ;; Close fd port if we opened one
                (when fd (close-input-port in-port))))))
-        ((string=? (car args) "-r")
-         (loop (cdr args) #t silent? prompt nchars delim timeout fd vars))
-        ((string=? (car args) "-s")
-         (loop (cdr args) raw? #t prompt nchars delim timeout fd vars))
-        ((string=? (car args) "-p")
-         (if (pair? (cdr args))
-           (loop (cddr args) raw? silent? (cadr args) nchars delim timeout fd vars)
-           (loop (cdr args) raw? silent? prompt nchars delim timeout fd vars)))
-        ((string=? (car args) "-n")
-         (if (pair? (cdr args))
-           (loop (cddr args) raw? silent? prompt
-                 (or (string->number (cadr args)) 1) delim timeout fd vars)
-           (loop (cdr args) raw? silent? prompt nchars delim timeout fd vars)))
-        ((string=? (car args) "-d")
-         (if (pair? (cdr args))
-           (loop (cddr args) raw? silent? prompt nchars (cadr args) timeout fd vars)
-           (loop (cdr args) raw? silent? prompt nchars delim timeout fd vars)))
-        ((string=? (car args) "-t")
-         (if (pair? (cdr args))
-           (loop (cddr args) raw? silent? prompt nchars delim
-                 (or (string->number (cadr args)) 0) fd vars)
-           (loop (cdr args) raw? silent? prompt nchars delim timeout fd vars)))
-        ((string=? (car args) "-u")
-         (if (pair? (cdr args))
-           (loop (cddr args) raw? silent? prompt nchars delim timeout
-                 (or (string->number (cadr args)) 0) vars)
-           (loop (cdr args) raw? silent? prompt nchars delim timeout fd vars)))
+        ;; Parse options — support smooshed flags like -rn5, -rd''
+        ((and (> (string-length (car args)) 1)
+              (char=? (string-ref (car args) 0) #\-))
+         (let* ((arg (car args))
+                (rest (cdr args)))
+           (let parse-flags ((i 1))
+             (if (>= i (string-length arg))
+               (loop rest raw? silent? prompt nchars nchars-raw? delim timeout fd array-name vars)
+               (let ((ch (string-ref arg i)))
+                 (case ch
+                   ((#\r) (set! raw? #t) (parse-flags (+ i 1)))
+                   ((#\s) (set! silent? #t) (parse-flags (+ i 1)))
+                   ((#\e) (parse-flags (+ i 1))) ;; -e ignored (readline, not relevant)
+                   ((#\n)
+                    ;; -nNUM or -n (next arg is count)
+                    (let ((num-str (substring arg (+ i 1) (string-length arg))))
+                      (if (> (string-length num-str) 0)
+                        (let ((n (string->number num-str)))
+                          (cond
+                            ((not n)
+                             (fprintf (current-error-port) "read: ~a: invalid number~n" num-str)
+                             2)
+                            ((< n 0)
+                             (fprintf (current-error-port) "read: ~a: invalid number~n" num-str)
+                             2)
+                            (else
+                             (set! nchars n)
+                             (loop rest raw? silent? prompt nchars nchars-raw?
+                                   delim timeout fd array-name vars))))
+                        (if (pair? rest)
+                          (let ((n (string->number (car rest))))
+                            (cond
+                              ((not n)
+                               (fprintf (current-error-port) "read: ~a: invalid number~n" (car rest))
+                               2)
+                              ((< n 0)
+                               (fprintf (current-error-port) "read: ~a: invalid number~n" (car rest))
+                               2)
+                              (else
+                               (set! nchars n)
+                               (loop (cdr rest) raw? silent? prompt nchars nchars-raw?
+                                     delim timeout fd array-name vars))))
+                          (loop rest raw? silent? prompt nchars nchars-raw?
+                                delim timeout fd array-name vars)))))
+                   ((#\N)
+                    ;; -NNUM or -N (next arg is count) — raw char read
+                    (let ((num-str (substring arg (+ i 1) (string-length arg))))
+                      (set! nchars-raw? #t)
+                      (if (> (string-length num-str) 0)
+                        (begin (set! nchars (or (string->number num-str) 1))
+                               (loop rest raw? silent? prompt nchars nchars-raw?
+                                     delim timeout fd array-name vars))
+                        (if (pair? rest)
+                          (begin (set! nchars (or (string->number (car rest)) 1))
+                                 (loop (cdr rest) raw? silent? prompt nchars nchars-raw?
+                                       delim timeout fd array-name vars))
+                          (loop rest raw? silent? prompt nchars nchars-raw?
+                                delim timeout fd array-name vars)))))
+                   ((#\p)
+                    ;; -p PROMPT (next arg or rest of this arg)
+                    (let ((p-str (substring arg (+ i 1) (string-length arg))))
+                      (if (> (string-length p-str) 0)
+                        (begin (set! prompt p-str)
+                               (loop rest raw? silent? prompt nchars nchars-raw?
+                                     delim timeout fd array-name vars))
+                        (if (pair? rest)
+                          (begin (set! prompt (car rest))
+                                 (loop (cdr rest) raw? silent? prompt nchars nchars-raw?
+                                       delim timeout fd array-name vars))
+                          (loop rest raw? silent? prompt nchars nchars-raw?
+                                delim timeout fd array-name vars)))))
+                   ((#\d)
+                    ;; -d DELIM (next arg or rest of this arg)
+                    (let ((d-str (substring arg (+ i 1) (string-length arg))))
+                      (if (> (string-length d-str) 0)
+                        (begin (set! delim d-str)
+                               (loop rest raw? silent? prompt nchars nchars-raw?
+                                     delim timeout fd array-name vars))
+                        (if (pair? rest)
+                          (begin (set! delim (car rest))
+                                 (loop (cdr rest) raw? silent? prompt nchars nchars-raw?
+                                       delim timeout fd array-name vars))
+                          (loop rest raw? silent? prompt nchars nchars-raw?
+                                delim timeout fd array-name vars)))))
+                   ((#\t)
+                    ;; -t TIMEOUT
+                    (let ((t-str (substring arg (+ i 1) (string-length arg))))
+                      (if (> (string-length t-str) 0)
+                        (let ((t (string->number t-str)))
+                          (if (and t (>= t 0))
+                            (begin (set! timeout t)
+                                   (loop rest raw? silent? prompt nchars nchars-raw?
+                                         delim timeout fd array-name vars))
+                            (begin
+                              (fprintf (current-error-port) "read: ~a: invalid timeout specification~n" t-str)
+                              2)))
+                        (if (pair? rest)
+                          (let ((t (string->number (car rest))))
+                            (if (and t (>= t 0))
+                              (begin (set! timeout t)
+                                     (loop (cdr rest) raw? silent? prompt nchars nchars-raw?
+                                           delim timeout fd array-name vars))
+                              (begin
+                                (fprintf (current-error-port) "read: ~a: invalid timeout specification~n" (car rest))
+                                2)))
+                          (loop rest raw? silent? prompt nchars nchars-raw?
+                                delim timeout fd array-name vars)))))
+                   ((#\u)
+                    ;; -u FD
+                    (let ((u-str (substring arg (+ i 1) (string-length arg))))
+                      (if (> (string-length u-str) 0)
+                        (let ((n (string->number u-str)))
+                          (if (and n (>= n 0))
+                            (begin (set! fd n)
+                                   (loop rest raw? silent? prompt nchars nchars-raw?
+                                         delim timeout fd array-name vars))
+                            (begin
+                              (fprintf (current-error-port) "read: ~a: invalid file descriptor specification~n" u-str)
+                              2)))
+                        (if (pair? rest)
+                          (let ((n (string->number (car rest))))
+                            (if (and n (>= n 0))
+                              (begin (set! fd n)
+                                     (loop (cdr rest) raw? silent? prompt nchars nchars-raw?
+                                           delim timeout fd array-name vars))
+                              (begin
+                                (fprintf (current-error-port) "read: ~a: invalid file descriptor specification~n" (car rest))
+                                2)))
+                          (loop rest raw? silent? prompt nchars nchars-raw?
+                                delim timeout fd array-name vars)))))
+                   ((#\a)
+                    ;; -a ARRAY
+                    (let ((a-str (substring arg (+ i 1) (string-length arg))))
+                      (if (> (string-length a-str) 0)
+                        (begin (set! array-name a-str)
+                               (loop rest raw? silent? prompt nchars nchars-raw?
+                                     delim timeout fd array-name vars))
+                        (if (pair? rest)
+                          (begin (set! array-name (car rest))
+                                 (loop (cdr rest) raw? silent? prompt nchars nchars-raw?
+                                       delim timeout fd array-name vars))
+                          (loop rest raw? silent? prompt nchars nchars-raw?
+                                delim timeout fd array-name vars)))))
+                   (else
+                    ;; Unknown flag — error
+                    (fprintf (current-error-port) "read: -~a: invalid option~n" ch)
+                    2)))))))
         (else
-         (loop (cdr args) raw? silent? prompt nchars delim timeout fd
-               (cons (car args) vars)))))))
+         (loop (cdr args) raw? silent? prompt nchars nchars-raw?
+               delim timeout fd array-name (cons (car args) vars)))))))
+
+;; Strip backslashes in non-raw read mode
+;; In read without -r, backslash-char becomes just char (backslash removed)
+;; This does NOT interpret C escapes (\n, \t, etc.) — only removes the backslash
+(def (read-strip-backslashes s)
+  (let ((len (string-length s))
+        (buf (open-output-string)))
+    (let loop ((i 0))
+      (cond
+        ((>= i len) (get-output-string buf))
+        ((and (char=? (string-ref s i) #\\) (< (+ i 1) len))
+         (display (string-ref s (+ i 1)) buf)
+         (loop (+ i 2)))
+        ((and (char=? (string-ref s i) #\\) (= (+ i 1) len))
+         ;; Trailing backslash - keep it
+         (display #\\ buf)
+         (loop (+ i 1)))
+        (else
+         (display (string-ref s i) buf)
+         (loop (+ i 1)))))))
+
+;; IFS splitting for read builtin (raw mode — no backslash processing)
+;; Rules:
+;; - IFS whitespace chars (space, tab, newline) collapse into single delimiters
+;; - Non-whitespace IFS chars are individual delimiters (create empty fields)
+;; - Leading IFS whitespace is stripped
+;; - Trailing IFS whitespace is stripped
+;; - When max-fields > 0 and reached, rest goes to last field
+;; - When max-fields = 0, split into unlimited fields
+(def (read-ifs-split-raw str ifs max-fields)
+  (let ((len (string-length str)))
+    (if (= len 0)
+      []
+      (let ((ifs-ws (ifs-whitespace-chars ifs))
+            (ifs-nw (ifs-non-whitespace-chars ifs)))
+        ;; Skip leading IFS whitespace
+        (let skip-lead ((i 0))
+          (if (and (< i len) (ifs-ws-member? (string-ref str i) ifs-ws))
+            (skip-lead (+ i 1))
+            ;; Now split from position i
+            (read-ifs-split-from str i len ifs-ws ifs-nw max-fields)))))))
+
+;; IFS splitting for read builtin (non-raw mode — backslash processing during split)
+;; Backslash escapes the next character, preventing it from being treated as IFS
+;; The backslash itself is removed from the output
+(def (read-ifs-split str ifs max-fields)
+  (let ((len (string-length str)))
+    (if (= len 0)
+      []
+      (let ((ifs-ws (ifs-whitespace-chars ifs))
+            (ifs-nw (ifs-non-whitespace-chars ifs)))
+        ;; Skip leading IFS whitespace (backslash-space is NOT whitespace)
+        (let skip-lead ((i 0))
+          (if (and (< i len)
+                   (not (char=? (string-ref str i) #\\))
+                   (ifs-ws-member? (string-ref str i) ifs-ws))
+            (skip-lead (+ i 1))
+            ;; Now split with backslash processing
+            (read-ifs-split-bs str i len ifs-ws ifs-nw max-fields)))))))
+
+;; Helper: extract IFS whitespace characters (space, tab, newline in IFS)
+(def (ifs-whitespace-chars ifs)
+  (let ((buf (open-output-string)))
+    (let loop ((i 0))
+      (if (>= i (string-length ifs))
+        (get-output-string buf)
+        (let ((ch (string-ref ifs i)))
+          (when (or (char=? ch #\space) (char=? ch #\tab) (char=? ch #\newline))
+            (display ch buf))
+          (loop (+ i 1)))))))
+
+;; Helper: extract IFS non-whitespace characters
+(def (ifs-non-whitespace-chars ifs)
+  (let ((buf (open-output-string)))
+    (let loop ((i 0))
+      (if (>= i (string-length ifs))
+        (get-output-string buf)
+        (let ((ch (string-ref ifs i)))
+          (when (not (or (char=? ch #\space) (char=? ch #\tab) (char=? ch #\newline)))
+            (display ch buf))
+          (loop (+ i 1)))))))
+
+(def (ifs-ws-member? ch ws)
+  (let loop ((i 0))
+    (and (< i (string-length ws))
+         (or (char=? ch (string-ref ws i))
+             (loop (+ i 1))))))
+
+(def (ifs-nw-member? ch nw)
+  (let loop ((i 0))
+    (and (< i (string-length nw))
+         (or (char=? ch (string-ref nw i))
+             (loop (+ i 1))))))
+
+;; Raw IFS splitting (no backslash processing)
+(def (read-ifs-split-from str start len ifs-ws ifs-nw max-fields)
+  (let ((buf (open-output-string))
+        (fields [])
+        (field-count 1))
+    (let loop ((i start))
+      (cond
+        ((>= i len)
+         ;; End of string: strip trailing IFS for last field
+         (let* ((s (get-output-string buf))
+                (s (strip-trailing-ifs-for-read s ifs-ws ifs-nw)))
+           (reverse (if (or (> (string-length s) 0) (pair? fields))
+                      (cons s fields)
+                      fields))))
+        ;; Non-whitespace IFS delimiter
+        ((ifs-nw-member? (string-ref str i) ifs-nw)
+         ;; Check if we're at max-fields — if so, include delimiter in current field
+         (if (and (> max-fields 0) (>= field-count max-fields))
+           (begin (display (string-ref str i) buf) (loop (+ i 1)))
+           (let ((s (get-output-string buf)))
+             ;; Strip trailing IFS whitespace from current field
+             (set! fields (cons (strip-trailing-ifs-ws s ifs-ws) fields))
+             (set! buf (open-output-string))
+             (set! field-count (+ field-count 1))
+             ;; Skip IFS whitespace after non-whitespace delimiter
+             (let skip ((j (+ i 1)))
+               (if (and (< j len) (ifs-ws-member? (string-ref str j) ifs-ws))
+                 (skip (+ j 1))
+                 ;; If NOW at max fields, take rest as last field
+                 (if (and (> max-fields 0) (>= field-count max-fields))
+                   (begin
+                     (display (substring str j len) buf)
+                     (let* ((s (get-output-string buf))
+                            (s (strip-trailing-ifs-for-read s ifs-ws ifs-nw)))
+                       (reverse (cons s fields))))
+                   (loop j)))))))
+        ;; IFS whitespace
+        ((ifs-ws-member? (string-ref str i) ifs-ws)
+         ;; Check if we're at max-fields AND buf has content — if so, include ws in current field
+         ;; NOTE: get-output-string resets the port in Gambit, so save to var first
+         (let ((buf-content (get-output-string buf)))
+           (if (and (> max-fields 0) (>= field-count max-fields)
+                    (> (string-length buf-content) 0))
+             ;; At max fields: include buffered content + rest of string
+             (let* ((full (string-append buf-content (substring str i len)))
+                    (full (strip-trailing-ifs-for-read full ifs-ws ifs-nw)))
+               (reverse (cons full fields)))
+             (begin
+               (when (> (string-length buf-content) 0)
+                 (set! fields (cons buf-content fields))
+                 (set! field-count (+ field-count 1)))
+               (set! buf (open-output-string))
+               ;; Skip consecutive IFS whitespace
+               (let skip ((j (+ i 1)))
+                 (if (and (< j len) (ifs-ws-member? (string-ref str j) ifs-ws))
+                   (skip (+ j 1))
+                   ;; If NOW at max fields, take rest as last field
+                   (if (and (> max-fields 0) (>= field-count max-fields))
+                     (begin
+                       (display (substring str j len) buf)
+                       (let* ((s (get-output-string buf))
+                              (s (strip-trailing-ifs-for-read s ifs-ws ifs-nw)))
+                         (reverse (cons s fields))))
+                     (loop j))))))))
+        ;; Regular character
+        (else
+         (display (string-ref str i) buf)
+         (loop (+ i 1)))))))
+
+;; Non-raw IFS splitting with backslash processing
+(def (read-ifs-split-bs str start len ifs-ws ifs-nw max-fields)
+  ;; Helper to process remaining with backslash removal for last field
+  (define (process-rest-bs j buf)
+    (let rloop ((j j))
+      (cond
+        ((>= j len) #!void)
+        ((and (char=? (string-ref str j) #\\) (< (+ j 1) len))
+         (display (string-ref str (+ j 1)) buf)
+         (rloop (+ j 2)))
+        (else
+         (display (string-ref str j) buf)
+         (rloop (+ j 1))))))
+  (let ((buf (open-output-string))
+        (fields [])
+        (field-count 1))
+    (let loop ((i start))
+      (cond
+        ((>= i len)
+         ;; End of string: strip trailing IFS for last field
+         (let* ((s (get-output-string buf))
+                (s (strip-trailing-ifs-for-read s ifs-ws ifs-nw)))
+           (reverse (if (or (> (string-length s) 0) (pair? fields))
+                      (cons s fields)
+                      fields))))
+        ;; Backslash: escape next character (prevent IFS matching)
+        ;; But only process backslash specially if NOT at max-fields
+        ;; (at max-fields, backslash still escapes to prevent IFS matching)
+        ((and (char=? (string-ref str i) #\\) (< (+ i 1) len))
+         (display (string-ref str (+ i 1)) buf)
+         (loop (+ i 2)))
+        ;; Trailing backslash
+        ((and (char=? (string-ref str i) #\\) (= (+ i 1) len))
+         (display #\\ buf)
+         (loop (+ i 1)))
+        ;; Non-whitespace IFS delimiter
+        ((ifs-nw-member? (string-ref str i) ifs-nw)
+         ;; Check if we're at max-fields — if so, include delimiter in current field
+         (if (and (> max-fields 0) (>= field-count max-fields))
+           (begin (display (string-ref str i) buf) (loop (+ i 1)))
+           (let ((s (get-output-string buf)))
+             (set! fields (cons (strip-trailing-ifs-ws s ifs-ws) fields))
+             (set! buf (open-output-string))
+             (set! field-count (+ field-count 1))
+             ;; Skip IFS whitespace after non-whitespace delimiter
+             (let skip ((j (+ i 1)))
+               (if (and (< j len)
+                        (not (char=? (string-ref str j) #\\))
+                        (ifs-ws-member? (string-ref str j) ifs-ws))
+                 (skip (+ j 1))
+                 ;; If NOW at max fields, process rest with backslash removal
+                 (if (and (> max-fields 0) (>= field-count max-fields))
+                   (begin
+                     (process-rest-bs j buf)
+                     (let* ((s (get-output-string buf))
+                            (s (strip-trailing-ifs-for-read s ifs-ws ifs-nw)))
+                       (reverse (cons s fields))))
+                   (loop j)))))))
+        ;; IFS whitespace
+        ((ifs-ws-member? (string-ref str i) ifs-ws)
+         ;; Check if we're at max-fields AND buf has content — keep ws in current field
+         ;; NOTE: get-output-string resets the port in Gambit, so save to var first
+         (let ((buf-content (get-output-string buf)))
+           (if (and (> max-fields 0) (>= field-count max-fields)
+                    (> (string-length buf-content) 0))
+             ;; At max fields: include buffered content + rest of string with bs processing
+             (let ((new-buf (open-output-string)))
+               (display buf-content new-buf)
+               (process-rest-bs i new-buf)
+               (let* ((s (get-output-string new-buf))
+                      (s (strip-trailing-ifs-for-read s ifs-ws ifs-nw)))
+                 (reverse (cons s fields))))
+             (begin
+               (when (> (string-length buf-content) 0)
+                 (set! fields (cons buf-content fields))
+                 (set! field-count (+ field-count 1)))
+               (set! buf (open-output-string))
+               ;; Skip consecutive IFS whitespace
+               (let skip ((j (+ i 1)))
+                 (if (and (< j len)
+                          (not (char=? (string-ref str j) #\\))
+                          (ifs-ws-member? (string-ref str j) ifs-ws))
+                   (skip (+ j 1))
+                   ;; If NOW at max fields, process rest with backslash removal
+                   (if (and (> max-fields 0) (>= field-count max-fields))
+                     (begin
+                       (process-rest-bs j buf)
+                       (let* ((s (get-output-string buf))
+                              (s (strip-trailing-ifs-for-read s ifs-ws ifs-nw)))
+                         (reverse (cons s fields))))
+                     (loop j))))))))
+        ;; Regular character
+        (else
+         (display (string-ref str i) buf)
+         (loop (+ i 1)))))))
+
+;; Strip trailing IFS whitespace from a string
+(def (strip-trailing-ifs-ws s ws)
+  (if (= (string-length ws) 0)
+    s
+    (let loop ((end (string-length s)))
+      (if (and (> end 0) (ifs-ws-member? (string-ref s (- end 1)) ws))
+        (loop (- end 1))
+        (substring s 0 end)))))
+
+;; Strip trailing IFS from the last field for read:
+;; 1. Strip trailing IFS whitespace
+;; 2. If the last char is a non-ws IFS char AND it is NOT preceded by another non-ws IFS char,
+;;    strip that one trailing non-ws IFS char (and any IFS whitespace before it)
+(def (strip-trailing-ifs-for-read s ifs-ws ifs-nw)
+  (let* ((s1 (strip-trailing-ifs-ws s ifs-ws))
+         (len (string-length s1)))
+    (if (and (> len 0)
+             (ifs-nw-member? (string-ref s1 (- len 1)) ifs-nw)
+             ;; Only strip if NOT preceded by another non-ws IFS char
+             (or (= len 1)
+                 (not (ifs-nw-member? (string-ref s1 (- len 2)) ifs-nw))))
+      ;; Strip the trailing non-ws IFS char
+      (strip-trailing-ifs-ws (substring s1 0 (- len 1)) ifs-ws)
+      s1)))
 
 ;; trap ['command'] [signal ...]
 (builtin-register! "trap"
   (lambda (args env)
+    ;; Helper: print a trap entry with canonical signal display name
+    (def (print-trap short-name action)
+      (let ((display-name (signal-display-name short-name)))
+        (if (string? action)
+          (displayln (format "trap -- '~a' ~a" action display-name))
+          (displayln (format "trap -- '' ~a" display-name)))))
+    ;; Helper: normalize signal arg, print error if invalid
+    (def (normalize-or-error sig)
+      (let ((n (normalize-signal-arg sig)))
+        (unless n
+          (fprintf (current-error-port) "trap: ~a: invalid signal specification~n" sig))
+        n))
+    ;; Helper: set trap action for given signals
+    (def (trap-set-action action signals)
+      (let ((status 0))
+        (for-each
+         (lambda (sig)
+           (let ((norm (normalize-or-error sig)))
+             (if norm
+               (cond
+                 ((string=? action "-") (trap-set! norm 'default))
+                 ((string=? action "") (trap-set! norm 'ignore))
+                 (else (trap-set! norm action)))
+               (set! status 1))))
+         signals)
+        status))
+    ;; Main dispatch
     (cond
       ((null? args)
        ;; Print all traps
        (for-each
-        (lambda (pair)
-          (if (string? (cdr pair))
-            (displayln (format "trap -- '~a' ~a" (cdr pair) (car pair)))
-            (displayln (format "trap -- '' ~a" (car pair)))))
+        (lambda (pair) (print-trap (car pair) (cdr pair)))
         (trap-list))
        0)
       ((string=? (car args) "-l")
@@ -739,27 +1410,42 @@
        0)
       ((string=? (car args) "-p")
        ;; Print specific traps
-       (for-each
-        (lambda (sig)
-          (let ((action (trap-get sig)))
-            (when action
-              (if (string? action)
-                (displayln (format "trap -- '~a' ~a" action sig))
-                (displayln (format "trap -- '' ~a" sig))))))
-        (if (pair? (cdr args)) (cdr args) (map car (trap-list))))
-       0)
-      ((and (>= (length args) 2))
-       ;; Set trap: trap 'command' SIGNAL...
-       (let ((action (car args))
-             (signals (cdr args)))
+       (let ((sigs (cdr args)))
          (for-each
           (lambda (sig)
-            (cond
-              ((string=? action "-") (trap-set! sig 'default))
-              ((string=? action "") (trap-set! sig 'ignore))
-              (else (trap-set! sig action))))
-          signals)
-         0))
+            (let ((norm (normalize-or-error sig)))
+              (when norm
+                (let ((action (trap-get norm)))
+                  (when action (print-trap norm action))))))
+          (if (pair? sigs) sigs (map car (trap-list)))))
+       0)
+      ((string=? (car args) "--")
+       ;; Skip --, process rest
+       (let ((rest (cdr args)))
+         (if (null? rest)
+           ;; trap -- alone = print traps
+           (begin
+             (for-each (lambda (pair) (print-trap (car pair) (cdr pair))) (trap-list))
+             0)
+           ;; Check if next is also a signal (single-arg clear) or action + signals
+           (if (= (length rest) 1)
+             ;; Could be: trap -- SIGNAL (clear) or trap -- action (with no signals = error)
+             ;; Per bash: trap -- EXIT clears EXIT trap
+             (let ((norm (normalize-or-error (car rest))))
+               (if norm
+                 (begin (trap-set! norm 'default) 0)
+                 1))
+             (trap-set-action (car rest) (cdr rest))))))
+      ;; Single argument (no action, just signal name): clear the trap
+      ;; trap EXIT = clear EXIT trap, trap 0 = clear EXIT trap
+      ((= (length args) 1)
+       (let ((norm (normalize-or-error (car args))))
+         (if norm
+           (begin (trap-set! norm 'default) 0)
+           1)))
+      ;; Two or more args: action + signals
+      ((>= (length args) 2)
+       (trap-set-action (car args) (cdr args)))
       (else 0))))
 
 ;; jobs [-lnprs]
@@ -1281,44 +1967,185 @@
 ;;; --- test/[ implementation ---
 
 (def (test-eval args)
-  (cond
-    ((null? args) 1)  ;; false
-    ((= (length args) 1)
-     ;; Single arg: true if non-empty string
-     (if (> (string-length (car args)) 0) 0 1))
-    ((= (length args) 2)
-     ;; Unary: -flag arg
-     (test-unary (car args) (cadr args)))
-    ((= (length args) 3)
-     ;; Binary or negation
-     (if (string=? (car args) "!")
-       (if (= (test-eval (cdr args)) 0) 1 0)
-       (test-binary (car args) (cadr args) (caddr args))))
-    ((and (>= (length args) 3) (string=? (car args) "!"))
-     (if (= (test-eval (cdr args)) 0) 1 0))
-    (else 1)))
+  (test-eval-or args))
+
+;; Parse: expr -o expr -o ...
+(def (test-eval-or args)
+  ;; Find first -o at top level (not inside parens)
+  ;; Only treat -o as binary OR if there's something on both sides
+  (let split ((rest args) (left []))
+    (cond
+      ((null? rest)
+       (test-eval-and (reverse left)))
+      ((and (string=? (car rest) "-o")
+            (pair? left)         ;; must have left operand
+            (pair? (cdr rest)))  ;; must have right operand
+       ;; Evaluate left side; if true, short-circuit
+       (let ((lresult (test-eval-and (reverse left))))
+         (if (= lresult 0) 0
+           (test-eval-or (cdr rest)))))
+      (else
+       (split (cdr rest) (cons (car rest) left))))))
+
+;; Parse: expr -a expr -a ...
+(def (test-eval-and args)
+  (let split ((rest args) (left []))
+    (cond
+      ((null? rest)
+       (test-eval-not (reverse left)))
+      ((string=? (car rest) "-a")
+       ;; Check if this is unary -a (file exists) or binary -a (AND)
+       ;; It's binary -a if we have something on both sides
+       (if (and (pair? left) (pair? (cdr rest)))
+         (let ((lresult (test-eval-not (reverse left))))
+           (if (= lresult 0)
+             (test-eval-and (cdr rest))
+             1))
+         ;; Could be unary, don't split here
+         (split (cdr rest) (cons (car rest) left))))
+      (else
+       (split (cdr rest) (cons (car rest) left))))))
+
+;; Parse: ! expr | ( expr ) | primary
+(def (test-eval-not args)
+  (let ((len (length args)))
+    (cond
+      ((= len 0) 1)
+      ;; Negation: ! expr
+      ((string=? (car args) "!")
+       (let ((result (test-eval-not (cdr args))))
+         (if (= result 0) 1 (if (= result 1) 0 result))))
+      ;; Parenthesized: ( expr )
+      ((and (string=? (car args) "(")
+            (>= len 3)
+            (string=? (last-elem* args) ")"))
+       (test-eval (butlast (cdr args))))
+      ;; 1 arg: non-empty string test
+      ((= len 1)
+       (if (> (string-length (car args)) 0) 0 1))
+      ;; 2 args: unary operator
+      ((= len 2)
+       (test-unary (car args) (cadr args)))
+      ;; 3 args: binary operator OR special forms
+      ((= len 3)
+       (let ((a (car args)) (b (cadr args)) (c (caddr args)))
+         (cond
+           ;; ! unary-op arg
+           ((string=? a "!")
+            (let ((r (test-eval-not (cdr args))))
+              (if (= r 0) 1 (if (= r 1) 0 r))))
+           ;; ( expr )
+           ((and (string=? a "(") (string=? c ")"))
+            (test-eval-not (list b)))
+           ;; binary operator
+           (else (test-binary a b c)))))
+      ;; 4 args: ! with 3 arg expr, or ( unary )
+      ((= len 4)
+       (let ((a (car args)) (d (list-ref args 3)))
+         (cond
+           ((string=? a "!")
+            (let ((r (test-eval (cdr args))))
+              (if (= r 0) 1 (if (= r 1) 0 r))))
+           ;; ( expr op expr ) - parenthesized expression
+           ((and (string=? a "(") (string=? d ")"))
+            (test-eval (list (cadr args) (caddr args))))
+           (else 2))))
+      ;; 5+ args: handle using -a/-o parsing at top level already done
+      ;; But if we got here, it's a syntax error
+      (else 2))))
 
 (def (test-unary flag arg)
   (case (string->symbol flag)
     ((-z) (if (= (string-length arg) 0) 0 1))
     ((-n) (if (> (string-length arg) 0) 0 1))
-    ((-e) (if (file-exists? arg) 0 1))
+    ((-e -a) (if (file-exists? arg) 0 1))  ;; -a as unary is alias for -e
     ((-f) (if (and (file-exists? arg)
                     (eq? (file-info-type (file-info arg)) 'regular)) 0 1))
     ((-d) (if (and (file-exists? arg)
                     (eq? (file-info-type (file-info arg)) 'directory)) 0 1))
-    ((-r) (if (file-exists? arg) 0 1))  ;; simplified
-    ((-w) (if (file-exists? arg) 0 1))  ;; simplified
-    ((-x) (if (and (file-exists? arg) (executable? arg)) 0 1))
+    ((-r) (if (= (ffi-access arg 4) 0) 0 1))  ;; R_OK = 4
+    ((-w) (if (= (ffi-access arg 2) 0) 0 1))  ;; W_OK = 2
+    ((-x) (if (= (ffi-access arg 1) 0) 0 1))  ;; X_OK = 1
     ((-s) (if (and (file-exists? arg)
                     (> (file-info-size (file-info arg)) 0)) 0 1))
-    ((-L -h) (if (and (file-exists? arg)
-                       (eq? (file-info-type (file-info arg #t)) 'symbolic-link)) 0 1))
+    ((-L -h) ;; Symlink: use file-info with #f to not follow symlinks
+     (with-catch (lambda (e) 1)
+       (lambda ()
+         (let ((fi (file-info arg #f)))
+           (if (eq? (file-info-type fi) 'symbolic-link) 0 1)))))
     ((-t) (let ((fd (string->number arg)))
-             (if (and fd (= (ffi-isatty fd) 1)) 0 1)))
+             (if (not fd) 2  ;; invalid fd → exit 2
+               (if (= (ffi-isatty fd) 1) 0 1))))
     ((-p) (if (and (file-exists? arg)
                     (eq? (file-info-type (file-info arg)) 'fifo)) 0 1))
-    (else 1)))
+    ((-b) (if (and (file-exists? arg)
+                    (eq? (file-info-type (file-info arg)) 'block-special)) 0 1))
+    ((-c) (if (and (file-exists? arg)
+                    (eq? (file-info-type (file-info arg)) 'character-special)) 0 1))
+    ((-v) ;; True if the named variable is set
+     (if (*test-var-fn*)
+       (if ((*test-var-fn*) arg) 0 1)
+       1))
+    ((-o) ;; Shell option test
+     (if (*test-option-fn*)
+       (if ((*test-option-fn*) arg) 0 1)
+       1))
+    ((-G) (with-catch (lambda (e) 1)
+            (lambda () (if (and (file-exists? arg)
+                                (= (file-info-group (file-info arg)) (ffi-getegid))) 0 1))))
+    ((-O) (with-catch (lambda (e) 1)
+            (lambda () (if (and (file-exists? arg)
+                                (= (file-info-owner (file-info arg)) (ffi-geteuid))) 0 1))))
+    ((-u) (with-catch (lambda (e) 1)  ;; setuid
+            (lambda () (if (and (file-exists? arg)
+                                (not (zero? (bitwise-and (file-info-mode (file-info arg)) #o4000)))) 0 1))))
+    ((-g) (with-catch (lambda (e) 1)  ;; setgid
+            (lambda () (if (and (file-exists? arg)
+                                (not (zero? (bitwise-and (file-info-mode (file-info arg)) #o2000)))) 0 1))))
+    ((-k) (with-catch (lambda (e) 1)  ;; sticky bit
+            (lambda () (if (and (file-exists? arg)
+                                (not (zero? (bitwise-and (file-info-mode (file-info arg)) #o1000)))) 0 1))))
+    ((-S) (if (and (file-exists? arg)
+                    (eq? (file-info-type (file-info arg)) 'socket)) 0 1))
+    ((-N) (with-catch (lambda (e) 1)  ;; modified since last read
+            (lambda ()
+              (if (file-exists? arg)
+                (let ((fi (file-info arg)))
+                  (if (> (time->seconds (file-info-last-modification-time fi))
+                         (time->seconds (file-info-last-access-time fi))) 0 1))
+                1))))
+    (else
+     ;; Not a recognized flag, treat as non-empty string test for both args
+     ;; This handles cases like [ "str1" "str2" ] which is a syntax error → exit 2
+     2)))
+
+;; Parameter for checking variable existence (set by executor)
+(def *test-var-fn* (make-parameter #f))
+;; Parameter for checking shell options (set by executor)
+(def *test-option-fn* (make-parameter #f))
+
+;; Parse a shell integer for [ comparisons: handles decimal, 0x hex, 0 octal, N#val
+(def (test-parse-integer str)
+  (let ((s (test-string-trim str)))
+    (cond
+      ((string=? s "") #f)
+      ;; Negative
+      ((and (> (string-length s) 0) (char=? (string-ref s 0) #\-))
+       (let ((n (test-parse-integer (substring s 1 (string-length s)))))
+         (and n (- n))))
+      ;; [/test treats all numbers as decimal — no 0x hex, no 0 octal
+      ;; Plain decimal only
+      (else (string->number s)))))
+
+(def (test-string-trim s)
+  (let* ((len (string-length s))
+         (start (let loop ((i 0))
+                  (if (and (< i len) (char-whitespace? (string-ref s i)))
+                    (loop (+ i 1)) i)))
+         (end (let loop ((i len))
+                (if (and (> i start) (char-whitespace? (string-ref s (- i 1))))
+                  (loop (- i 1)) i))))
+    (substring s start end)))
 
 (def (test-binary left op right)
   (case (string->symbol op)
@@ -1326,25 +2153,43 @@
     ((!=) (if (not (string=? left right)) 0 1))
     ((<) (if (string<? left right) 0 1))
     ((>) (if (string>? left right) 0 1))
-    ((-eq) (let ((l (string->number left)) (r (string->number right)))
-             (if (and l r (= l r)) 0 1)))
-    ((-ne) (let ((l (string->number left)) (r (string->number right)))
-             (if (and l r (not (= l r))) 0 1)))
-    ((-lt) (let ((l (string->number left)) (r (string->number right)))
-             (if (and l r (< l r)) 0 1)))
-    ((-le) (let ((l (string->number left)) (r (string->number right)))
-             (if (and l r (<= l r)) 0 1)))
-    ((-gt) (let ((l (string->number left)) (r (string->number right)))
-             (if (and l r (> l r)) 0 1)))
-    ((-ge) (let ((l (string->number left)) (r (string->number right)))
-             (if (and l r (>= l r)) 0 1)))
+    ((-eq) (test-int-cmp = left right))
+    ((-ne) (test-int-cmp (lambda (a b) (not (= a b))) left right))
+    ((-lt) (test-int-cmp < left right))
+    ((-le) (test-int-cmp <= left right))
+    ((-gt) (test-int-cmp > left right))
+    ((-ge) (test-int-cmp >= left right))
     ((-nt) (if (and (file-exists? left) (file-exists? right)
                      (> (time->seconds (file-info-last-modification-time (file-info left)))
                         (time->seconds (file-info-last-modification-time (file-info right))))) 0 1))
     ((-ot) (if (and (file-exists? left) (file-exists? right)
                      (< (time->seconds (file-info-last-modification-time (file-info left)))
                         (time->seconds (file-info-last-modification-time (file-info right))))) 0 1))
-    (else 1)))
+    ((-ef) (if (and (file-exists? left) (file-exists? right)
+                     (let ((li (file-info left)) (ri (file-info right)))
+                       (and (= (file-info-device li) (file-info-device ri))
+                            (= (file-info-inode li) (file-info-inode ri))))) 0 1))
+    ;; Binary -a (AND) and -o (OR)
+    ((-a) (let ((l (if (> (string-length left) 0) 0 1))
+                (r (if (> (string-length right) 0) 0 1)))
+            (if (and (= l 0) (= r 0)) 0 1)))
+    ((-o) (let ((l (if (> (string-length left) 0) 0 1))
+                (r (if (> (string-length right) 0) 0 1)))
+            (if (or (= l 0) (= r 0)) 0 1)))
+    (else 2)))  ;; Unknown operator → exit 2
+
+;; Integer comparison for test: returns 0 (true), 1 (false), 2 (error)
+(def (test-int-cmp cmp left right)
+  (let ((l (test-parse-integer left))
+        (r (test-parse-integer right)))
+    (cond
+      ((not l)
+       (fprintf (current-error-port) "test: ~a: integer expression expected~n" left)
+       2)
+      ((not r)
+       (fprintf (current-error-port) "test: ~a: integer expression expected~n" right)
+       2)
+      (else (if (cmp l r) 0 1)))))
 
 ;;; --- Helpers ---
 
@@ -1467,6 +2312,24 @@
 ;; Returns (values next-position remaining-args)
 (def (printf-format-spec fmt i args buf)
   (let ((flen (string-length fmt)))
+    ;; Check for %(strftime)T format
+    (if (and (< i flen) (char=? (string-ref fmt i) #\()
+             (let ((close (string-find-char-from fmt #\) (+ i 1))))
+               (and close (< (+ close 1) flen)
+                    (char=? (string-ref fmt (+ close 1)) #\T))))
+      (let* ((close (string-find-char-from fmt #\) (+ i 1)))
+             (strfmt (substring fmt (+ i 1) close))
+             (arg (if (pair? args) (car args) ""))
+             (rest (if (pair? args) (cdr args) []))
+             (epoch (cond
+                      ((string=? arg "") (inexact->exact (floor (time->seconds (current-time)))))
+                      ((string=? arg "-1") (inexact->exact (floor (time->seconds (current-time)))))
+                      ((string=? arg "-2")
+                       (inexact->exact (floor (time->seconds (current-time)))))
+                      (else (or (string->number arg) 0))))
+             (result (ffi-strftime strfmt epoch)))
+        (display result buf)
+        (values (+ close 2) rest))
     ;; Parse flags: -, +, space, 0, #
     (let flag-loop ((i i) (left-align? #f) (plus-sign? #f) (space-sign? #f)
                     (zero-pad? #f) (alt-form? #f))
@@ -1597,7 +2460,7 @@
                        (else
                         (fprintf (current-error-port) "printf: %~a: invalid format character~n" (string spec))
                         (*printf-conversion-error* #t)
-                        (values (+ i 1) args))))))))))))))
+                        (values (+ i 1) args)))))))))))))))
 
 ;; Parse a number (or * for arg-supplied width/precision) in format string
 (def (parse-printf-number fmt i args)
@@ -1991,8 +2854,8 @@
    (lambda (e) 0)
    (lambda ()
      (arith-eval expr
-                 (lambda (name) (env-get env name))
-                 (lambda (name val) (env-set! env name val))))))
+                 (arith-env-getter env)
+                 (arith-env-setter env)))))
 
 ;; Import arith-eval from arithmetic module
 (import :gsh/arithmetic)

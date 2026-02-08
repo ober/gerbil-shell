@@ -15,6 +15,11 @@
         :gsh/glob
         :gsh/arithmetic)
 
+;;; --- Nounset (set -u) error ---
+(def (nounset-error! name env)
+  (fprintf (current-error-port) "gsh: ~a: unbound variable~n" name)
+  (raise (make-nounset-exception 1)))
+
 ;;; --- Process substitution state ---
 ;; Accumulates cleanup thunks for process substitutions created during expansion.
 ;; Caller should bind this and call the cleanups after the command finishes.
@@ -426,6 +431,8 @@
                   j)))
          (name (substring str (+ i 1) end))
          (val (env-get env name)))
+    (when (and (not val) (env-option? env "nounset"))
+      (nounset-error! name env))
     (values (or val "") end)))
 
 ;; Braced parameter: ${name} ${name:-default} ${#name} etc.
@@ -482,11 +489,13 @@
            (let* ((name (substring rest 0 bracket-pos))
                   (keys (env-array-keys env name)))
              (string-join-with " " keys))
-           ;; ${!name} — indirect expansion
-           (let ((ref-name (env-get env rest)))
-             (if ref-name
-               (or (env-get env ref-name) "")
-               "")))))
+           ;; ${!name} — indirect expansion, possibly with modifiers
+           (let-values (((iname modifier arg) (parse-parameter-modifier rest)))
+             (let* ((ref-name (env-get env iname))
+                    (val (if ref-name (env-get env ref-name) #f)))
+               (if modifier
+                 (apply-parameter-modifier val (or ref-name iname) modifier arg env)
+                 (or val "")))))))
       (else
        ;; Check for array subscript: name[idx] or name[@] or name[*]
        (let ((bracket-pos (find-array-subscript-start content)))
@@ -495,6 +504,10 @@
            ;; Regular parameter — find modifier
            (let-values (((name modifier arg) (parse-parameter-modifier content)))
              (let ((val (env-get env name)))
+               ;; nounset check: only for bare ${name} or modifiers that don't provide defaults
+               (when (and (not val) (env-option? env "nounset")
+                          (not (memq modifier '(:- - := = :+ + :? ?))))
+                 (nounset-error! name env))
                (apply-parameter-modifier val name modifier arg env)))))))))
 
 ;; Find the start of an array subscript [idx] in parameter content.
@@ -547,15 +560,24 @@
           ;; ${name[@]modifier} or ${name[*]modifier} — with modifier
           ((and (or (string=? subscript "@") (string=? subscript "*"))
                 (> (string-length after-bracket) 0))
-           ;; Apply modifier to the joined string
-           (let* ((vals (env-array-values env name))
-                  (joined (string-join-with " " vals)))
-             ;; Parse the modifier from after-bracket
+           ;; Parse the modifier from after-bracket
+           (let* ((vals (env-array-values env name)))
              (let-values (((mname modifier arg)
                            (parse-parameter-modifier
                             (string-append "x" after-bracket))))
-               (apply-parameter-modifier (if (null? vals) #f joined)
-                                        name modifier arg env))))
+               ;; For @, apply modifier per-element
+               (if (string=? subscript "@")
+                 (let ((modified-vals
+                        (map (lambda (v)
+                               (apply-parameter-modifier v name modifier arg env))
+                             vals)))
+                   (string-join-with " " modified-vals))
+                 ;; For *, join first then apply
+                 (let* ((ifs (or (env-get env "IFS") " \t\n"))
+                        (sep (if (> (string-length ifs) 0) (string (string-ref ifs 0)) ""))
+                        (joined (string-join-with sep vals)))
+                   (apply-parameter-modifier (if (null? vals) #f joined)
+                                            name modifier arg env))))))
           ;; ${name[idx]} — single element access
           (else
            (let ((expanded-idx (expand-word-nosplit subscript env)))
@@ -571,8 +593,57 @@
                                             name modifier arg env)))))))))))
 
 ;; Parse NAME and modifier from parameter content
+(def (special-param-char? ch)
+  (or (char=? ch #\@) (char=? ch #\*)
+      (char=? ch #\?) (char=? ch #\!)
+      (char=? ch #\$) (char=? ch #\-)))
+
+;; Parse modifier from a rest string starting after the name.
+;; Returns (values modifier arg) or #f if no modifier found.
+(def (parse-modifier-from-rest rest)
+  (let ((rlen (string-length rest)))
+    (if (= rlen 0) (values #f "")
+      (let ((mod-ch (string-ref rest 0)))
+        (cond
+          ((char=? mod-ch #\:)
+           (if (> rlen 1)
+             (let ((mod2 (string-ref rest 1)))
+               (case mod2
+                 ((#\- #\+ #\= #\?)
+                  (values (string->symbol (string #\: mod2))
+                          (substring rest 2 rlen)))
+                 (else
+                  (values ': (substring rest 1 rlen)))))
+             (values #f "")))
+          ((memq mod-ch '(#\- #\+ #\= #\?))
+           (values (string->symbol (string mod-ch))
+                   (substring rest 1 rlen)))
+          ((char=? mod-ch #\%)
+           (if (and (> rlen 1) (char=? (string-ref rest 1) #\%))
+             (values '%% (substring rest 2 rlen))
+             (values '% (substring rest 1 rlen))))
+          ((char=? mod-ch #\#)
+           (if (and (> rlen 1) (char=? (string-ref rest 1) #\#))
+             (values 'prefix-long (substring rest 2 rlen))
+             (values 'prefix-short (substring rest 1 rlen))))
+          (else #f))))))
+
 (def (parse-parameter-modifier content)
   (let ((len (string-length content)))
+    ;; Handle special parameters: @, *, ?, !, $, -, 0-9
+    ;; These are single-char names — modifier starts at position 1
+    (if (and (> len 0)
+             (let ((ch (string-ref content 0)))
+               (or (special-param-char? ch)
+                   (and (char-numeric? ch)
+                        (or (= len 1)
+                            (not (char-numeric? (string-ref content 1))))))))
+      (let* ((name (string (string-ref content 0)))
+             (rest (substring content 1 len)))
+        (let-values (((modifier arg) (parse-modifier-from-rest rest)))
+          (if modifier
+            (values name modifier arg)
+            (values name #f ""))))
     ;; Find the modifier operator
     (let loop ((i 0))
       (cond
@@ -647,7 +718,81 @@
          (values (substring content 0 i)
                  (string->symbol (string (string-ref content i)))
                  (substring content (+ i 1) len)))
-        (else (loop (+ i 1)))))))
+        (else (loop (+ i 1))))))))
+
+;; Pattern substitution helpers for ${var/pattern/repl} and ${var//pattern/repl}
+;; Returns string with first match of glob pattern replaced
+(def (pattern-substitute-first val pattern replacement (extglob? #f))
+  (let ((vlen (string-length val)))
+    (cond
+      ;; ${var/#pattern/repl} — anchor to start (prefix match)
+      ((and (> (string-length pattern) 0) (char=? (string-ref pattern 0) #\#))
+       (let ((pat (substring pattern 1 (string-length pattern))))
+         ;; Try longest match from start
+         (let loop ((i vlen))
+           (if (< i 0)
+             val
+             (if (glob-match? pat (substring val 0 i) #f extglob?)
+               (string-append replacement (substring val i vlen))
+               (loop (- i 1)))))))
+      ;; ${var/%pattern/repl} — anchor to end (suffix match)
+      ((and (> (string-length pattern) 0) (char=? (string-ref pattern 0) #\%))
+       (let ((pat (substring pattern 1 (string-length pattern))))
+         ;; Try longest match from end
+         (let loop ((i 0))
+           (if (> i vlen)
+             val
+             (if (glob-match? pat (substring val i vlen) #f extglob?)
+               (string-append (substring val 0 i) replacement)
+               (loop (+ i 1)))))))
+      ;; Unanchored — find first match anywhere
+      (else
+       (let loop ((start 0))
+         (if (> start vlen)
+           val
+           ;; Try all end positions from longest to shortest
+           (let inner ((end vlen))
+             (cond
+               ((< end start)
+                ;; No match at this start position, try next
+                (loop (+ start 1)))
+               ((glob-match? pattern (substring val start end) #f extglob?)
+                ;; Found a match
+                (string-append (substring val 0 start)
+                               replacement
+                               (substring val end vlen)))
+               (else (inner (- end 1)))))))))))
+
+;; Returns string with all matches of glob pattern replaced
+(def (pattern-substitute-all val pattern replacement (extglob? #f))
+  (let ((vlen (string-length val)))
+    (if (string=? pattern "")
+      val  ;; Empty pattern — no replacement
+      (let ((buf (open-output-string)))
+        (let loop ((start 0))
+          (if (> start vlen)
+            (get-output-string buf)
+            ;; Try all end positions from longest to shortest
+            (let inner ((end vlen))
+              (cond
+                ((< end (+ start 1))
+                 ;; No match at this start, emit char and move on
+                 (if (< start vlen)
+                   (begin
+                     (display (string-ref val start) buf)
+                     (loop (+ start 1)))
+                   (get-output-string buf)))
+                ((glob-match? pattern (substring val start end) #f extglob?)
+                 ;; Found match — emit replacement and skip past match
+                 (display replacement buf)
+                 (if (= end start)
+                   ;; Zero-length match — advance by one to avoid infinite loop
+                   (begin
+                     (when (< start vlen)
+                       (display (string-ref val start) buf))
+                     (loop (+ start 1)))
+                   (loop end)))
+                (else (inner (- end 1)))))))))))
 
 ;; Apply parameter modifier
 (def (apply-parameter-modifier val name modifier arg env)
@@ -734,6 +879,20 @@
                ;; No length — from offset to end
                (substring str start slen)))
            ""))
+    ;; ${name/pattern/replacement} — replace first match
+    ((/) (if val
+           (let ((pattern (expand-string (car arg) env))
+                 (replacement (expand-string (cdr arg) env)))
+             (pattern-substitute-first val pattern replacement
+                                       (env-shopt? env "extglob")))
+           ""))
+    ;; ${name//pattern/replacement} — replace all matches
+    ((//) (if val
+            (let ((pattern (expand-string (car arg) env))
+                  (replacement (expand-string (cdr arg) env)))
+              (pattern-substitute-all val pattern replacement
+                                      (env-shopt? env "extglob")))
+            ""))
     ;; No modifier
     ((#f) (or val ""))
     (else (or val ""))))
@@ -838,12 +997,93 @@
 
 (def (expand-arith-sub str i env)
   ;; $(( ... )) — find matching ))
+  ;; Pre-expand $var, ${var}, $(cmd) inside the expression before arith-eval
   (let* ((close (find-arith-close str (+ i 3)))
-         (expr (substring str (+ i 3) close))
+         (raw-expr (substring str (+ i 3) close))
+         (expr (expand-arith-expr raw-expr env))
          (result (arith-eval expr
-                            (lambda (name) (env-get env name))
-                            (lambda (name val) (env-set! env name val)))))
+                            (arith-env-getter env)
+                            (arith-env-setter env)
+                            (env-option? env "nounset"))))
     (values (number->string result) (+ close 2))))
+
+;; Expand $var, ${var}, $(cmd) inside an arithmetic expression
+;; but leave bare variable names alone (they're resolved by arith-eval)
+(def (expand-arith-expr expr env)
+  (let ((len (string-length expr))
+        (buf (open-output-string)))
+    (let loop ((i 0))
+      (cond
+        ((>= i len) (get-output-string buf))
+        ((and (char=? (string-ref expr i) #\$)
+              (< (+ i 1) len))
+         (let ((next (string-ref expr (+ i 1))))
+           (cond
+             ;; $(( ... )) — nested arithmetic substitution
+             ((and (char=? next #\()
+                   (< (+ i 2) len)
+                   (char=? (string-ref expr (+ i 2)) #\())
+              (let-values (((val end) (expand-arith-sub expr i env)))
+                (display val buf)
+                (loop end)))
+             ;; $( ... ) — command substitution
+             ((char=? next #\()
+              (let-values (((val end) (expand-command-sub expr i env)))
+                (display val buf)
+                (loop end)))
+             ;; ${ ... } — braced parameter expansion
+             ((char=? next #\{)
+              (let-values (((val end) (expand-parameter-braced expr i env)))
+                (display val buf)
+                (loop end)))
+             ;; $name — simple variable
+             ((or (char-alphabetic? next) (char=? next #\_))
+              (let-values (((val end) (expand-simple-var expr i env)))
+                (display val buf)
+                (loop end)))
+             ;; $N — positional parameter
+             ((char-numeric? next)
+              (let-values (((val end) (expand-simple-var expr i env)))
+                (display val buf)
+                (loop end)))
+             ;; $? $! $# etc.
+             ((memv next '(#\? #\! #\# #\- #\$ #\0))
+              (let-values (((val end) (expand-simple-var expr i env)))
+                (display val buf)
+                (loop end)))
+             (else
+              (display #\$ buf)
+              (loop (+ i 1))))))
+        ;; Backquote substitution
+        ((char=? (string-ref expr i) #\`)
+         (let-values (((val end) (expand-backtick expr i env)))
+           (display val buf)
+           (loop end)))
+        ;; Quoted strings: pass through removing quotes for arith purposes
+        ((char=? (string-ref expr i) #\')
+         ;; Single-quoted string in arithmetic — the content is a literal
+         (let qloop ((j (+ i 1)))
+           (cond
+             ((>= j len) (display (substring expr i len) buf) (loop len))
+             ((char=? (string-ref expr j) #\')
+              (display (substring expr (+ i 1) j) buf)
+              (loop (+ j 1)))
+             (else (qloop (+ j 1))))))
+        ((char=? (string-ref expr i) #\")
+         ;; Double-quoted string in arithmetic — expand contents
+         (let qloop ((j (+ i 1)))
+           (cond
+             ((>= j len) (display (substring expr i len) buf) (loop len))
+             ((char=? (string-ref expr j) #\")
+              (let ((inner (substring expr (+ i 1) j)))
+                (display (expand-arith-expr inner env) buf)
+                (loop (+ j 1))))
+             ((char=? (string-ref expr j) #\\)
+              (qloop (min (+ j 2) len)))
+             (else (qloop (+ j 1))))))
+        (else
+         (display (string-ref expr i) buf)
+         (loop (+ i 1)))))))
 
 ;;; --- Word splitting ---
 
@@ -974,8 +1214,8 @@
                (loop (+ i 2) 0))
               (else (loop (+ i 1) depth))))))))
 
-;; Check if a word contains $@ or ${@} inside double quotes (not inside $() or ``)
-;; Used to detect the need for "$@" multi-word expansion
+;; Check if a word contains $@ or ${@} or ${name[@]} inside double quotes (not inside $() or ``)
+;; Used to detect the need for "$@" / "${arr[@]}" multi-word expansion
 (def (word-has-quoted-at? word)
   (let ((len (string-length word)))
     (let loop ((i 0) (in-dq #f) (depth 0))
@@ -1021,16 +1261,41 @@
                     (char=? (string-ref word (+ i 2)) #\@)
                     (char=? (string-ref word (+ i 3)) #\}))
                #t)
+              ;; ${name[@]} at depth 0 inside double quotes — MATCH
+              ((and in-dq (= depth 0) (char=? ch #\$) (< (+ i 1) len)
+                    (char=? (string-ref word (+ i 1)) #\{))
+               ;; Scan for [@]} pattern
+               (let scan ((j (+ i 2)))
+                 (cond
+                   ((>= j len) (loop (+ i 1) in-dq depth))
+                   ;; Found [@]} — match!
+                   ((and (char=? (string-ref word j) #\[)
+                         (< (+ j 2) len)
+                         (char=? (string-ref word (+ j 1)) #\@)
+                         (char=? (string-ref word (+ j 2)) #\]))
+                    ;; Check for closing }
+                    (let ((k (+ j 3)))
+                      (if (and (< k len) (char=? (string-ref word k) #\}))
+                        #t
+                        (loop (+ i 1) in-dq depth))))
+                   ;; Valid identifier chars — keep scanning
+                   ((or (char-alphabetic? (string-ref word j))
+                        (char-numeric? (string-ref word j))
+                        (char=? (string-ref word j) #\_))
+                    (scan (+ j 1)))
+                   ;; Not an array[@] pattern — fall through
+                   (else (loop (+ i 1) in-dq depth)))))
               (else (loop (+ i 1) in-dq depth))))))))
 
-;; Find $@ or ${@} inside double quotes and split into prefix/suffix
-;; Returns (values prefix-str suffix-str) where quotes are balanced
+;; Find $@ or ${@} or ${name[@]} inside double quotes and split into prefix/suffix
+;; Returns (values prefix-str suffix-str array-name-or-false) where quotes are balanced
+;; array-name is #f for $@/${@}, or the array name string for ${name[@]}
 (def (split-word-at-quoted-at word)
   (let ((len (string-length word)))
     (let loop ((i 0) (in-dq #f) (depth 0))
       (cond
         ((>= i len)
-         (values word ""))
+         (values word "" #f))
         ((char=? (string-ref word i) #\\)
          (loop (min (+ i 2) len) in-dq depth))
         ((and (char=? (string-ref word i) #\") (= depth 0))
@@ -1059,34 +1324,60 @@
               (char=? (string-ref word (+ i 1)) #\@))
          ;; Close double quote for prefix, reopen for suffix
          (values (string-append (substring word 0 i) "\"")
-                 (string-append "\"" (substring word (+ i 2) len))))
+                 (string-append "\"" (substring word (+ i 2) len))
+                 #f))
         ;; ${@} inside double quotes at depth 0
         ((and in-dq (= depth 0) (char=? (string-ref word i) #\$) (< (+ i 3) len)
               (char=? (string-ref word (+ i 1)) #\{)
               (char=? (string-ref word (+ i 2)) #\@)
               (char=? (string-ref word (+ i 3)) #\}))
          (values (string-append (substring word 0 i) "\"")
-                 (string-append "\"" (substring word (+ i 4) len))))
+                 (string-append "\"" (substring word (+ i 4) len))
+                 #f))
+        ;; ${name[@]} inside double quotes at depth 0
+        ((and in-dq (= depth 0) (char=? (string-ref word i) #\$) (< (+ i 1) len)
+              (char=? (string-ref word (+ i 1)) #\{))
+         ;; Try to match name[@]}
+         (let scan ((j (+ i 2)))
+           (cond
+             ((>= j len) (loop (+ i 1) in-dq depth))
+             ((and (char=? (string-ref word j) #\[)
+                   (< (+ j 3) len)
+                   (char=? (string-ref word (+ j 1)) #\@)
+                   (char=? (string-ref word (+ j 2)) #\])
+                   (char=? (string-ref word (+ j 3)) #\}))
+              (let ((arr-name (substring word (+ i 2) j))
+                    (end-pos (+ j 4)))
+                (values (string-append (substring word 0 i) "\"")
+                        (string-append "\"" (substring word end-pos len))
+                        arr-name)))
+             ((or (char-alphabetic? (string-ref word j))
+                  (char-numeric? (string-ref word j))
+                  (char=? (string-ref word j) #\_))
+              (scan (+ j 1)))
+             (else (loop (+ i 1) in-dq depth)))))
         (else
          (loop (+ i 1) in-dq depth))))))
 
-;; Expand a word containing "$@" in double quotes to multiple words
+;; Expand a word containing "$@" or "${arr[@]}" in double quotes to multiple words
 (def (expand-word-with-at word env)
-  (let-values (((prefix-raw suffix-raw) (split-word-at-quoted-at word)))
-    (let ((positionals (env-positional-list env))
+  (let-values (((prefix-raw suffix-raw array-name) (split-word-at-quoted-at word)))
+    (let ((elements (if array-name
+                      (env-array-values env array-name)
+                      (env-positional-list env)))
           (expanded-prefix (expand-string prefix-raw env))
           (expanded-suffix (expand-string suffix-raw env)))
-      (if (null? positionals)
-        ;; No params: "$@" produces nothing, but prefix/suffix may remain
+      (if (null? elements)
+        ;; No elements: "$@"/"${arr[@]}" produces nothing, but prefix/suffix may remain
         (let ((combined (string-append expanded-prefix expanded-suffix)))
           (if (string=? combined "") [] [combined]))
-        ;; Has positional params
-        (let ((n (length positionals)))
+        ;; Has elements
+        (let ((n (length elements)))
           (if (= n 1)
-            [(string-append expanded-prefix (car positionals) expanded-suffix)]
-            (let* ((first (string-append expanded-prefix (car positionals)))
-                   (last-val (string-append (last positionals) expanded-suffix))
-                   (middle (let mid-loop ((ps (cdr positionals)) (acc []))
+            [(string-append expanded-prefix (car elements) expanded-suffix)]
+            (let* ((first (string-append expanded-prefix (car elements)))
+                   (last-val (string-append (last elements) expanded-suffix))
+                   (middle (let mid-loop ((ps (cdr elements)) (acc []))
                              (if (null? (cdr ps))
                                (reverse acc)
                                (mid-loop (cdr ps) (cons (car ps) acc))))))
@@ -1190,19 +1481,40 @@
            (loop (+ i 1) depth cd "")))))))
 
 (def (find-arith-close str start)
+  ;; Find matching )) for $(( ... ))
+  ;; Must track nested (( )) pairs AND single ( ) for expressions like ~(1|2)
   (let ((len (string-length str)))
-    (let loop ((i start) (depth 1))
+    (let loop ((i start) (paren-depth 0))
       (cond
         ((>= i len) (- len 2))
-        ((and (char=? (string-ref str i) #\))
+        ;; Check for )) — only close if no open single parens
+        ((and (= paren-depth 0)
+              (char=? (string-ref str i) #\))
               (< (+ i 1) len)
               (char=? (string-ref str (+ i 1)) #\)))
-         (if (= depth 1) i (loop (+ i 2) (- depth 1))))
-        ((and (char=? (string-ref str i) #\()
-              (< (+ i 1) len)
+         i)
+        ;; Nested $(( — skip
+        ((and (< (+ i 2) len)
+              (char=? (string-ref str i) #\$)
+              (char=? (string-ref str (+ i 1)) #\()
+              (char=? (string-ref str (+ i 2)) #\())
+         ;; Find matching )) for nested arith, then continue
+         (let ((inner-close (find-arith-close str (+ i 3))))
+           (loop (+ inner-close 2) paren-depth)))
+        ;; $( — command substitution, skip to matching )
+        ((and (< (+ i 1) len)
+              (char=? (string-ref str i) #\$)
               (char=? (string-ref str (+ i 1)) #\())
-         (loop (+ i 2) (+ depth 1)))
-        (else (loop (+ i 1) depth))))))
+         (let ((close (find-matching-paren str (+ i 2))))
+           (loop (+ close 1) paren-depth)))
+        ;; Single ( increases depth
+        ((char=? (string-ref str i) #\()
+         (loop (+ i 1) (+ paren-depth 1)))
+        ;; Single ) decreases depth (must be inside parens)
+        ((and (char=? (string-ref str i) #\))
+              (> paren-depth 0))
+         (loop (+ i 1) (- paren-depth 1)))
+        (else (loop (+ i 1) paren-depth))))))
 
 ;;; --- Pattern matching helpers ---
 
