@@ -63,11 +63,22 @@
 (defstruct break-exception (levels) transparent: #t)
 (defstruct continue-exception (levels) transparent: #t)
 
+;; Track loop nesting depth — break/continue are only valid inside loops
+(def *loop-depth* (make-parameter 0))
+
 (def (shell-break! (levels 1))
-  (raise (make-break-exception levels)))
+  (if (> (*loop-depth*) 0)
+    (raise (make-break-exception levels))
+    (begin
+      (fprintf (current-error-port) "break: only meaningful in a `for', `while', or `until' loop~n")
+      0)))
 
 (def (shell-continue! (levels 1))
-  (raise (make-continue-exception levels)))
+  (if (> (*loop-depth*) 0)
+    (raise (make-continue-exception levels))
+    (begin
+      (fprintf (current-error-port) "continue: only meaningful in a `for', `while', or `until' loop~n")
+      0)))
 
 ;;; --- Errexit exception ---
 ;; Raised when set -e is active and a command fails outside a condition context

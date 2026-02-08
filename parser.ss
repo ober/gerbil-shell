@@ -351,7 +351,10 @@
                         (or (eq? (token-type tok) 'WORD)
                             ;; ASSIGNMENT_WORD as argument to builtins like
                             ;; local, export, readonly, declare
-                            (eq? (token-type tok) 'ASSIGNMENT_WORD)))
+                            (eq? (token-type tok) 'ASSIGNMENT_WORD)
+                            ;; BANG (!) as argument — only special at pipeline
+                            ;; start, not inside command arguments like [ ! -z x ]
+                            (eq? (token-type tok) 'BANG)))
                    (set! words (cons (token-value (parser-next! ps)) words))
                    (suffix-loop))
                   ;; Process substitution <(cmd) or >(cmd)

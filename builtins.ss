@@ -1973,11 +1973,17 @@
 (def (test-eval-or args)
   ;; Find first -o at top level (not inside parens)
   ;; Only treat -o as binary OR if there's something on both sides
-  (let split ((rest args) (left []))
+  (let split ((rest args) (left []) (depth 0))
     (cond
       ((null? rest)
        (test-eval-and (reverse left)))
-      ((and (string=? (car rest) "-o")
+      ;; Track ( ) nesting
+      ((string=? (car rest) "(")
+       (split (cdr rest) (cons (car rest) left) (+ depth 1)))
+      ((string=? (car rest) ")")
+       (split (cdr rest) (cons (car rest) left) (max 0 (- depth 1))))
+      ((and (= depth 0)
+            (string=? (car rest) "-o")
             (pair? left)         ;; must have left operand
             (pair? (cdr rest)))  ;; must have right operand
        ;; Evaluate left side; if true, short-circuit
@@ -1985,15 +1991,20 @@
          (if (= lresult 0) 0
            (test-eval-or (cdr rest)))))
       (else
-       (split (cdr rest) (cons (car rest) left))))))
+       (split (cdr rest) (cons (car rest) left) depth)))))
 
 ;; Parse: expr -a expr -a ...
 (def (test-eval-and args)
-  (let split ((rest args) (left []))
+  (let split ((rest args) (left []) (depth 0))
     (cond
       ((null? rest)
        (test-eval-not (reverse left)))
-      ((string=? (car rest) "-a")
+      ;; Track ( ) nesting
+      ((string=? (car rest) "(")
+       (split (cdr rest) (cons (car rest) left) (+ depth 1)))
+      ((string=? (car rest) ")")
+       (split (cdr rest) (cons (car rest) left) (max 0 (- depth 1))))
+      ((and (= depth 0) (string=? (car rest) "-a"))
        ;; Check if this is unary -a (file exists) or binary -a (AND)
        ;; It's binary -a if we have something on both sides
        (if (and (pair? left) (pair? (cdr rest)))
@@ -2002,9 +2013,20 @@
              (test-eval-and (cdr rest))
              1))
          ;; Could be unary, don't split here
-         (split (cdr rest) (cons (car rest) left))))
+         (split (cdr rest) (cons (car rest) left) depth)))
       (else
-       (split (cdr rest) (cons (car rest) left))))))
+       (split (cdr rest) (cons (car rest) left) depth)))))
+
+;; Find matching ) for ( at the start of args. Returns index or #f.
+(def (test-find-close-paren args)
+  (let loop ((rest (cdr args)) (depth 1) (idx 1))
+    (cond
+      ((null? rest) #f)
+      ((string=? (car rest) "(") (loop (cdr rest) (+ depth 1) (+ idx 1)))
+      ((string=? (car rest) ")")
+       (if (= depth 1) idx
+         (loop (cdr rest) (- depth 1) (+ idx 1))))
+      (else (loop (cdr rest) depth (+ idx 1))))))
 
 ;; Parse: ! expr | ( expr ) | primary
 (def (test-eval-not args)
@@ -2015,44 +2037,58 @@
       ((string=? (car args) "!")
        (let ((result (test-eval-not (cdr args))))
          (if (= result 0) 1 (if (= result 1) 0 result))))
-      ;; Parenthesized: ( expr )
-      ((and (string=? (car args) "(")
-            (>= len 3)
-            (string=? (last-elem* args) ")"))
-       (test-eval (butlast (cdr args))))
-      ;; 1 arg: non-empty string test
-      ((= len 1)
-       (if (> (string-length (car args)) 0) 0 1))
-      ;; 2 args: unary operator
-      ((= len 2)
-       (test-unary (car args) (cadr args)))
-      ;; 3 args: binary operator OR special forms
-      ((= len 3)
-       (let ((a (car args)) (b (cadr args)) (c (caddr args)))
-         (cond
-           ;; ! unary-op arg
-           ((string=? a "!")
-            (let ((r (test-eval-not (cdr args))))
-              (if (= r 0) 1 (if (= r 1) 0 r))))
-           ;; ( expr )
-           ((and (string=? a "(") (string=? c ")"))
-            (test-eval-not (list b)))
-           ;; binary operator
-           (else (test-binary a b c)))))
-      ;; 4 args: ! with 3 arg expr, or ( unary )
-      ((= len 4)
-       (let ((a (car args)) (d (list-ref args 3)))
-         (cond
-           ((string=? a "!")
-            (let ((r (test-eval (cdr args))))
-              (if (= r 0) 1 (if (= r 1) 0 r))))
-           ;; ( expr op expr ) - parenthesized expression
-           ((and (string=? a "(") (string=? d ")"))
-            (test-eval (list (cadr args) (caddr args))))
-           (else 2))))
-      ;; 5+ args: handle using -a/-o parsing at top level already done
-      ;; But if we got here, it's a syntax error
-      (else 2))))
+      ;; Parenthesized: ( ... ) — find matching close paren
+      ((and (string=? (car args) "(") (>= len 3))
+       (let ((close-idx (test-find-close-paren args)))
+         (if (and close-idx (= close-idx (- len 1)))
+           ;; ( expr ) — entire args is parenthesized
+           (test-eval (list-head (cdr args) (- close-idx 1)))
+           ;; ( not at end — fall through to normal evaluation
+           (test-eval-primary args len))))
+      ;; Primary expressions
+      (else (test-eval-primary args len)))))
+
+;; Handle primary test expressions by argument count
+(def (test-eval-primary args len)
+  (cond
+    ;; 1 arg: non-empty string test
+    ((= len 1)
+     (if (> (string-length (car args)) 0) 0 1))
+    ;; 2 args: unary operator
+    ((= len 2)
+     (test-unary (car args) (cadr args)))
+    ;; 3 args: binary operator OR special forms
+    ((= len 3)
+     (let ((a (car args)) (b (cadr args)) (c (caddr args)))
+       (cond
+         ;; ! unary-op arg
+         ((string=? a "!")
+          (let ((r (test-eval-not (cdr args))))
+            (if (= r 0) 1 (if (= r 1) 0 r))))
+         ;; ( expr )
+         ((and (string=? a "(") (string=? c ")"))
+          (test-eval-not (list b)))
+         ;; binary operator
+         (else (test-binary a b c)))))
+    ;; 4 args: ! with 3 arg expr, or ( expr op expr )
+    ((= len 4)
+     (let ((a (car args)) (d (list-ref args 3)))
+       (cond
+         ((string=? a "!")
+          (let ((r (test-eval (cdr args))))
+            (if (= r 0) 1 (if (= r 1) 0 r))))
+         ;; ( expr op expr ) - parenthesized binary
+         ((and (string=? a "(") (string=? d ")"))
+          (test-eval (list (cadr args) (caddr args))))
+         (else 2))))
+    ;; 5+ args: should have been handled by -a/-o splitting
+    ;; Try to handle remaining cases
+    (else
+     ;; Check for ! at the start
+     (if (string=? (car args) "!")
+       (let ((r (test-eval (cdr args))))
+         (if (= r 0) 1 (if (= r 1) 0 r)))
+       2))))
 
 (def (test-unary flag arg)
   (case (string->symbol flag)
@@ -2832,6 +2868,10 @@
     (cond ((>= i (string-length str)) #f)
           ((char=? (string-ref str i) ch) i)
           (else (loop (+ i 1))))))
+
+(def (list-head lst n)
+  (if (or (<= n 0) (null? lst)) []
+      (cons (car lst) (list-head (cdr lst) (- n 1)))))
 
 (def (last-elem* lst)
   (if (null? (cdr lst)) (car lst) (last-elem* (cdr lst))))

@@ -1,4 +1,4 @@
-;;; control.ss — Compound commands (if/for/while/until/case/select) for gsh
+;;; control.ss -- Compound commands (if/for/while/until/case/select) for gsh
 
 (export #t)
 (import :std/sugar
@@ -9,6 +9,11 @@
         :gsh/glob
         :gsh/functions)
 
+;; Wrap a thunk in a loop context (increments loop depth)
+(def (with-loop-context thunk)
+  (parameterize ((*loop-depth* (+ (*loop-depth*) 1)))
+    (thunk)))
+
 ;;; --- Public interface ---
 ;;; All functions take an execute-fn callback to avoid circular dependency.
 ;;; execute-fn: (lambda (ast env) -> exit-status)
@@ -17,7 +22,7 @@
 (def (execute-if cmd env execute-fn)
   (let loop ((clauses (if-command-clauses cmd)))
     (if (null? clauses)
-      ;; No clause matched — try else
+      ;; No clause matched -- try else
       (if (if-command-else-part cmd)
         (execute-fn (if-command-else-part cmd) env)
         0)
@@ -38,96 +43,102 @@
          (items (if word-list
                   (expand-words word-list env)
                   (env-at env))))
-    (let loop ((items items) (status 0))
-      (if (null? items)
-        status
-        (begin
-          (env-set! env var-name (car items))
-          (with-catch
-           (lambda (e)
-             (cond
-               ((break-exception? e)
-                (if (> (break-exception-levels e) 1)
-                  (raise (make-break-exception (- (break-exception-levels e) 1)))
-                  status))
-               ((continue-exception? e)
-                (if (> (continue-exception-levels e) 1)
-                  (raise (make-continue-exception (- (continue-exception-levels e) 1)))
-                  (loop (cdr items) status)))
-               (else (raise e))))
-           (lambda ()
-             (let ((new-status (execute-fn (for-command-body cmd) env)))
-               (loop (cdr items) new-status)))))))))
+    (with-loop-context
+     (lambda ()
+       (let loop ((items items) (status 0))
+         (if (null? items)
+           status
+           (begin
+             (env-set! env var-name (car items))
+             (with-catch
+              (lambda (e)
+                (cond
+                  ((break-exception? e)
+                   (if (> (break-exception-levels e) 1)
+                     (raise (make-break-exception (- (break-exception-levels e) 1)))
+                     status))
+                  ((continue-exception? e)
+                   (if (> (continue-exception-levels e) 1)
+                     (raise (make-continue-exception (- (continue-exception-levels e) 1)))
+                     (loop (cdr items) status)))
+                  (else (raise e))))
+              (lambda ()
+                (let ((new-status (execute-fn (for-command-body cmd) env)))
+                  (loop (cdr items) new-status)))))))))))
 
 ;; Execute a while-command
 (def (execute-while cmd env execute-fn)
-  (let loop ((status 0))
-    (let ((test-status
+  (with-loop-context
+   (lambda ()
+     (let loop ((status 0))
+       (let ((test-status
+              (with-catch
+               (lambda (e)
+                 (cond
+                   ((break-exception? e)
+                    (if (> (break-exception-levels e) 1)
+                      (raise (make-break-exception (- (break-exception-levels e) 1)))
+                      ;; break in condition: exit loop
+                      (cons 'break-in-condition status)))
+                   ((continue-exception? e)
+                    (if (> (continue-exception-levels e) 1)
+                      (raise (make-continue-exception (- (continue-exception-levels e) 1)))
+                      ;; continue in condition: re-test
+                      (cons 'continue-in-condition status)))
+                   (else (raise e))))
+               (lambda ()
+                 (parameterize ((*in-condition-context* #t))
+                   (execute-fn (while-command-test cmd) env))))))
+         (cond
+           ;; break signaled from condition
+           ((and (pair? test-status) (eq? (car test-status) 'break-in-condition))
+            (cdr test-status))
+           ;; continue signaled from condition
+           ((and (pair? test-status) (eq? (car test-status) 'continue-in-condition))
+            (loop (cdr test-status)))
+           ;; Normal test passed
+           ((and (number? test-status) (= test-status 0))
+            (with-catch
+             (lambda (e)
+               (cond
+                 ((break-exception? e)
+                  (if (> (break-exception-levels e) 1)
+                    (raise (make-break-exception (- (break-exception-levels e) 1)))
+                    status))
+                 ((continue-exception? e)
+                  (if (> (continue-exception-levels e) 1)
+                    (raise (make-continue-exception (- (continue-exception-levels e) 1)))
+                    (loop status)))
+                 (else (raise e))))
+             (lambda ()
+               (let ((new-status (execute-fn (while-command-body cmd) env)))
+                 (loop new-status)))))
+           (else status)))))))
+
+;; Execute an until-command
+(def (execute-until cmd env execute-fn)
+  (with-loop-context
+   (lambda ()
+     (let loop ((status 0))
+       (let ((test-status (parameterize ((*in-condition-context* #t))
+                             (execute-fn (until-command-test cmd) env))))
+         (if (not (= test-status 0))
            (with-catch
             (lambda (e)
               (cond
                 ((break-exception? e)
                  (if (> (break-exception-levels e) 1)
                    (raise (make-break-exception (- (break-exception-levels e) 1)))
-                   ;; break in condition → exit loop
-                   (cons 'break-in-condition status)))
+                   status))
                 ((continue-exception? e)
                  (if (> (continue-exception-levels e) 1)
                    (raise (make-continue-exception (- (continue-exception-levels e) 1)))
-                   ;; continue in condition → re-test
-                   (cons 'continue-in-condition status)))
+                   (loop status)))
                 (else (raise e))))
             (lambda ()
-              (parameterize ((*in-condition-context* #t))
-                (execute-fn (while-command-test cmd) env))))))
-      (cond
-        ;; break signaled from condition
-        ((and (pair? test-status) (eq? (car test-status) 'break-in-condition))
-         (cdr test-status))
-        ;; continue signaled from condition
-        ((and (pair? test-status) (eq? (car test-status) 'continue-in-condition))
-         (loop (cdr test-status)))
-        ;; Normal test passed
-        ((and (number? test-status) (= test-status 0))
-         (with-catch
-          (lambda (e)
-            (cond
-              ((break-exception? e)
-               (if (> (break-exception-levels e) 1)
-                 (raise (make-break-exception (- (break-exception-levels e) 1)))
-                 status))
-              ((continue-exception? e)
-               (if (> (continue-exception-levels e) 1)
-                 (raise (make-continue-exception (- (continue-exception-levels e) 1)))
-                 (loop status)))
-              (else (raise e))))
-          (lambda ()
-            (let ((new-status (execute-fn (while-command-body cmd) env)))
-              (loop new-status)))))
-        (else status)))))
-
-;; Execute an until-command
-(def (execute-until cmd env execute-fn)
-  (let loop ((status 0))
-    (let ((test-status (parameterize ((*in-condition-context* #t))
-                          (execute-fn (until-command-test cmd) env))))
-      (if (not (= test-status 0))
-        (with-catch
-         (lambda (e)
-           (cond
-             ((break-exception? e)
-              (if (> (break-exception-levels e) 1)
-                (raise (make-break-exception (- (break-exception-levels e) 1)))
-                status))
-             ((continue-exception? e)
-              (if (> (continue-exception-levels e) 1)
-                (raise (make-continue-exception (- (continue-exception-levels e) 1)))
-                (loop status)))
-             (else (raise e))))
-         (lambda ()
-           (let ((new-status (execute-fn (until-command-body cmd) env)))
-             (loop new-status))))
-        status))))
+              (let ((new-status (execute-fn (until-command-body cmd) env)))
+                (loop new-status))))
+           status))))))
 
 ;; Execute a case-command
 (def (execute-case cmd env execute-fn)
@@ -143,18 +154,24 @@
           (if (any-pattern-matches? patterns word env)
             (let ((status (if body (execute-fn body env) 0)))
               (case terminator
-                ;; ;; — break
+                ;; ;; -- break
                 ((break) status)
-                ;; ;& — fallthrough (execute next clause body unconditionally)
+                ;; ;& -- fallthrough (execute next clause bodies unconditionally)
+                ;; Continue falling through while clauses end with ;&
                 ((fallthrough)
-                 (if (null? (cdr clauses))
-                   status
-                   (let* ((next-clause (cadr clauses))
-                          (next-body (case-clause-body next-clause)))
-                     (if next-body
-                       (execute-fn next-body env)
-                       status))))
-                ;; ;;& — test-next (continue checking patterns)
+                 (let fall ((rest (cdr clauses)) (last-status status))
+                   (if (null? rest)
+                     last-status
+                     (let* ((next-clause (car rest))
+                            (next-body (case-clause-body next-clause))
+                            (next-term (case-clause-terminator next-clause))
+                            (next-status (if next-body
+                                           (execute-fn next-body env)
+                                           last-status)))
+                       (if (eq? next-term 'fallthrough)
+                         (fall (cdr rest) next-status)
+                         next-status)))))
+                ;; ;;& -- test-next (continue checking patterns)
                 ((test-next)
                  (let ((rest-status (loop (cdr clauses))))
                    (if (= rest-status 0) status rest-status)))
