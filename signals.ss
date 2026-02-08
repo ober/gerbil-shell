@@ -75,6 +75,9 @@
           ((and num (= num 0)) "EXIT")
           ((and num (hash-get *signal-number-to-name* num))
            => (lambda (name) name))
+          ;; Valid signal number but no name in table — return as-is
+          ((and num (integer? num) (> num 0) (<= num 64))
+           (number->string num))
           ;; Known signal name
           ((hash-get *signal-names* stripped) stripped)
           ;; Pseudo-signal
@@ -124,7 +127,8 @@
        (hash-remove! *trap-table* uname)
        (let ((signum (signal-name->number uname)))
          (when signum
-           (remove-signal-handler! signum))))
+           (with-catch (lambda (e) #!void) ;; ignore error if no handler installed
+             (lambda () (remove-signal-handler! signum))))))
       ;; Ignore signal
       ((or (eq? action 'ignore) (and (string? action) (string=? action "")))
        (hash-put! *trap-table* uname 'ignore)

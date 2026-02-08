@@ -20,6 +20,11 @@
   (fprintf (current-error-port) "gsh: ~a: unbound variable~n" name)
   (raise (make-nounset-exception 1)))
 
+;;; --- Double-quote context tracking ---
+;; When #t, backslash inside expand-string uses double-quote rules:
+;; only $, `, ", \, newline are special; others preserve the backslash.
+(def *in-dquote-context* (make-parameter #f))
+
 ;;; --- Process substitution state ---
 ;; Accumulates cleanup thunks for process substitutions created during expansion.
 ;; Caller should bind this and call the cleanups after the command finishes.
@@ -343,9 +348,13 @@
             ;; Backslash escape
             ((char=? ch #\\)
              (if (< (+ i 1) len)
-               (begin
-                 (display (string-ref str (+ i 1)) out)
-                 (loop (+ i 2)))
+               (let ((next (string-ref str (+ i 1))))
+                 (if (and (*in-dquote-context*)
+                          (not (memq next '(#\$ #\` #\" #\\ #\newline))))
+                   ;; In double-quote context, preserve backslash for non-special chars
+                   (begin (display "\\" out) (display next out) (loop (+ i 2)))
+                   ;; Outside double quotes or special char: consume backslash
+                   (begin (display next out) (loop (+ i 2)))))
                (begin
                  (display "\\" out)
                  (loop (+ i 1)))))
@@ -1410,7 +1419,9 @@
                (begin (display "\\" buf) (display next buf) (loop (+ j 2)))))
            (begin (display "\\" buf) (loop (+ j 1)))))
         ((char=? (string-ref str j) #\$)
-         (let-values (((expanded end) (expand-dollar str j env)))
+         (let-values (((expanded end)
+                       (parameterize ((*in-dquote-context* #t))
+                         (expand-dollar str j env))))
            (display expanded buf)
            (loop end)))
         ((char=? (string-ref str j) #\`)

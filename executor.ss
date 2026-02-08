@@ -119,12 +119,22 @@
   (let* ((assignments (simple-command-assignments cmd))
          (raw-words (simple-command-words cmd))
          (redirections (simple-command-redirections cmd)))
-    ;; If no command words, just apply assignments
+    ;; If no command words, apply assignments and redirections
     ;; Exit status is that of the last command substitution, or 0
     (if (null? raw-words)
       (begin
         (for-each (lambda (asgn) (apply-assignment! asgn env)) assignments)
-        (shell-environment-last-status env))
+        ;; Process redirections even without command (e.g. "> file" creates empty file)
+        (if (pair? redirections)
+          (with-catch
+           (lambda (e)
+             (fprintf (current-error-port) "gsh: ~a~n" (exception-message e))
+             1)
+           (lambda ()
+             (let ((saved (apply-redirections redirections env)))
+               (restore-redirections saved)
+               0)))
+          (shell-environment-last-status env)))
       ;; Expand words (process substitutions handled by expand-word)
       (parameterize ((*procsub-cleanups* []))
         (unwind-protect

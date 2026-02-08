@@ -379,9 +379,10 @@
       (if (*in-subshell*)
         (raise (make-subshell-exit-exception code))
         (begin
-          ;; Run EXIT trap if set
+          ;; Run EXIT trap if set — clear first to prevent re-entrancy
           (let ((exit-trap (trap-get "EXIT")))
             (when (and exit-trap (string? exit-trap))
+              (trap-set! "EXIT" 'default)
               (let ((exec-fn (*execute-input*)))
                 (when exec-fn
                   (exec-fn exit-trap env)))))
@@ -1382,6 +1383,15 @@
         (unless n
           (fprintf (current-error-port) "trap: ~a: invalid signal specification~n" sig))
         n))
+    ;; Helper: check if string is an unsigned decimal integer (POSIX heuristic)
+    ;; "0", "42", "07" are unsigned integers; "-1", " 42 ", "abc" are not
+    (def (unsigned-integer? s)
+      (and (> (string-length s) 0)
+           (let loop ((i 0))
+             (if (>= i (string-length s))
+               #t
+               (and (char-numeric? (string-ref s i))
+                    (loop (+ i 1)))))))
     ;; Helper: set trap action for given signals
     (def (trap-set-action action signals)
       (let ((status 0))
@@ -1419,6 +1429,15 @@
                   (when action (print-trap norm action))))))
           (if (pair? sigs) sigs (map car (trap-list)))))
        0)
+      ;; Unrecognized -X options (e.g. -1, -e) are errors
+      ((and (> (string-length (car args)) 1)
+            (char=? (string-ref (car args) 0) #\-)
+            (not (string=? (car args) "-"))
+            (not (string=? (car args) "--"))
+            (not (string=? (car args) "-l"))
+            (not (string=? (car args) "-p")))
+       (fprintf (current-error-port) "trap: ~a: invalid signal specification~n" (car args))
+       1)
       ((string=? (car args) "--")
        ;; Skip --, process rest
        (let ((rest (cdr args)))
@@ -1443,9 +1462,22 @@
          (if norm
            (begin (trap-set! norm 'default) 0)
            1)))
-      ;; Two or more args: action + signals
+      ;; Two or more args: check POSIX unsigned integer heuristic
+      ;; If first arg is an unsigned decimal integer, all args are signals to reset
       ((>= (length args) 2)
-       (trap-set-action (car args) (cdr args)))
+       (if (unsigned-integer? (car args))
+         ;; POSIX: all operands are conditions to reset
+         (let ((status 0))
+           (for-each
+            (lambda (sig)
+              (let ((norm (normalize-or-error sig)))
+                (if norm
+                  (trap-set! norm 'default)
+                  (set! status 1))))
+            args)
+           status)
+         ;; Normal case: first arg is action, rest are signals
+         (trap-set-action (car args) (cdr args))))
       (else 0))))
 
 ;; jobs [-lnprs]

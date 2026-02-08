@@ -10,7 +10,9 @@
         :gsh/functions
         :gsh/lexer
         :gsh/parser
-        :gsh/executor)
+        :gsh/executor
+        :gsh/signals
+        :gsh/jobs)
 
 ;;; --- Public interface ---
 
@@ -86,15 +88,46 @@
                         (errexit-exception-status e))
                        ((break-exception? e) 0)
                        ((continue-exception? e) 0)
-                       (else (raise e))))
+                       ((subshell-exit-exception? e) (raise e))
+                       ((return-exception? e) (raise e))
+                       (else
+                        ;; Catch-all: print error and continue
+                        (fprintf (current-error-port) "gsh: ~a~n"
+                                 (exception-message e))
+                        1)))
                    (lambda ()
                      (execute-command cmd env)))))
+             (env-set-last-status! env new-status)
+             ;; Process pending signals between commands
+             (process-pending-traps! env)
              ;; If errexit triggered, stop executing further commands
              (if (and (not (= new-status 0))
                       (env-option? env "errexit")
                       (not (*in-condition-context*)))
                new-status
                (loop new-status)))))))))
+
+;; Process pending signals and execute trap commands
+;; Lightweight version for script.ss (avoids circular import with main.ss)
+;; Traps execute with $? isolated — they don't affect the main script's $?
+(def (process-pending-traps! env)
+  (let ((signals (pending-signals!)))
+    (for-each
+     (lambda (sig-name)
+       (cond
+         ((string=? sig-name "CHLD")
+          (job-update-status!)
+          (job-notify!))
+         (else #!void))
+       (let ((action (trap-get sig-name)))
+         (when (and action (string? action))
+           ;; Save and restore $? so trap doesn't affect main flow
+           (let ((saved-status (shell-environment-last-status env))
+                 (exec-fn (*execute-input*)))
+             (when exec-fn
+               (exec-fn action env))
+             (env-set-last-status! env saved-status)))))
+     signals)))
 
 ;;; --- Helpers ---
 

@@ -34,6 +34,7 @@
                       (login? #f)
                       (interactive? #f)
                       (verbose? #f)
+                      (errexit? #f)
                       (args []))))
     (let loop ((args args))
       (cond
@@ -53,6 +54,10 @@
         ;; -i: force interactive
         ((string=? (car args) "-i")
          (hash-put! result 'interactive? #t)
+         (loop (cdr args)))
+        ;; -e: errexit
+        ((string=? (car args) "-e")
+         (hash-put! result 'errexit? #t)
          (loop (cdr args)))
         ;; -x: xtrace
         ((string=? (car args) "-x")
@@ -134,6 +139,9 @@
     ;; Verbose mode
     (when (hash-ref args-hash 'verbose?)
       (env-option-set! env "xtrace" #t))
+    ;; Errexit mode
+    (when (hash-ref args-hash 'errexit?)
+      (env-option-set! env "errexit" #t))
     ;; Register builtins that need main.ss callbacks
     (register-late-builtins! env)
     env))
@@ -257,15 +265,21 @@
           #!void)  ;; TODO: update terminal dimensions
          (else #!void))
        ;; Check trap table for this signal
+       ;; Save and restore $? so trap doesn't affect main flow
        (let ((action (trap-get sig-name)))
          (when (and action (string? action))
-           (execute-input action env))))
+           (let ((saved-status (shell-environment-last-status env)))
+             (execute-input action env)
+             (env-set-last-status! env saved-status)))))
      signals)))
 
 ;; Execute EXIT trap and clean up
+;; Clears the trap BEFORE executing to prevent re-entrancy
+;; (e.g. exit called inside the trap handler)
 (def (run-exit-trap! env)
   (let ((action (trap-get "EXIT")))
     (when (and action (string? action))
+      (trap-set! "EXIT" 'default)
       (execute-input action env))))
 
 ;;; --- Helpers ---
@@ -306,15 +320,31 @@
            (env-set-positional! env (cdr script-args)))
          ;; Load non-interactive startup
          (load-startup-files! env login? #f)
-         (let ((status (with-catch
-                        (lambda (e)
-                          (cond
-                            ((nounset-exception? e) (nounset-exception-status e))
-                            ((break-exception? e) 0)
-                            ((continue-exception? e) 0)
-                            ((return-exception? e) (return-exception-status e))
-                            (else (raise e))))
-                        (lambda () (execute-input command env)))))
+         ;; Try parse-complete-command first (handles here-docs correctly).
+         ;; If parse fails, fall back to execute-string for line-by-line
+         ;; execution so earlier commands run before later parse errors
+         ;; (e.g. "trap 'echo bye' EXIT; for" — trap must execute).
+         (let* ((parse-ok? (with-catch (lambda (e) #f)
+                             (lambda ()
+                               (parse-complete-command command (env-shopt? env "extglob"))
+                               #t)))
+                (status (with-catch
+                         (lambda (e)
+                           (cond
+                             ((nounset-exception? e) (nounset-exception-status e))
+                             ((break-exception? e) 0)
+                             ((continue-exception? e) 0)
+                             ((return-exception? e) (return-exception-status e))
+                             (else
+                              (fprintf (current-error-port) "gsh: ~a~n"
+                                       (exception-message e))
+                              1)))
+                         (lambda ()
+                           (if parse-ok?
+                             (execute-input command env)
+                             (execute-string command env))))))
+           ;; Process any pending signals before exit
+           (process-traps! env)
            (run-exit-trap! env)
            (exit status))))
       ;; Script file
