@@ -1742,11 +1742,16 @@
   (let* ((parts (string-split-dot-dot content))
          (nparts (length parts)))
     (cond
-      ;; start..end
-      ((= nparts 2)
+      ;; start..end — reject if either part is empty
+      ((and (= nparts 2)
+            (> (string-length (car parts)) 0)
+            (> (string-length (cadr parts)) 0))
        (brace-range (car parts) (cadr parts) #f))
-      ;; start..end..step
-      ((= nparts 3)
+      ;; start..end..step — reject if any part is empty
+      ((and (= nparts 3)
+            (> (string-length (car parts)) 0)
+            (> (string-length (cadr parts)) 0)
+            (> (string-length (caddr parts)) 0))
        (brace-range (car parts) (cadr parts) (caddr parts)))
       (else #f))))
 
@@ -1764,46 +1769,70 @@
                (cons (substring str start i) parts)))
         (else (loop (+ i 1) start parts))))))
 
+;; Parse an integer string (with optional leading minus), rejecting floats
+(def (brace-parse-int str)
+  (let ((len (string-length str)))
+    (and (> len 0)
+         (let* ((start (if (and (> len 1) (char=? (string-ref str 0) #\-)) 1 0))
+                (has-digit? #f))
+           (let loop ((i start))
+             (if (>= i len)
+               (and has-digit? (string->number str))
+               (if (char-numeric? (string-ref str i))
+                 (begin (set! has-digit? #t) (loop (+ i 1)))
+                 #f)))))))
+
 ;; Generate a range from start to end with optional step
 (def (brace-range start-str end-str step-str)
-  (let ((start-num (string->number start-str))
-        (end-num (string->number end-str))
-        (step-num (and step-str (string->number step-str))))
+  (let ((start-num (brace-parse-int start-str))
+        (end-num (brace-parse-int end-str))
+        (step-num (and step-str (brace-parse-int step-str))))
     (cond
       ;; Numeric range
       ((and start-num end-num)
-       (let* ((step (or step-num 1))
-              (step (if (< end-num start-num) (- (abs step)) (abs step)))
+       (let* ((step (or step-num (if (< end-num start-num) -1 1)))
               ;; Zero-padding: if either has leading zeros, pad to max width
               (pad-width (max (string-length start-str) (string-length end-str)))
               (needs-pad? (or (and (> (string-length start-str) 1)
                                    (char=? (string-ref start-str 0) #\0))
                               (and (> (string-length end-str) 1)
                                    (char=? (string-ref end-str 0) #\0)))))
-         (if (= step 0) #f
-           (let loop ((i start-num) (result []))
-             (if (if (> step 0) (> i end-num) (< i end-num))
-               (reverse result)
-               (loop (+ i step)
-                     (cons (if needs-pad?
-                             (pad-number i pad-width)
-                             (number->string i))
-                           result)))))))
+         (cond
+           ((= step 0) #f)
+           ;; If user specified step, validate direction
+           ((and step-num (> end-num start-num) (< step 0)) #f)
+           ((and step-num (< end-num start-num) (> step 0)) #f)
+           (else
+            (let loop ((i start-num) (result []))
+              (if (if (> step 0) (> i end-num) (< i end-num))
+                (reverse result)
+                (loop (+ i step)
+                      (cons (if needs-pad?
+                              (pad-number i pad-width)
+                              (number->string i))
+                            result))))))))
       ;; Single-char alphabetic range
       ((and (= (string-length start-str) 1) (= (string-length end-str) 1)
             (char-alphabetic? (string-ref start-str 0))
-            (char-alphabetic? (string-ref end-str 0)))
+            (char-alphabetic? (string-ref end-str 0))
+            ;; Mixed case (e.g., z..A) is invalid
+            (eq? (char-upper-case? (string-ref start-str 0))
+                 (char-upper-case? (string-ref end-str 0))))
        (let* ((start-ch (char->integer (string-ref start-str 0)))
               (end-ch (char->integer (string-ref end-str 0)))
               (step (or (and step-num (inexact->exact step-num))
-                        (if (<= start-ch end-ch) 1 -1)))
-              (step (if (< end-ch start-ch) (- (abs step)) (abs step))))
-         (if (= step 0) #f
-           (let loop ((i start-ch) (result []))
-             (if (if (> step 0) (> i end-ch) (< i end-ch))
-               (reverse result)
-               (loop (+ i step)
-                     (cons (string (integer->char i)) result)))))))
+                        (if (<= start-ch end-ch) 1 -1))))
+         (cond
+           ((= step 0) #f)
+           ;; If user specified step, validate direction
+           ((and step-num (> end-ch start-ch) (< step 0)) #f)
+           ((and step-num (< end-ch start-ch) (> step 0)) #f)
+           (else
+            (let loop ((i start-ch) (result []))
+              (if (if (> step 0) (> i end-ch) (< i end-ch))
+                (reverse result)
+                (loop (+ i step)
+                      (cons (string (integer->char i)) result))))))))
       (else #f))))
 
 ;; Pad an integer to a given width with leading zeros

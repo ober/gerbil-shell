@@ -37,108 +37,151 @@
 
 ;; Execute a for-command
 (def (execute-for cmd env execute-fn)
-  (let* ((var-name (for-command-var cmd))
-         (word-list (for-command-words cmd))
-         ;; If words is #f, use positional params ("$@")
-         (items (if word-list
-                  (expand-words word-list env)
-                  (env-at env))))
+  (let* ((var-name (for-command-var cmd)))
+    ;; Validate variable name
+    (if (not (valid-identifier? var-name))
+      (begin
+        (fprintf (current-error-port) "gsh: `~a': not a valid identifier~n" var-name)
+        2)
+      (let* ((word-list (for-command-words cmd))
+             ;; If words is #f, use positional params ("$@")
+             (items (if word-list
+                      (expand-words word-list env)
+                      (env-at env))))
     (with-loop-context
      (lambda ()
-       (let loop ((items items) (status 0))
-         (if (null? items)
-           status
-           (begin
-             (env-set! env var-name (car items))
-             (with-catch
-              (lambda (e)
-                (cond
-                  ((break-exception? e)
-                   (if (> (break-exception-levels e) 1)
-                     (raise (make-break-exception (- (break-exception-levels e) 1)))
-                     status))
-                  ((continue-exception? e)
-                   (if (> (continue-exception-levels e) 1)
-                     (raise (make-continue-exception (- (continue-exception-levels e) 1)))
-                     (loop (cdr items) status)))
-                  (else (raise e))))
-              (lambda ()
-                (let ((new-status (execute-fn (for-command-body cmd) env)))
-                  (loop (cdr items) new-status)))))))))))
+       ;; Use iterative structure so raise from break/continue handler
+       ;; propagates to the CALLER, not to a parent iteration's with-catch.
+       (let ((remaining items)
+             (status 0))
+         (let loop ()
+           (if (null? remaining)
+             status
+             (begin
+               (env-set! env var-name (car remaining))
+               (set! remaining (cdr remaining))
+               (let ((caught
+                      (with-catch
+                       (lambda (e)
+                         (cond
+                           ((break-exception? e) (cons 'break e))
+                           ((continue-exception? e) (cons 'continue e))
+                           (else (raise e))))
+                       (lambda ()
+                         (set! status (execute-fn (for-command-body cmd) env))
+                         #f))))
+                 (cond
+                   ((not caught) (loop))
+                   ((eq? (car caught) 'break)
+                    (let ((levels (break-exception-levels (cdr caught))))
+                      (if (> levels 1)
+                        (raise (make-break-exception (- levels 1)))
+                        (shell-environment-last-status env))))
+                   ((eq? (car caught) 'continue)
+                    (let ((levels (continue-exception-levels (cdr caught))))
+                      (if (> levels 1)
+                        (raise (make-continue-exception (- levels 1)))
+                        (loop))))))))))))))))
 
 ;; Execute a while-command
+;; Uses iterative structure so raise from break/continue handler
+;; propagates to the CALLER, not to a parent iteration's with-catch.
 (def (execute-while cmd env execute-fn)
   (with-loop-context
    (lambda ()
-     (let loop ((status 0))
-       (let ((test-status
-              (with-catch
-               (lambda (e)
-                 (cond
-                   ((break-exception? e)
-                    (if (> (break-exception-levels e) 1)
-                      (raise (make-break-exception (- (break-exception-levels e) 1)))
-                      ;; break in condition: exit loop
-                      (cons 'break-in-condition status)))
-                   ((continue-exception? e)
-                    (if (> (continue-exception-levels e) 1)
-                      (raise (make-continue-exception (- (continue-exception-levels e) 1)))
-                      ;; continue in condition: re-test
-                      (cons 'continue-in-condition status)))
-                   (else (raise e))))
-               (lambda ()
-                 (parameterize ((*in-condition-context* #t))
-                   (execute-fn (while-command-test cmd) env))))))
-         (cond
-           ;; break signaled from condition
-           ((and (pair? test-status) (eq? (car test-status) 'break-in-condition))
-            (cdr test-status))
-           ;; continue signaled from condition
-           ((and (pair? test-status) (eq? (car test-status) 'continue-in-condition))
-            (loop (cdr test-status)))
-           ;; Normal test passed
-           ((and (number? test-status) (= test-status 0))
-            (with-catch
-             (lambda (e)
-               (cond
-                 ((break-exception? e)
-                  (if (> (break-exception-levels e) 1)
-                    (raise (make-break-exception (- (break-exception-levels e) 1)))
-                    status))
-                 ((continue-exception? e)
-                  (if (> (continue-exception-levels e) 1)
-                    (raise (make-continue-exception (- (continue-exception-levels e) 1)))
-                    (loop status)))
-                 (else (raise e))))
-             (lambda ()
-               (let ((new-status (execute-fn (while-command-body cmd) env)))
-                 (loop new-status)))))
-           (else status)))))))
+     (let ((status 0))
+       (let loop ()
+         ;; Evaluate test condition with break/continue handling
+         (let ((test-caught
+                (with-catch
+                 (lambda (e)
+                   (cond
+                     ((break-exception? e) (cons 'break e))
+                     ((continue-exception? e) (cons 'continue e))
+                     (else (raise e))))
+                 (lambda ()
+                   (let ((ts (parameterize ((*in-condition-context* #t))
+                               (execute-fn (while-command-test cmd) env))))
+                     (cons 'test ts))))))
+           (cond
+             ;; break in condition
+             ((eq? (car test-caught) 'break)
+              (let ((levels (break-exception-levels (cdr test-caught))))
+                (if (> levels 1)
+                  (raise (make-break-exception (- levels 1)))
+                  status)))
+             ;; continue in condition: re-test
+             ((eq? (car test-caught) 'continue)
+              (let ((levels (continue-exception-levels (cdr test-caught))))
+                (if (> levels 1)
+                  (raise (make-continue-exception (- levels 1)))
+                  (loop))))
+             ;; Normal test result
+             (else
+              (let ((test-status (cdr test-caught)))
+                (if (= test-status 0)
+                  ;; Test passed — execute body
+                  (let ((body-caught
+                         (with-catch
+                          (lambda (e)
+                            (cond
+                              ((break-exception? e) (cons 'break e))
+                              ((continue-exception? e) (cons 'continue e))
+                              (else (raise e))))
+                          (lambda ()
+                            (set! status (execute-fn (while-command-body cmd) env))
+                            #f))))
+                    (cond
+                      ((not body-caught) (loop))
+                      ((eq? (car body-caught) 'break)
+                       (let ((levels (break-exception-levels (cdr body-caught))))
+                         (if (> levels 1)
+                           (raise (make-break-exception (- levels 1)))
+                           (shell-environment-last-status env))))
+                      ((eq? (car body-caught) 'continue)
+                       (let ((levels (continue-exception-levels (cdr body-caught))))
+                         (if (> levels 1)
+                           (raise (make-continue-exception (- levels 1)))
+                           (loop))))))
+                  ;; Test failed — exit loop
+                  status))))))))))
 
 ;; Execute an until-command
+;; Uses iterative structure so raise from break/continue handler
+;; propagates to the CALLER, not to a parent iteration's with-catch.
 (def (execute-until cmd env execute-fn)
   (with-loop-context
    (lambda ()
-     (let loop ((status 0))
-       (let ((test-status (parameterize ((*in-condition-context* #t))
-                             (execute-fn (until-command-test cmd) env))))
-         (if (not (= test-status 0))
-           (with-catch
-            (lambda (e)
-              (cond
-                ((break-exception? e)
-                 (if (> (break-exception-levels e) 1)
-                   (raise (make-break-exception (- (break-exception-levels e) 1)))
-                   status))
-                ((continue-exception? e)
-                 (if (> (continue-exception-levels e) 1)
-                   (raise (make-continue-exception (- (continue-exception-levels e) 1)))
-                   (loop status)))
-                (else (raise e))))
-            (lambda ()
-              (let ((new-status (execute-fn (until-command-body cmd) env)))
-                (loop new-status))))
-           status))))))
+     (let ((status 0))
+       (let loop ()
+         (let ((test-status (parameterize ((*in-condition-context* #t))
+                              (execute-fn (until-command-test cmd) env))))
+           (if (not (= test-status 0))
+             ;; Test still failing — execute body
+             (let ((caught
+                    (with-catch
+                     (lambda (e)
+                       (cond
+                         ((break-exception? e) (cons 'break e))
+                         ((continue-exception? e) (cons 'continue e))
+                         (else (raise e))))
+                     (lambda ()
+                       (set! status (execute-fn (until-command-body cmd) env))
+                       #f))))
+               (cond
+                 ((not caught) (loop))
+                 ((eq? (car caught) 'break)
+                  (let ((levels (break-exception-levels (cdr caught))))
+                    (if (> levels 1)
+                      (raise (make-break-exception (- levels 1)))
+                      (shell-environment-last-status env))))
+                 ((eq? (car caught) 'continue)
+                  (let ((levels (continue-exception-levels (cdr caught))))
+                    (if (> levels 1)
+                      (raise (make-continue-exception (- levels 1)))
+                      (loop))))))
+             ;; Test succeeded — exit loop
+             status)))))))
 
 ;; Execute a case-command
 (def (execute-case cmd env execute-fn)
@@ -229,6 +272,21 @@
                 (glob-match? pat word #f (env-shopt? env "extglob")))
           #t
           (loop (cdr pats)))))))
+
+(def (valid-identifier? name)
+  ;; A valid shell variable name: starts with letter/underscore,
+  ;; followed by letters, digits, or underscores
+  (and (string? name)
+       (> (string-length name) 0)
+       (let ((ch0 (string-ref name 0)))
+         (or (char-alphabetic? ch0) (char=? ch0 #\_)))
+       (let loop ((i 1))
+         (if (>= i (string-length name))
+           #t
+           (let ((ch (string-ref name i)))
+             (if (or (char-alphabetic? ch) (char-numeric? ch) (char=? ch #\_))
+               (loop (+ i 1))
+               #f))))))
 
 (def (string-trim-ws str)
   (let* ((len (string-length str))

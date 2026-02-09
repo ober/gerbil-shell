@@ -412,17 +412,20 @@
     (cond
       ;; Too many arguments
       ((> (length args) 1)
-       (fprintf (current-error-port) "break: too many arguments~n")
+       (fprintf (current-error-port) "gsh: break: too many arguments~n")
        1)
       ((pair? args)
        (let ((n (string->number (car args))))
          (cond
            ((not n)
-            (fprintf (current-error-port) "break: ~a: numeric argument required~n" (car args))
-            2)
+            ;; Non-numeric arg: print error, set error status, then break (bash compat)
+            (fprintf (current-error-port) "gsh: break: ~a: numeric argument required~n" (car args))
+            (env-set-last-status! env 1)
+            (shell-break! 1))
            ((<= n 0)
-            (fprintf (current-error-port) "break: ~a: loop count out of range~n" (car args))
-            1)
+            (fprintf (current-error-port) "gsh: break: ~a: loop count out of range~n" (car args))
+            (env-set-last-status! env 1)
+            (shell-break! 1))
            (else (shell-break! n)))))
       (else (shell-break! 1)))))
 
@@ -430,19 +433,22 @@
 (builtin-register! "continue"
   (lambda (args env)
     (cond
-      ;; Too many arguments
+      ;; Too many arguments: fatal error
       ((> (length args) 1)
-       (fprintf (current-error-port) "continue: too many arguments~n")
-       1)
+       (fprintf (current-error-port) "gsh: continue: too many arguments~n")
+       2)
       ((pair? args)
        (let ((n (string->number (car args))))
          (cond
            ((not n)
-            (fprintf (current-error-port) "continue: ~a: numeric argument required~n" (car args))
-            2)
+            ;; Non-numeric arg: print error, set error status, then continue (bash compat)
+            (fprintf (current-error-port) "gsh: continue: ~a: numeric argument required~n" (car args))
+            (env-set-last-status! env 1)
+            (shell-continue! 1))
            ((<= n 0)
-            (fprintf (current-error-port) "continue: ~a: loop count out of range~n" (car args))
-            1)
+            (fprintf (current-error-port) "gsh: continue: ~a: loop count out of range~n" (car args))
+            (env-set-last-status! env 1)
+            (shell-continue! 1))
            (else (shell-continue! n)))))
       (else (shell-continue! 1)))))
 
@@ -516,13 +522,28 @@
 ;; shift [n]
 (builtin-register! "shift"
   (lambda (args env)
-    (let* ((n (if (pair? args) (or (string->number (car args)) 1) 1))
-           (pos (env-positional-list env)))
-      (if (> n (length pos))
-        1
-        (begin
-          (env-set-positional! env (list-tail pos n))
-          0)))))
+    (if (pair? args)
+      (let ((n (string->number (car args))))
+        (cond
+          ((not n)
+           (fprintf (current-error-port) "gsh: shift: ~a: numeric argument required~n" (car args))
+           2)
+          ((< n 0)
+           (fprintf (current-error-port) "gsh: shift: ~a: shift count out of range~n" (car args))
+           1)
+          (else
+           (let ((pos (env-positional-list env)))
+             (if (> n (length pos))
+               1
+               (begin
+                 (env-set-positional! env (list-tail pos n))
+                 0))))))
+      (let ((pos (env-positional-list env)))
+        (if (> 1 (length pos))
+          1
+          (begin
+            (env-set-positional! env (list-tail pos 1))
+            0))))))
 
 ;; eval [args...]
 (builtin-register! "eval"

@@ -627,40 +627,50 @@
       (when (and init-expr (> (string-length init-expr) 0))
         (arith-eval (expand init-expr) getter setter)))
     ;; Loop: test, body, update (with loop context for break/continue)
+    ;; Uses iterative structure so raise from break/continue handler
+    ;; propagates to the CALLER, not to a parent iteration's with-catch.
     (parameterize ((*loop-depth* (+ (*loop-depth*) 1)))
-      (let loop ((status 0))
-        ;; Evaluate test
-        (let* ((test-expr (arith-for-command-test cmd))
-               (test-val (if (and test-expr (> (string-length test-expr) 0))
-                           (arith-eval (expand test-expr) getter setter)
-                           1)))  ;; empty test = true
-          (if (= test-val 0)
-            status  ;; test is false, exit loop
-            ;; Execute body with break/continue handling
-            (with-catch
-             (lambda (e)
-               (cond
-                 ((break-exception? e)
-                  (if (> (break-exception-levels e) 1)
-                    (raise (make-break-exception (- (break-exception-levels e) 1)))
-                    status))
-                 ((continue-exception? e)
-                  (if (> (continue-exception-levels e) 1)
-                    (raise (make-continue-exception (- (continue-exception-levels e) 1)))
-                    ;; Continue: run update, then loop
-                    (begin
-                      (let ((update-expr (arith-for-command-update cmd)))
-                        (when (and update-expr (> (string-length update-expr) 0))
-                          (arith-eval (expand update-expr) getter setter)))
-                      (loop status))))
-                 (else (raise e))))
-             (lambda ()
-               (let ((new-status (exec-fn (arith-for-command-body cmd) env)))
-                 ;; Execute update expression
-                 (let ((update-expr (arith-for-command-update cmd)))
-                   (when (and update-expr (> (string-length update-expr) 0))
-                     (arith-eval (expand update-expr) getter setter)))
-                 (loop new-status))))))))))
+      (let ((status 0))
+        (let loop ()
+          ;; Evaluate test
+          (let* ((test-expr (arith-for-command-test cmd))
+                 (test-val (if (and test-expr (> (string-length test-expr) 0))
+                             (arith-eval (expand test-expr) getter setter)
+                             1)))  ;; empty test = true
+            (if (= test-val 0)
+              status  ;; test is false, exit loop
+              ;; Execute body with break/continue handling
+              (let ((caught
+                     (with-catch
+                      (lambda (e)
+                        (cond
+                          ((break-exception? e) (cons 'break e))
+                          ((continue-exception? e) (cons 'continue e))
+                          (else (raise e))))
+                      (lambda ()
+                        (set! status (exec-fn (arith-for-command-body cmd) env))
+                        ;; Execute update expression
+                        (let ((update-expr (arith-for-command-update cmd)))
+                          (when (and update-expr (> (string-length update-expr) 0))
+                            (arith-eval (expand update-expr) getter setter)))
+                        #f))))
+                (cond
+                  ((not caught) (loop))
+                  ((eq? (car caught) 'break)
+                   (let ((levels (break-exception-levels (cdr caught))))
+                     (if (> levels 1)
+                       (raise (make-break-exception (- levels 1)))
+                       status)))
+                  ((eq? (car caught) 'continue)
+                   (let ((levels (continue-exception-levels (cdr caught))))
+                     (if (> levels 1)
+                       (raise (make-continue-exception (- levels 1)))
+                       ;; Continue: run update, then loop
+                       (begin
+                         (let ((update-expr (arith-for-command-update cmd)))
+                           (when (and update-expr (> (string-length update-expr) 0))
+                             (arith-eval (expand update-expr) getter setter)))
+                         (loop))))))))))))))
 
 (def (check-errexit! env status)
   (when (and (not (= status 0))
