@@ -123,7 +123,9 @@
                                                           nullglob?: (env-shopt? env "nullglob")
                                                           failglob?: (env-shopt? env "failglob")
                                                           nocase?: (env-shopt? env "nocaseglob")
-                                                          extglob?: (env-shopt? env "extglob"))
+                                                          extglob?: (env-shopt? env "extglob")
+                                                          globskipdots?: (let ((v (env-shopt? env "globskipdots")))
+                                                                           (if (eq? v #f) #t v)))
                                                         [s])))
                                                   split)))))
                                     ;; Apply GLOBIGNORE filtering
@@ -137,9 +139,12 @@
                        ((null? globbed)
                         (if any-quoted? [""] []))
                        ;; Unquoted word that expanded to single empty string → remove
+                       ;; But only if ALL segments expanded to empty (not if IFS split
+                       ;; of a non-empty value produced an empty field)
                        ((and (not any-quoted?)
                              (= (length globbed) 1)
-                             (string=? (car globbed) ""))
+                             (string=? (car globbed) "")
+                             (every (lambda (seg) (string=? (car seg) "")) segments))
                         [])
                        (else globbed)))))
                brace-words)))
@@ -242,17 +247,50 @@
                     (seg-loop (cdr segs) words current (or cur-can-glob? (seg-globbable? type))
                               (or word-started? #t)))
                   ;; Unquoted segment: apply IFS splitting
-                  (let* ((split-words (word-split text env))
+                  ;; If text ends with non-ws IFS delimiter and there are more segments,
+                  ;; add trailing empty field to force word boundary
+                  (let* ((ifs (or (env-get env "IFS") " \t\n"))
+                         (trailing-nws-delim?
+                           (and (> (string-length text) 0)
+                                (pair? (cdr segs))
+                                (not (string=? ifs ""))
+                                (let ((last-ch (string-ref text (- (string-length text) 1))))
+                                  (and (ifs-char? last-ch ifs)
+                                       (not (or (char=? last-ch #\space)
+                                                (char=? last-ch #\tab)
+                                                (char=? last-ch #\newline)))))))
+                         ;; Also check if text starts with non-ws IFS delimiter
+                         ;; and there's a preceding segment
+                         (leading-nws-delim?
+                           (and (> (string-length text) 0)
+                                word-started?
+                                (not (string=? ifs ""))
+                                (let ((first-ch (string-ref text 0)))
+                                  (and (ifs-char? first-ch ifs)
+                                       (not (or (char=? first-ch #\space)
+                                                (char=? first-ch #\tab)
+                                                (char=? first-ch #\newline)))))))
+                         (raw-split (word-split text env))
+                         (split-words (if trailing-nws-delim?
+                                       (append raw-split [""])
+                                       raw-split))
+                         (split-words (if (and leading-nws-delim?
+                                              (pair? split-words)
+                                              (not (string=? (car split-words) "")))
+                                       (cons "" split-words)
+                                       split-words))
                          (n (length split-words)))
                     (cond
                       ;; Empty expansion: nothing to add, but mark as having unquoted content
                       ((= n 0)
                        (seg-loop (cdr segs) words current (or cur-can-glob? #t) word-started?))
                       ;; Single word: append to current (joining with adjacent)
+                      ;; Mark word-started if the original text was non-empty (IFS produced an empty field)
                       ((= n 1)
                        (display (car split-words) current)
                        (seg-loop (cdr segs) words current (or cur-can-glob? #t)
-                                 (or word-started? (> (string-length (car split-words)) 0))))
+                                 (or word-started? (> (string-length (car split-words)) 0)
+                                     (> (string-length text) 0))))
                       ;; Multiple words: first joins with current, rest are separate
                       (else
                        (display (car split-words) current)
@@ -297,38 +335,53 @@
     word))
 
 ;; Split an assignment value on unquoted : characters
-;; Returns list of segments. Respects single and double quoting.
+;; Returns list of segments. Respects single/double quoting and ${...} nesting.
 (def (split-assignment-on-colon str)
   (let ((len (string-length str))
         (out (open-output-string))
         (result []))
-    (let loop ((i 0) (in-sq? #f) (in-dq? #f))
+    (let loop ((i 0) (in-sq? #f) (in-dq? #f) (brace-depth 0))
       (if (>= i len)
         (reverse (cons (get-output-string out) result))
         (let ((ch (string-ref str i)))
           (cond
-            ;; Single quote toggle
+            ;; Single quote toggle (not in dq, not in ${})
             ((and (char=? ch #\') (not in-dq?))
              (display ch out)
-             (loop (+ i 1) (not in-sq?) in-dq?))
-            ;; Double quote toggle
-            ((and (char=? ch #\") (not in-sq?))
+             (if in-sq?
+               (loop (+ i 1) #f in-dq? brace-depth)
+               (loop (+ i 1) #t in-dq? brace-depth)))
+            ;; In single quotes, everything is literal
+            (in-sq?
              (display ch out)
-             (loop (+ i 1) in-sq? (not in-dq?)))
-            ;; Backslash in double quotes
-            ((and (char=? ch #\\) in-dq? (< (+ i 1) len))
+             (loop (+ i 1) in-sq? in-dq? brace-depth))
+            ;; Double quote toggle
+            ((char=? ch #\")
+             (display ch out)
+             (loop (+ i 1) in-sq? (not in-dq?) brace-depth))
+            ;; Backslash escape
+            ((and (char=? ch #\\) (< (+ i 1) len))
              (display ch out)
              (display (string-ref str (+ i 1)) out)
-             (loop (+ i 2) in-sq? in-dq?))
-            ;; Unquoted colon — split point
-            ((and (char=? ch #\:) (not in-sq?) (not in-dq?))
+             (loop (+ i 2) in-sq? in-dq? brace-depth))
+            ;; ${ opens brace depth
+            ((and (char=? ch #\$) (< (+ i 1) len) (char=? (string-ref str (+ i 1)) #\{))
+             (display ch out)
+             (display (string-ref str (+ i 1)) out)
+             (loop (+ i 2) in-sq? in-dq? (+ brace-depth 1)))
+            ;; } closes brace depth
+            ((and (char=? ch #\}) (> brace-depth 0))
+             (display ch out)
+             (loop (+ i 1) in-sq? in-dq? (- brace-depth 1)))
+            ;; Unquoted colon — split only at brace-depth 0
+            ((and (char=? ch #\:) (not in-dq?) (= brace-depth 0))
              (set! result (cons (get-output-string out) result))
              (set! out (open-output-string))
-             (loop (+ i 1) in-sq? in-dq?))
+             (loop (+ i 1) in-sq? in-dq? brace-depth))
             ;; Everything else
             (else
              (display ch out)
-             (loop (+ i 1) in-sq? in-dq?))))))))
+             (loop (+ i 1) in-sq? in-dq? brace-depth))))))))
 
 ;; Expand heredoc body: $, `, \ escaping, but NO quote processing (" and ' are literal)
 (def (expand-heredoc-body body env)

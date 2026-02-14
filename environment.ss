@@ -532,7 +532,8 @@
   (env-shopt-set! env "interactive_comments" #t)
   (env-shopt-set! env "progcomp" #t)
   (env-shopt-set! env "promptvars" #t)
-  (env-shopt-set! env "sourcepath" #t))
+  (env-shopt-set! env "sourcepath" #t)
+  (env-shopt-set! env "globskipdots" #t))
 
 ;;; --- Helpers ---
 

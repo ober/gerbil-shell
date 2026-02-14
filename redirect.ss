@@ -235,43 +235,53 @@
             (ffi-close-fd fd)
             save))
          (else
-          (let ((target-fd (string->number target-str)))
-            (cond
-              (target-fd
-               (let ((save (save-fd fd)))
-                 (let ((r (ffi-dup2 target-fd fd)))
-                   (when (< r 0)
-                     (restore-single! save)
-                     (error (string-append (number->string target-fd) ": Bad file descriptor")))
-                   ;; Update Gambit port: if the source fd is not a standard
-                   ;; Gambit port (0/1/2), create a fresh port via /dev/fd/N
-                   ;; to avoid sendto-on-non-socket errors when Gambit cached
-                   ;; the fd type at startup. Track the new port in save for cleanup.
-                   (if (and (<= 0 fd 2) (not (<= 0 target-fd 2)))
-                     ;; High fd → standard fd: need fresh Gambit port
-                     (let ((new-port (make-port-for-fd fd)))
-                       (set-current-port-for-fd! fd new-port)
-                       (append save (list new-port)))
-                     ;; Standard fd → standard fd: copy existing Gambit port
-                     (begin (dup-gambit-port! target-fd fd)
-                            save)))))
-              ;; Only treat as &> if fd was NOT explicitly specified
-              ;; 1>&file → error (bad file descriptor)
-              ;; >&file → equivalent to &>file
-              ((redir-fd redir)
-               (error (string-append target-str ": Bad file descriptor")))
-              (else
-               ;; Not a number, no explicit fd → treat as &> (redirect stdout+stderr to file)
-               (let ((save1 (save-fd 1))
-                     (save2 (save-fd 2)))
-                 (redirect-fd-to-file! 1 target-str
-                                       (bitwise-ior O_WRONLY O_CREAT O_TRUNC)
-                                       #o666)
-                 (ffi-dup2 1 2)
-                 (let ((port (open-output-file [path: target-str truncate: #t])))
-                   (current-output-port port)
-                   (current-error-port port))
-                 (list save1 save2))))))))
+          ;; Check for fd move: N- means dup N then close N
+          (let-values (((actual-target close-source?)
+                        (if (and (> (string-length target-str) 1)
+                                 (char=? (string-ref target-str (- (string-length target-str) 1)) #\-)
+                                 (string->number (substring target-str 0 (- (string-length target-str) 1))))
+                          (values (substring target-str 0 (- (string-length target-str) 1)) #t)
+                          (values target-str #f))))
+            (let ((target-fd (string->number actual-target)))
+              (cond
+                (target-fd
+                 (let ((save (save-fd fd)))
+                   (let ((r (ffi-dup2 target-fd fd)))
+                     (when (< r 0)
+                       (restore-single! save)
+                       (error (string-append (number->string target-fd) ": Bad file descriptor")))
+                     ;; Close source fd if this is a move operation (N-)
+                     (when close-source?
+                       (ffi-close-fd target-fd))
+                     ;; Update Gambit port: if the source fd is not a standard
+                     ;; Gambit port (0/1/2), create a fresh port via /dev/fd/N
+                     ;; to avoid sendto-on-non-socket errors when Gambit cached
+                     ;; the fd type at startup. Track the new port in save for cleanup.
+                     (if (and (<= 0 fd 2) (not (<= 0 target-fd 2)))
+                       ;; High fd → standard fd: need fresh Gambit port
+                       (let ((new-port (make-port-for-fd fd)))
+                         (set-current-port-for-fd! fd new-port)
+                         (append save (list new-port)))
+                       ;; Standard fd → standard fd: copy existing Gambit port
+                       (begin (dup-gambit-port! target-fd fd)
+                              save)))))
+                ;; Only treat as &> if fd was NOT explicitly specified
+                ;; 1>&file → error (bad file descriptor)
+                ;; >&file → equivalent to &>file
+                ((redir-fd redir)
+                 (error (string-append target-str ": Bad file descriptor")))
+                (else
+                 ;; Not a number, no explicit fd → treat as &> (redirect stdout+stderr to file)
+                 (let ((save1 (save-fd 1))
+                       (save2 (save-fd 2)))
+                   (redirect-fd-to-file! 1 target-str
+                                         (bitwise-ior O_WRONLY O_CREAT O_TRUNC)
+                                         #o666)
+                   (ffi-dup2 1 2)
+                   (let ((port (open-output-file [path: target-str truncate: #t])))
+                     (current-output-port port)
+                     (current-error-port port))
+                   (list save1 save2)))))))))
       ;; <& n — dup fd for input
       ((<&)
        (cond
@@ -280,22 +290,31 @@
             (ffi-close-fd fd)
             save))
          (else
-          (let ((target-fd (string->number target-str)))
-            (if target-fd
-              (let ((save (save-fd fd)))
-                (let ((r (ffi-dup2 target-fd fd)))
-                  (when (< r 0)
-                    (restore-single! save)
-                    (error (string-append (number->string target-fd) ": Bad file descriptor")))
-                  (if (and (<= 0 fd 2) (not (<= 0 target-fd 2)))
-                    (let ((new-port (make-port-for-fd fd)))
-                      (set-current-port-for-fd! fd new-port)
-                      (append save (list new-port)))
-                    (begin (dup-gambit-port! target-fd fd)
-                           save))))
-              (begin
-                (fprintf (current-error-port) "gsh: ~a: bad file descriptor~n" target-str)
-                #f))))))
+          ;; Check for fd move: N- means dup N then close N
+          (let-values (((actual-target close-source?)
+                        (if (and (> (string-length target-str) 1)
+                                 (char=? (string-ref target-str (- (string-length target-str) 1)) #\-)
+                                 (string->number (substring target-str 0 (- (string-length target-str) 1))))
+                          (values (substring target-str 0 (- (string-length target-str) 1)) #t)
+                          (values target-str #f))))
+            (let ((target-fd (string->number actual-target)))
+              (if target-fd
+                (let ((save (save-fd fd)))
+                  (let ((r (ffi-dup2 target-fd fd)))
+                    (when (< r 0)
+                      (restore-single! save)
+                      (error (string-append (number->string target-fd) ": Bad file descriptor")))
+                    (when close-source?
+                      (ffi-close-fd target-fd))
+                    (if (and (<= 0 fd 2) (not (<= 0 target-fd 2)))
+                      (let ((new-port (make-port-for-fd fd)))
+                        (set-current-port-for-fd! fd new-port)
+                        (append save (list new-port)))
+                      (begin (dup-gambit-port! target-fd fd)
+                             save))))
+                (begin
+                  (fprintf (current-error-port) "gsh: ~a: bad file descriptor~n" target-str)
+                  #f)))))))
       ;; <> file — open read-write on fd
       ((<>)
        (let ((save (save-fd fd)))
@@ -362,41 +381,55 @@
          ((string=? target-str "-")
           (ffi-close-fd fd))
          (else
-          (let ((target-fd (string->number target-str)))
-            (cond
-              (target-fd
-               (let ((r (ffi-dup2 target-fd fd)))
-                 (when (< r 0)
-                   (error (string-append (number->string target-fd) ": Bad file descriptor")))
-                 ;; Create fresh Gambit port for standard fds
-                 ;; For permanent redirect, create fresh port if needed
-                 (if (and (<= 0 fd 2) (not (<= 0 target-fd 2)))
-                   (set-current-port-for-fd! fd (make-port-for-fd fd))
-                   (dup-gambit-port! target-fd fd))))
-              ((redir-fd redir)
-               (error (string-append target-str ": Bad file descriptor")))
-              (else
-               ;; >&word → redirect both stdout+stderr to file
-               (redirect-fd-to-file! 1 target-str
-                                     (bitwise-ior O_WRONLY O_CREAT O_TRUNC) #o666)
-               (ffi-dup2 1 2)
-               (let ((port (open-output-file [path: target-str truncate: #t])))
-                 (current-output-port port)
-                 (current-error-port port))))))))
+          (let-values (((actual-target close-source?)
+                        (if (and (> (string-length target-str) 1)
+                                 (char=? (string-ref target-str (- (string-length target-str) 1)) #\-)
+                                 (string->number (substring target-str 0 (- (string-length target-str) 1))))
+                          (values (substring target-str 0 (- (string-length target-str) 1)) #t)
+                          (values target-str #f))))
+            (let ((target-fd (string->number actual-target)))
+              (cond
+                (target-fd
+                 (let ((r (ffi-dup2 target-fd fd)))
+                   (when (< r 0)
+                     (error (string-append (number->string target-fd) ": Bad file descriptor")))
+                   (when close-source?
+                     (ffi-close-fd target-fd))
+                   (if (and (<= 0 fd 2) (not (<= 0 target-fd 2)))
+                     (set-current-port-for-fd! fd (make-port-for-fd fd))
+                     (dup-gambit-port! target-fd fd))))
+                ((redir-fd redir)
+                 (error (string-append target-str ": Bad file descriptor")))
+                (else
+                 ;; >&word → redirect both stdout+stderr to file
+                 (redirect-fd-to-file! 1 target-str
+                                       (bitwise-ior O_WRONLY O_CREAT O_TRUNC) #o666)
+                 (ffi-dup2 1 2)
+                 (let ((port (open-output-file [path: target-str truncate: #t])))
+                   (current-output-port port)
+                   (current-error-port port)))))))))
       ((<&)
        (cond
          ((string=? target-str "-")
           (ffi-close-fd fd))
          (else
-          (let ((target-fd (string->number target-str)))
-            (if target-fd
-              (let ((r (ffi-dup2 target-fd fd)))
-                (when (< r 0)
-                  (error (string-append (number->string target-fd) ": Bad file descriptor")))
-                (if (and (<= 0 fd 2) (not (<= 0 target-fd 2)))
-                  (set-current-port-for-fd! fd (make-port-for-fd fd))
-                  (dup-gambit-port! target-fd fd)))
-              (fprintf (current-error-port) "gsh: ~a: bad file descriptor~n" target-str))))))
+          (let-values (((actual-target close-source?)
+                        (if (and (> (string-length target-str) 1)
+                                 (char=? (string-ref target-str (- (string-length target-str) 1)) #\-)
+                                 (string->number (substring target-str 0 (- (string-length target-str) 1))))
+                          (values (substring target-str 0 (- (string-length target-str) 1)) #t)
+                          (values target-str #f))))
+            (let ((target-fd (string->number actual-target)))
+              (if target-fd
+                (let ((r (ffi-dup2 target-fd fd)))
+                  (when (< r 0)
+                    (error (string-append (number->string target-fd) ": Bad file descriptor")))
+                  (when close-source?
+                    (ffi-close-fd target-fd))
+                  (if (and (<= 0 fd 2) (not (<= 0 target-fd 2)))
+                    (set-current-port-for-fd! fd (make-port-for-fd fd))
+                    (dup-gambit-port! target-fd fd)))
+                (fprintf (current-error-port) "gsh: ~a: bad file descriptor~n" target-str)))))))
       ((<>) (redirect-fd-to-file! fd target-str O_RDWR #o666))
       (else (fprintf (current-error-port) "gsh: unsupported redirect operator ~a~n" op)))))
 

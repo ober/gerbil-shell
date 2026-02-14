@@ -47,8 +47,9 @@
                    nullglob?: (nullglob? #f)
                    failglob?: (failglob? #f)
                    nocase?: (nocase? #f)
-                   extglob?: (extglob? #f))
-  (let ((matches (glob-expand-path pattern dotglob? nocase? extglob?)))
+                   extglob?: (extglob? #f)
+                   globskipdots?: (globskipdots? #t))
+  (let ((matches (glob-expand-path pattern dotglob? nocase? extglob? globskipdots?)))
     (cond
       ((pair? matches) (sort matches string<?))
       (failglob?
@@ -368,7 +369,7 @@
 
 ;; Expand a glob pattern against the filesystem
 ;; Handles path components separately: dir/pattern
-(def (glob-expand-path pattern (dotglob? #f) (nocase? #f) (extglob? #f))
+(def (glob-expand-path pattern (dotglob? #f) (nocase? #f) (extglob? #f) (globskipdots? #t))
   (let ((parts (split-glob-path pattern)))
     (if (null? parts)
       []
@@ -377,7 +378,7 @@
                      "/"
                      ".")))
         (glob-expand-parts parts start (char=? (string-ref pattern 0) #\/)
-                           dotglob? nocase? extglob?)))))
+                           dotglob? nocase? extglob? globskipdots?)))))
 
 ;; Split a glob path into components
 (def (split-glob-path path)
@@ -396,13 +397,13 @@
        (loop (+ i 1) start parts)))))
 
 ;; Expand a list of path components against the filesystem
-(def (glob-expand-parts parts base absolute? (dotglob? #f) (nocase? #f) (extglob? #f))
+(def (glob-expand-parts parts base absolute? (dotglob? #f) (nocase? #f) (extglob? #f) (globskipdots? #t))
   (if (null? parts)
     [(if absolute? base
          (if (string=? base ".") "" base))]
     (let* ((pattern (car parts))
            (rest (cdr parts))
-           (entries (glob-match-dir base pattern dotglob? nocase? extglob?)))
+           (entries (glob-match-dir base pattern dotglob? nocase? extglob? globskipdots?)))
       (let loop ((entries entries) (results []))
         (if (null? entries)
           results
@@ -418,11 +419,11 @@
               (if (directory-exists? full)
                 (loop (cdr entries)
                       (append (glob-expand-parts rest full absolute?
-                                                 dotglob? nocase? extglob?) results))
+                                                 dotglob? nocase? extglob? globskipdots?) results))
                 (loop (cdr entries) results)))))))))
 
 ;; Match entries in a directory against a glob pattern
-(def (glob-match-dir dir pattern (dotglob? #f) (nocase? #f) (extglob? #f))
+(def (glob-match-dir dir pattern (dotglob? #f) (nocase? #f) (extglob? #f) (globskipdots? #t))
   (with-catch
    (lambda (e) [])
    (lambda ()
@@ -437,9 +438,10 @@
                       (directory-files dir))))
        (filter
         (lambda (entry)
-          (and ;; Exclude . and .. always
-               (not (string=? entry "."))
-               (not (string=? entry ".."))
+          (and ;; Exclude . and .. when globskipdots is on (default)
+               (or (not globskipdots?)
+                   (and (not (string=? entry "."))
+                        (not (string=? entry ".."))))
                ;; Dotfile filter (when not showing dots)
                (or show-dots?
                    (not (and (> (string-length entry) 0)

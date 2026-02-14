@@ -1669,11 +1669,29 @@
               0)
              ;; wait -n - wait for next job to complete
              ((string=? (car args) "-n")
-              (let ((jobs (job-table-list)))
-                (if (null? jobs)
-                  127
-                  (let ((job (car jobs)))
-                    (job-wait job)))))
+              (let* ((rest-args (cdr args))
+                     ;; Validate any PID args
+                     (valid? (let vloop ((a rest-args))
+                               (or (null? a)
+                                   (let ((arg (car a)))
+                                     (if (or (string->number arg)
+                                             (and (> (string-length arg) 0)
+                                                  (char=? (string-ref arg 0) #\%)))
+                                       (vloop (cdr a))
+                                       (begin
+                                         (fprintf (current-error-port) "wait: `~a': not a pid or valid job spec~n" arg)
+                                         #f)))))))
+                (if (not valid?)
+                  1
+                  (let ((jobs (if (null? rest-args)
+                               (job-table-list)
+                               ;; Look up specific jobs
+                               (filter identity
+                                 (map (lambda (a) (job-table-get a)) rest-args)))))
+                    (if (null? jobs)
+                      127
+                      (let ((job (car jobs)))
+                        (job-wait job)))))))
              ;; Wait for specific jobs
              (else
               (let loop ((args args) (status 0))
