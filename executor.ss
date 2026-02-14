@@ -66,8 +66,9 @@
          (op (assignment-op asgn)))
     (cond
       ;; Compound array assignment: arr=(val1 val2 ...) or arr+=(val1 val2 ...)
+      ;; Use expand-word (not nosplit) so glob patterns expand (e.g. a=(*.txt))
       ((pair? raw-value)
-       (let ((expanded (map (lambda (v) (expand-word-nosplit v env)) raw-value)))
+       (let ((expanded (append-map (lambda (v) (expand-word v env)) raw-value)))
          (if (eq? op '+=)
            (env-array-append-compound! env name expanded)
            (env-array-set-compound! env name expanded
