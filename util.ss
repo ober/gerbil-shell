@@ -94,8 +94,9 @@
 
 ;; Search PATH for a regular file (not directory), no execute requirement
 ;; Used by source/. to find files to source
-(def (find-file-in-path name)
-  (let ((path-dirs (string-split-chars (or (getenv "PATH" #f) "/usr/bin:/bin") ":")))
+;; Optional path-str parameter overrides getenv lookup (for temp env assignments)
+(def (find-file-in-path name (path-str #f))
+  (let ((path-dirs (string-split-chars (or path-str (getenv "PATH" #f) "/usr/bin:/bin") ":")))
     (let loop ((dirs path-dirs))
       (if (null? dirs) #f
           (let ((full (string-append (car dirs) "/" name)))
@@ -110,8 +111,8 @@
   (with-catch
    (lambda (e) #f)
    (lambda ()
-     (let ((info (file-info path)))
-       (not (eq? (file-info-type info) 'directory))))))
+     (and (not (eq? (file-info-type (file-info path)) 'directory))
+          (= (ffi-access path 1) 0)))))  ;; X_OK = 1
 
 ;; Return home directory
 (def (home-directory)

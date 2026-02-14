@@ -640,7 +640,17 @@
                (when (and (not val) (env-option? env "nounset")
                           (not (memq modifier '(:- - := = :+ + :? ?))))
                  (nounset-error! name env))
-               (apply-parameter-modifier val name modifier arg env)))))))))
+               ;; For @ and * with transform modifiers, apply per-element
+               (if (and (or (string=? name "@") (string=? name "*"))
+                        modifier
+                        (memq modifier '(% %% prefix-short prefix-long
+                                         ^^ ^ lc-all lc-first / //)))
+                 (let* ((params (env-positional-list env))
+                        (transformed (map (lambda (p)
+                                           (apply-parameter-modifier p name modifier arg env))
+                                         params)))
+                   (string-join-with " " transformed))
+                 (apply-parameter-modifier val name modifier arg env))))))))))
 
 ;; Find the start of an array subscript [idx] in parameter content.
 ;; Returns position of [ or #f. Must be preceded by a valid name.

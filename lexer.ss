@@ -456,11 +456,13 @@
       (error "lexer: empty word")
       ;; Classify the token
       (cond
-        ;; IO_NUMBER: single digit (0-9) and next char is < or >
-        ;; Bash only treats single-digit fds as IO_NUMBERs;
-        ;; multi-digit numbers like 99 or 100 are treated as words
-        ((and (= (string-length word) 1)
-              (char-numeric? (string-ref word 0))
+        ;; IO_NUMBER: digits followed by < or >
+        ;; Bash treats multi-digit numbers as IO_NUMBERs too (e.g. 20> file)
+        ((and (> (string-length word) 0)
+              (let check-digits ((i 0))
+                (if (>= i (string-length word)) #t
+                  (and (char-numeric? (string-ref word i))
+                       (check-digits (+ i 1)))))
               (not (at-end? (current-lexer)))
               (let ((ch (current-char (current-lexer))))
                 (or (char=? ch #\<) (char=? ch #\>))))
@@ -733,6 +735,21 @@
            ;; Single ) — decrease paren depth
            ((and (char=? (current-char lex) #\)) (> paren-depth 0))
             (display (current-char lex) buf) (advance! lex) (loop (- paren-depth 1)))
+           ;; Backslash: handle line continuation
+           ((char=? (current-char lex) #\\)
+            (advance! lex)
+            (cond
+              ((at-end? lex)
+               (display "\\" buf))
+              ;; Line continuation: backslash-newline consumed silently
+              ((char=? (current-char lex) #\newline)
+               (advance! lex)
+               (loop paren-depth))
+              (else
+               (display "\\" buf)
+               (display (current-char lex) buf)
+               (advance! lex)
+               (loop paren-depth))))
            (else
             (display (current-char lex) buf)
             (advance! lex)

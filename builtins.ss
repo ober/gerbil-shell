@@ -122,8 +122,22 @@
              (parameterize ((*printf-conversion-error* #f))
                (let ((output (shell-printf fmt fmt-args)))
                  (if var-name
-                   (begin (env-set! env var-name output)
-                          (if (*printf-conversion-error*) 1 0))
+                   (let ((bracket (string-index var-name #\[)))
+                     (if bracket
+                       ;; Validate array subscript syntax: must end with ]
+                       (if (and (> (string-length var-name) (+ bracket 1))
+                                (char=? (string-ref var-name (- (string-length var-name) 1)) #\]))
+                         (let ((arr-name (substring var-name 0 bracket))
+                               (idx-str (substring var-name (+ bracket 1)
+                                                   (- (string-length var-name) 1))))
+                           (env-array-set! env arr-name idx-str output)
+                           (if (*printf-conversion-error*) 1 0))
+                         (begin
+                           (fprintf (current-error-port) "printf: `~a': not a valid identifier~n" var-name)
+                           2))
+                       (begin
+                         (env-set! env var-name output)
+                         (if (*printf-conversion-error*) 1 0))))
                    (begin (display output) (force-output)
                           (if (*printf-conversion-error*) 1 0))))))))))))
 
@@ -198,8 +212,12 @@
              (string=? (car rest) "-"))
          (let* ((remaining (if (and (pair? rest) (string=? (car rest) "--"))
                              (cdr rest)
-                             rest))
-                (dir-arg (cond
+                             rest)))
+           (if (and (pair? remaining) (pair? (cdr remaining)))
+             (begin
+               (fprintf (current-error-port) "cd: too many arguments~n")
+               1)
+             (let* ((dir-arg (cond
                            ((null? remaining)
                             (let ((home (env-get env "HOME")))
                               (if (or (not home) (string=? home ""))
@@ -258,7 +276,7 @@
                       (*internal-pwd* new-pwd)
                       (when print-dir?
                         (displayln new-pwd))
-                      0))))))))
+                      0))))))))))
         ;; -L flag: logical (default)
         ((string=? (car rest) "-L")
          (loop (cdr rest) #f))
@@ -298,9 +316,9 @@
          (lambda (arg)
            (let ((eq-pos (string-find-char* arg #\=)))
              (if eq-pos
+               ;; Args already expanded by expand-declaration-args (no re-expansion)
                (let* ((name (substring arg 0 eq-pos))
-                      (raw-value (substring arg (+ eq-pos 1) (string-length arg)))
-                      (value (expand-assignment-value raw-value env)))
+                      (value (substring arg (+ eq-pos 1) (string-length arg))))
                  (env-export! env name value))
                (env-export! env arg))))
          args)
@@ -357,9 +375,10 @@
          (lambda (arg)
            (let ((eq-pos (string-find-char* arg #\=)))
              (if eq-pos
+               ;; Args are already expanded by expand-declaration-args
+               ;; Don't re-expand the value (would cause double tilde expansion etc.)
                (let* ((name (substring arg 0 eq-pos))
-                      (raw-value (substring arg (+ eq-pos 1) (string-length arg)))
-                      (value (expand-assignment-value raw-value env)))
+                      (value (substring arg (+ eq-pos 1) (string-length arg))))
                  (env-readonly! env name value))
                (env-readonly! env arg))))
          args)
@@ -538,7 +557,38 @@
            0))))))
 
 (def (shell-quote-value val)
-  (string-append "'" (string-replace-all val "'" "'\\''") "'"))
+  ;; Check if value contains control characters that need $'...' quoting
+  (let ((needs-dollar-quote?
+         (let loop ((i 0))
+           (if (>= i (string-length val)) #f
+             (let ((ch (string-ref val i)))
+               (if (or (char<? ch #\space) (char=? ch #\x7f))
+                 #t
+                 (loop (+ i 1))))))))
+    (if needs-dollar-quote?
+      ;; Use $'...' quoting with escape sequences for control chars
+      (let ((buf (open-output-string)))
+        (display "$'" buf)
+        (let loop ((i 0))
+          (when (< i (string-length val))
+            (let ((ch (string-ref val i)))
+              (cond
+                ((char=? ch #\newline) (display "\\n" buf))
+                ((char=? ch #\tab) (display "\\t" buf))
+                ((char=? ch #\return) (display "\\r" buf))
+                ((char=? ch #\\) (display "\\\\" buf))
+                ((char=? ch #\') (display "\\'" buf))
+                ((or (char<? ch #\space) (char=? ch #\x7f))
+                 (display (string-append "\\x"
+                   (let ((h (number->string (char->integer ch) 16)))
+                     (if (< (string-length h) 2) (string-append "0" h) h)))
+                  buf))
+                (else (display ch buf))))
+            (loop (+ i 1))))
+        (display "'" buf)
+        (get-output-string buf))
+      ;; Normal single-quote wrapping
+      (string-append "'" (string-replace-all val "'" "'\\''") "'"))))
 
 ;; shift [n]
 (builtin-register! "shift"
@@ -1612,19 +1662,36 @@
 (builtin-register! "wait"
   (lambda (args env)
     (let ((result
-           (if (null? args)
-             ;; Wait for all background jobs — return 0 per POSIX
-             (begin
-               (for-each (lambda (job) (job-wait job)) (job-table-list))
-               0)
+           (cond
+             ;; wait with no args - wait for all background jobs
+             ((null? args)
+              (for-each (lambda (job) (job-wait job)) (job-table-list))
+              0)
+             ;; wait -n - wait for next job to complete
+             ((string=? (car args) "-n")
+              (let ((jobs (job-table-list)))
+                (if (null? jobs)
+                  127
+                  (let ((job (car jobs)))
+                    (job-wait job)))))
              ;; Wait for specific jobs
-             (let loop ((args args) (status 0))
+             (else
+              (let loop ((args args) (status 0))
                (if (null? args)
                  status
-                 (let ((job (job-table-get (car args))))
-                   (if job
-                     (loop (cdr args) (job-wait job))
-                     (loop (cdr args) 127))))))))
+                 (let* ((arg (car args))
+                        (valid-arg? (or (string->number arg)
+                                        (and (> (string-length arg) 0)
+                                             (char=? (string-ref arg 0) #\%)))))
+                   (if (not valid-arg?)
+                     ;; Invalid argument - not a PID or job spec
+                     (begin
+                       (fprintf (current-error-port) "wait: `~a': not a pid or valid job spec~n" arg)
+                       (loop (cdr args) 2))
+                     (let ((job (job-table-get arg)))
+                       (if job
+                         (loop (cdr args) (job-wait job))
+                         (loop (cdr args) 127)))))))))))
       ;; Clean up completed jobs
       (job-table-cleanup!)
       result)))
@@ -1722,9 +1789,9 @@
             (lambda (arg)
               (let ((eq-pos (string-find-char* arg #\=)))
                 (if eq-pos
+                  ;; Args already expanded by expand-declaration-args (no re-expansion)
                   (let* ((name (substring arg 0 eq-pos))
-                         (raw-value (substring arg (+ eq-pos 1) (string-length arg)))
-                         (value (expand-assignment-value raw-value env)))
+                         (value (substring arg (+ eq-pos 1) (string-length arg))))
                     (hash-put! (shell-environment-vars env) name
                                (make-shell-var value effective-export? readonly? #t
                                               integer? #f #f nameref? #f #f)))
@@ -1794,9 +1861,9 @@
      (lambda (arg)
        (let* ((eq-pos (string-find-char* arg #\=))
               (name (if eq-pos (substring arg 0 eq-pos) arg))
+              ;; Args already expanded by expand-declaration-args (no re-expansion)
               (value (if eq-pos
-                       (let ((raw (substring arg (+ eq-pos 1) (string-length arg))))
-                         (expand-assignment-value raw env))
+                       (substring arg (+ eq-pos 1) (string-length arg))
                        #f)))
          (if print?
            ;; -p name: print declaration (return 1 if var not found)
@@ -2410,7 +2477,7 @@
              ((#\f) (display "\x0c;" buf) (loop (+ i 2) acc))
              ((#\v) (display "\x0b;" buf) (loop (+ i 2) acc))
              ((#\\) (display "\\" buf) (loop (+ i 2) acc))
-             ((#\0) ;; \0nnn - octal (up to 3 digits after the 0)
+             ((#\0) ;; \0nnn - octal (up to 3 digits after the 0, matching bash echo)
               (let oloop ((j (+ i 2)) (val 0) (count 0))
                 (if (and (< j len) (< count 3)
                          (char>=? (string-ref str j) #\0)
@@ -2510,24 +2577,6 @@
 ;; Returns (values next-position remaining-args)
 (def (printf-format-spec fmt i args buf)
   (let ((flen (string-length fmt)))
-    ;; Check for %(strftime)T format
-    (if (and (< i flen) (char=? (string-ref fmt i) #\()
-             (let ((close (string-find-char-from fmt #\) (+ i 1))))
-               (and close (< (+ close 1) flen)
-                    (char=? (string-ref fmt (+ close 1)) #\T))))
-      (let* ((close (string-find-char-from fmt #\) (+ i 1)))
-             (strfmt (substring fmt (+ i 1) close))
-             (arg (if (pair? args) (car args) ""))
-             (rest (if (pair? args) (cdr args) []))
-             (epoch (cond
-                      ((string=? arg "") (inexact->exact (floor (time->seconds (current-time)))))
-                      ((string=? arg "-1") (inexact->exact (floor (time->seconds (current-time)))))
-                      ((string=? arg "-2")
-                       (inexact->exact (floor (time->seconds (current-time)))))
-                      (else (or (string->number arg) 0))))
-             (result (ffi-strftime strfmt epoch)))
-        (display result buf)
-        (values (+ close 2) rest))
     ;; Parse flags: -, +, space, 0, #
     (let flag-loop ((i i) (left-align? #f) (plus-sign? #f) (space-sign? #f)
                     (zero-pad? #f) (alt-form? #f))
@@ -2540,6 +2589,25 @@
             ((char=? ch #\space) (flag-loop (+ i 1) left-align? plus-sign? #t zero-pad? alt-form?))
             ((char=? ch #\0) (flag-loop (+ i 1) left-align? plus-sign? space-sign? #t alt-form?))
             ((char=? ch #\#) (flag-loop (+ i 1) left-align? plus-sign? space-sign? zero-pad? #t))
+            ;; %(strftime)T format — check after flags
+            ((char=? ch #\()
+             (let ((close (string-find-char-from fmt #\) (+ i 1))))
+               (if (and close (< (+ close 1) flen)
+                        (char=? (string-ref fmt (+ close 1)) #\T))
+                 (let* ((strfmt (substring fmt (+ i 1) close))
+                        (arg (if (pair? args) (car args) ""))
+                        (rest (if (pair? args) (cdr args) []))
+                        (epoch (cond
+                                 ((string=? arg "") (inexact->exact (floor (time->seconds (current-time)))))
+                                 ((string=? arg "-1") (inexact->exact (floor (time->seconds (current-time)))))
+                                 ((string=? arg "-2")
+                                  (inexact->exact (floor (time->seconds (current-time)))))
+                                 (else (or (string->number arg) 0))))
+                        (result (ffi-strftime strfmt epoch)))
+                   (display result buf)
+                   (values (+ close 2) rest))
+                 ;; Not a valid %(...)T format
+                 (values i args))))
             (else
              ;; Parse width (may be *)
              (let-values (((width i args) (parse-printf-number fmt i args)))
@@ -2549,6 +2617,29 @@
                                (let-values (((p j a) (parse-printf-number fmt (+ i 1) args)))
                                  (values (or p 0) j a))  ;; . alone means precision 0
                                (values #f i args))))
+                 ;; Check for %(strftime)T after width/precision
+                 (if (and (< i flen) (char=? (string-ref fmt i) #\())
+                   (let ((close (string-find-char-from fmt #\) (+ i 1))))
+                     (if (and close (< (+ close 1) flen)
+                              (char=? (string-ref fmt (+ close 1)) #\T))
+                       (let* ((strfmt (substring fmt (+ i 1) close))
+                              (arg (if (pair? args) (car args) ""))
+                              (rest (if (pair? args) (cdr args) []))
+                              (epoch (cond
+                                       ((string=? arg "") (inexact->exact (floor (time->seconds (current-time)))))
+                                       ((string=? arg "-1") (inexact->exact (floor (time->seconds (current-time)))))
+                                       ((string=? arg "-2")
+                                        (inexact->exact (floor (time->seconds (current-time)))))
+                                       (else (or (string->number arg) 0))))
+                              (result (ffi-strftime strfmt epoch))
+                              ;; Apply precision as truncation length
+                              (result (if prec
+                                        (substring result 0 (min prec (string-length result)))
+                                        result)))
+                         (display (pad-string result (or width 0) left-align? #\space) buf)
+                         (values (+ close 2) rest))
+                       ;; Not a valid %(...)T
+                       (values i args)))
                  ;; Conversion specifier
                  (if (>= i flen)
                    (values i args)
@@ -2567,6 +2658,10 @@
                        ;; %d %i - signed decimal integer
                        ((#\d #\i)
                         (let* ((n (string->integer-safe arg))
+                               ;; Clamp to 64-bit signed range (matching bash)
+                               (n (cond ((> n 9223372036854775807) 9223372036854775807)
+                                        ((< n -9223372036854775808) -9223372036854775808)
+                                        (else n)))
                                (neg? (< n 0))
                                (digits (number->string (abs n)))
                                ;; Precision: minimum number of digits (zero-pad)
@@ -2589,6 +2684,8 @@
                         (let* ((n (string->integer-safe arg))
                                ;; Two's complement for negative numbers (64-bit)
                                (n (if (< n 0) (+ (expt 2 64) n) n))
+                               ;; Clamp to 64-bit unsigned range (matching bash)
+                               (n (if (> n 18446744073709551615) 18446744073709551615 n))
                                (digits (number->string n))
                                (digits (if (and prec (> prec (string-length digits)))
                                          (string-append (make-string (- prec (string-length digits)) #\0)
@@ -2603,6 +2700,8 @@
                         (let* ((n (string->integer-safe arg))
                                ;; Two's complement for negative numbers (64-bit)
                                (n (if (< n 0) (+ (expt 2 64) n) n))
+                               ;; Clamp to 64-bit unsigned range
+                               (n (if (> n 18446744073709551615) 18446744073709551615 n))
                                (digits (number->string n 8))
                                (digits (if (and prec (> prec (string-length digits)))
                                          (string-append (make-string (- prec (string-length digits)) #\0)
@@ -2620,6 +2719,8 @@
                         (let* ((n (string->integer-safe arg))
                                ;; Two's complement for negative numbers (64-bit)
                                (n (if (< n 0) (+ (expt 2 64) n) n))
+                               ;; Clamp to 64-bit unsigned range
+                               (n (if (> n 18446744073709551615) 18446744073709551615 n))
                                (raw (number->string n 16))
                                (raw (if (char=? spec #\X) (string-upcase raw) raw))
                                (digits (if (and prec (> prec (string-length raw)))
@@ -2644,7 +2745,8 @@
                           (values (+ i 1) rest)))
                        ;; %q - shell-quoted
                        ((#\q)
-                        (display (shell-quote-string (if (string? arg) arg "")) buf)
+                        (let ((quoted (shell-quote-string (if (string? arg) arg ""))))
+                          (display (pad-string quoted (or width 0) left-align? #\space) buf))
                         (values (+ i 1) rest))
                        ;; %f %e %g and uppercase variants - floating point
                        ((#\f #\F #\e #\g #\E #\G)
@@ -2709,10 +2811,10 @@
           ((#\\) (display "\\" buf) (+ i 1))
           ((#\') (display "'" buf) (+ i 1))
           ((#\") (display "\"" buf) (+ i 1))
-          ;; \0nnn - octal
+          ;; \0nnn - octal (up to 2 digits after the 0, matching bash)
           ((#\0)
            (let octal-loop ((j (+ i 1)) (n 0) (count 0))
-             (if (and (< j flen) (< count 3)
+             (if (and (< j flen) (< count 2)
                       (char>=? (string-ref fmt j) #\0)
                       (char<=? (string-ref fmt j) #\7))
                (octal-loop (+ j 1)
@@ -2755,6 +2857,16 @@
                    (hex-loop (+ j 1) (+ (* n 16) hv) (+ count 1))
                    (begin (display-unicode-char n buf) j)))
                (begin (display-unicode-char n buf) j))))
+          ;; \nnn - octal without leading 0 (up to 3 digits)
+          ((#\1 #\2 #\3 #\4 #\5 #\6 #\7)
+           (let octal-loop ((j i) (n 0) (count 0))
+             (if (and (< j flen) (< count 3)
+                      (char>=? (string-ref fmt j) #\0)
+                      (char<=? (string-ref fmt j) #\7))
+               (octal-loop (+ j 1)
+                          (+ (* n 8) (- (char->integer (string-ref fmt j)) 48))
+                          (+ count 1))
+               (begin (display (string (integer->char (bitwise-and n #xFF))) buf) j))))
           ;; \c - stop output (only used in %b context, but handle here too)
           ((#\c) (+ i 1))  ;; caller should check for this
           (else (display "\\" buf) (display (string ch) buf) (+ i 1)))))))

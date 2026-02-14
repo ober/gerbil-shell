@@ -106,9 +106,11 @@
                (let* ((filename (car args))
                       ;; Search PATH if file doesn't contain /
                       ;; source doesn't require execute permission, just a regular file
+                      ;; Use env's PATH so prefix assignments like PATH=x . file work
                       (filepath (if (string-contains? filename "/")
                                   filename
-                                  (or (find-file-in-path filename) filename))))
+                                  (or (find-file-in-path filename (env-get env "PATH"))
+                                      filename))))
                  ;; Set positional params if extra args given, restore after
                  (if (pair? (cdr args))
                    (let ((saved-pos (shell-environment-positional env)))

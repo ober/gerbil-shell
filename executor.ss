@@ -216,6 +216,14 @@
                                        ((builtin-lookup cmd-name)
                                         => (lambda (handler)
                                              (handler args temp-env)))
+                                       ;; Reserved word used as command (e.g. from command sub)
+                                       ((member cmd-name '("if" "then" "elif" "else" "fi"
+                                                           "do" "done" "case" "esac"
+                                                           "while" "until" "for" "in"
+                                                           "select" "function" "{" "}"))
+                                        (fprintf (current-error-port)
+                                                 "gsh: syntax error near unexpected token `~a'~n" cmd-name)
+                                        2)
                                        ;; External command
                                        (else
                                         (execute-external cmd-name args temp-env)))))
@@ -248,6 +256,9 @@
 ;; Expand args for declaration builtins.
 ;; Flag args (starting with - or +) and assignment args (containing =)
 ;; are expanded without word splitting. Other args are expanded normally.
+;; For literal assignment args (name=value), expands tilde in the value part
+;; so builtin handlers don't need to re-expand (which would double-expand
+;; tilde from variable references like readonly "$binding").
 (def (expand-declaration-args words env)
   (append-map
    (lambda (w)
@@ -258,9 +269,17 @@
                (or (char=? (string-ref s 0) #\-)
                    (char=? (string-ref s 0) #\+)))
           [(expand-word-nosplit w env)])
-         ;; Assignment argument (contains =) - no splitting or globbing
+         ;; Literal assignment argument (contains =) - expand value with assignment
+         ;; tilde rules (tilde at start and after colons)
          ((and (string? w) (has-equals-sign? w))
-          [(expand-word-nosplit w env)])
+          (let* ((expanded (expand-word-nosplit w env))
+                 (eq-pos (string-find-char* expanded #\=)))
+            (if eq-pos
+              (let* ((name-part (substring expanded 0 (+ eq-pos 1)))
+                     (val-part (substring expanded (+ eq-pos 1) (string-length expanded)))
+                     (expanded-val (expand-assignment-value val-part env)))
+                [(string-append name-part expanded-val)])
+              [expanded])))
          ;; Regular arg - normal expansion with splitting
          (else (expand-word w env)))))
    words))
