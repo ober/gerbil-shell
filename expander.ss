@@ -25,6 +25,17 @@
 ;; only $, `, ", \, newline are special; others preserve the backslash.
 (def *in-dquote-context* (make-parameter #f))
 
+;;; --- Modifier segments (preserves quoting info from parameter defaults) ---
+;; When a parameter modifier like ${X:-'a b c'} expands a default value,
+;; we need to preserve the quoting information so word splitting respects it.
+;; A modifier-segments value wraps a list of (text . type) segments.
+(def (make-modifier-segments segs) (vector 'modifier-segments segs))
+(def (modifier-segments? x) (and (vector? x) (>= (vector-length x) 2)
+                                  (eq? (vector-ref x 0) 'modifier-segments)))
+(def (modifier-segments-list x) (vector-ref x 1))
+(def (segments->string segs)
+  (apply string-append (map car segs)))
+
 ;;; --- Process substitution state ---
 ;; Accumulates cleanup thunks for process substitutions created during expansion.
 ;; Caller should bind this and call the cleanups after the command finishes.
@@ -178,7 +189,10 @@
             ;; Dollar expansion — unquoted, subject to splitting
             ((char=? ch #\$)
              (let-values (((expanded end) (expand-dollar word i env)))
-               (loop end (cons (cons expanded 'expanded) segments))))
+               (if (modifier-segments? expanded)
+                 ;; Modifier returned segments — splice them to preserve quoting
+                 (loop end (append (reverse (modifier-segments-list expanded)) segments))
+                 (loop end (cons (cons expanded 'expanded) segments)))))
             ;; Backtick command substitution — unquoted
             ((char=? ch #\`)
              (let-values (((expanded end) (expand-backtick word i env)))
@@ -395,7 +409,10 @@
             ;; Dollar expansion
             ((char=? ch #\$)
              (let-values (((expanded end) (expand-dollar body i env)))
-               (display expanded out)
+               (display (if (modifier-segments? expanded)
+                          (segments->string (modifier-segments-list expanded))
+                          expanded)
+                        out)
                (loop end)))
             ;; Backtick command substitution
             ((char=? ch #\`)
@@ -445,7 +462,10 @@
             ;; Dollar expansion
             ((char=? ch #\$)
              (let-values (((expanded end) (expand-dollar str i env)))
-               (display expanded out)
+               (display (if (modifier-segments? expanded)
+                          (segments->string (modifier-segments-list expanded))
+                          expanded)
+                        out)
                (loop end)))
             ;; Backtick command substitution
             ((char=? ch #\`)
@@ -517,7 +537,10 @@
             ;; glob chars so $pat where pat='[ab]*' works as a glob pattern
             ((char=? ch #\$)
              (let-values (((expanded end) (expand-dollar str i env)))
-               (display expanded out)
+               (display (if (modifier-segments? expanded)
+                          (segments->string (modifier-segments-list expanded))
+                          expanded)
+                        out)
                (loop end)))
             ;; Backtick command substitution — expanded text is literal
             ((char=? ch #\`)
@@ -1009,23 +1032,31 @@
   (case modifier
     ;; ${name:-word} — default if unset or null
     ((:-) (if (or (not val) (string=? val ""))
-            (expand-string arg env)
+            (if (*in-dquote-context*)
+              (expand-string arg env)
+              (make-modifier-segments (expand-string-segments arg env)))
             val))
     ;; ${name-word} — default if unset
     ((-) (if (not val)
-           (expand-string arg env)
+           (if (*in-dquote-context*)
+             (expand-string arg env)
+             (make-modifier-segments (expand-string-segments arg env)))
            val))
     ;; ${name:=word} — assign default if unset or null
     ((:=) (if (or (not val) (string=? val ""))
             (let ((default (expand-string arg env)))
               (env-set! env name default)
-              default)
+              (if (*in-dquote-context*)
+                default
+                (make-modifier-segments (expand-string-segments arg env))))
             val))
     ;; ${name=word} — assign default if unset
     ((=) (if (not val)
            (let ((default (expand-string arg env)))
              (env-set! env name default)
-             default)
+             (if (*in-dquote-context*)
+               default
+               (make-modifier-segments (expand-string-segments arg env))))
            val))
     ;; ${name:?word} — error if unset or null
     ((:?) (if (or (not val) (string=? val ""))
@@ -1037,10 +1068,16 @@
            val))
     ;; ${name:+word} — alternate if set and non-null
     ((:+) (if (and val (not (string=? val "")))
-            (expand-string arg env)
+            (if (*in-dquote-context*)
+              (expand-string arg env)
+              (make-modifier-segments (expand-string-segments arg env)))
             ""))
     ;; ${name+word} — alternate if set
-    ((+) (if val (expand-string arg env) ""))
+    ((+) (if val
+           (if (*in-dquote-context*)
+             (expand-string arg env)
+             (make-modifier-segments (expand-string-segments arg env)))
+           ""))
     ;; ${name%pattern} — remove shortest suffix
     ((%) (if val (remove-suffix val (expand-pattern arg env) #f (env-shopt? env "extglob")) ""))
     ;; ${name%%pattern} — remove longest suffix
@@ -1647,7 +1684,10 @@
          (let-values (((expanded end)
                        (parameterize ((*in-dquote-context* #t))
                          (expand-dollar str j env))))
-           (display expanded buf)
+           (display (if (modifier-segments? expanded)
+                      (segments->string (modifier-segments-list expanded))
+                      expanded)
+                    buf)
            (loop end)))
         ((char=? (string-ref str j) #\`)
          (let-values (((expanded end) (expand-backtick str j env #t)))
@@ -1668,6 +1708,19 @@
         ((char=? (string-ref str i) #\})
          (if (= depth 1) i (loop (+ i 1) (- depth 1))))
         ((char=? (string-ref str i) #\\) (loop (+ i 2) depth))
+        ;; Skip single-quoted regions
+        ((char=? (string-ref str i) #\')
+         (let sq ((j (+ i 1)))
+           (cond ((>= j len) (loop j depth))
+                 ((char=? (string-ref str j) #\') (loop (+ j 1) depth))
+                 (else (sq (+ j 1))))))
+        ;; Skip double-quoted regions
+        ((char=? (string-ref str i) #\")
+         (let dq ((j (+ i 1)))
+           (cond ((>= j len) (loop j depth))
+                 ((char=? (string-ref str j) #\\) (dq (+ j 2)))
+                 ((char=? (string-ref str j) #\") (loop (+ j 1) depth))
+                 (else (dq (+ j 1))))))
         (else (loop (+ i 1) depth))))))
 
 (def (find-matching-paren str start)
@@ -2017,7 +2070,11 @@
       ;; Numeric range
       ((and start-num end-num)
        (let* (;; Bash uses absolute value of step, direction from start/end
-              (raw-step (or step-num (if (< end-num start-num) -1 1)))
+              ;; Step 0 is treated as default (step 1 in natural direction)
+              (raw-step (or (and step-num (if (= step-num 0)
+                                            (if (<= start-num end-num) 1 -1)
+                                            step-num))
+                            (if (< end-num start-num) -1 1)))
               (step (if (<= start-num end-num) (abs raw-step) (- (abs raw-step))))
               ;; Zero-padding: if either has leading zeros, pad to max width
               (pad-width (max (string-length start-str) (string-length end-str)))
@@ -2026,7 +2083,7 @@
                               (and (> (string-length end-str) 1)
                                    (char=? (string-ref end-str 0) #\0)))))
          (cond
-           ((= step 0) #f)
+           ((= step 0) #f) ;; shouldn't happen now, but safety guard
            (else
             (let loop ((i start-num) (result []))
               (if (if (> step 0) (> i end-num) (< i end-num))
@@ -2046,11 +2103,15 @@
        (let* ((start-ch (char->integer (string-ref start-str 0)))
               (end-ch (char->integer (string-ref end-str 0)))
               ;; Bash uses absolute value of step, direction from start/end
-              (raw-step (or (and step-num (inexact->exact step-num))
+              ;; Step 0 is treated as default (step 1 in natural direction)
+              (raw-step (or (and step-num (let ((s (inexact->exact step-num)))
+                                           (if (= s 0)
+                                             (if (<= start-ch end-ch) 1 -1)
+                                             s)))
                             (if (<= start-ch end-ch) 1 -1)))
               (step (if (<= start-ch end-ch) (abs raw-step) (- (abs raw-step)))))
          (cond
-           ((= step 0) #f)
+           ((= step 0) #f) ;; safety guard
            (else
             (let loop ((i start-ch) (result []))
               (if (if (> step 0) (> i end-ch) (< i end-ch))

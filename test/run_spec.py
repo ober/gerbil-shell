@@ -95,9 +95,10 @@ def parse_test_file(path):
                     _kind = m.group(1)
                     shells = m.group(3).split('/')
                     rest = m.group(4).strip()
-                    # Only use OK-bash overrides (bash alternative acceptable behavior)
-                    # Skip N-I (not implemented) and BUG (bash has a bug)
-                    if _kind == 'OK' and 'bash' in shells:
+                    # Use OK-bash overrides (bash alternative acceptable behavior)
+                    # and BUG-bash overrides (bash behavior labeled "bug" by oil-shell)
+                    # Since gsh targets bash compat, we match bash in both cases
+                    if _kind in ('OK', 'BUG') and 'bash' in shells:
                         # Parse the override value
                         if rest.startswith('status: '):
                             current.setdefault('bash_status', int(rest[8:].strip()))
