@@ -1217,20 +1217,36 @@
     ((prefix-short) (if val (remove-prefix val (expand-pattern arg env) #f (env-shopt? env "extglob")) ""))
     ;; ${name##pattern} — remove longest prefix
     ((prefix-long) (if val (remove-prefix val (expand-pattern arg env) #t (env-shopt? env "extglob")) ""))
-    ;; ${name^^} — uppercase all
-    ((^^) (if val (string-upcase val) ""))
-    ;; ${name^} — uppercase first
+    ;; ${name^^pattern} — uppercase all (matching pattern, or all if no pattern)
+    ((^^) (if val
+            (if (string=? arg "")
+              (string-upcase val)
+              (let ((pat (expand-pattern arg env)))
+                (case-convert-matching val pat char-upcase #t (env-shopt? env "extglob"))))
+            ""))
+    ;; ${name^pattern} — uppercase first (matching pattern, or first if no pattern)
     ((^) (if (and val (> (string-length val) 0))
-           (string-append (string (char-upcase (string-ref val 0)))
-                          (substring val 1 (string-length val)))
+           (if (string=? arg "")
+             (string-append (string (char-upcase (string-ref val 0)))
+                            (substring val 1 (string-length val)))
+             (let ((pat (expand-pattern arg env)))
+               (case-convert-matching val pat char-upcase #f (env-shopt? env "extglob"))))
            (or val "")))
-    ;; ${name,,} — lowercase all
-    ((lc-all) (if val (string-downcase val) ""))
-    ;; ${name,} — lowercase first
+    ;; ${name,,pattern} — lowercase all (matching pattern, or all if no pattern)
+    ((lc-all) (if val
+                (if (string=? arg "")
+                  (string-downcase val)
+                  (let ((pat (expand-pattern arg env)))
+                    (case-convert-matching val pat char-downcase #t (env-shopt? env "extglob"))))
+                ""))
+    ;; ${name,pattern} — lowercase first (matching pattern, or first if no pattern)
     ((lc-first) (if (and val (> (string-length val) 0))
-           (string-append (string (char-downcase (string-ref val 0)))
-                          (substring val 1 (string-length val)))
-           (or val "")))
+                  (if (string=? arg "")
+                    (string-append (string (char-downcase (string-ref val 0)))
+                                  (substring val 1 (string-length val)))
+                    (let ((pat (expand-pattern arg env)))
+                      (case-convert-matching val pat char-downcase #f (env-shopt? env "extglob"))))
+                  (or val "")))
     ;; ${name:offset} or ${name:offset:length} — substring expansion
     ((:) (cond
            ;; Special: ${@:offset} / ${*:offset} — positional param list slicing
@@ -2008,6 +2024,23 @@
         (else (loop (+ i 1) paren-depth))))))
 
 ;;; --- Pattern matching helpers ---
+
+;; Convert characters matching a glob pattern. If all? is #t, convert all
+;; matching chars; if #f, only the first.
+(def (case-convert-matching val pattern convert-fn all? (extglob? #f))
+  (let* ((len (string-length val))
+         (buf (open-output-string)))
+    (let loop ((i 0) (converted? #f))
+      (if (>= i len)
+        (get-output-string buf)
+        (let* ((ch (string-ref val i))
+               (ch-str (string ch))
+               (matches? (glob-match? pattern ch-str #f extglob?)))
+          (if (and matches? (or all? (not converted?)))
+            (begin (display (convert-fn ch) buf)
+                   (loop (+ i 1) #t))
+            (begin (display ch buf)
+                   (loop (+ i 1) converted?))))))))
 
 (def (remove-suffix val pattern longest? (extglob? #f))
   ;; Remove suffix matching pattern

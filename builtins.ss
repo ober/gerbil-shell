@@ -1782,23 +1782,27 @@
 ;; local [-n] [-i] [-r] [-x] var[=value] ...
 (builtin-register! "local"
   (lambda (args env)
-    (let loop ((args args) (nameref? #f) (integer? #f) (readonly? #f) (export? #f))
+    (let loop ((args args) (nameref? #f) (integer? #f) (readonly? #f) (export? #f)
+               (array? #f) (assoc? #f))
       (cond
         ((null? args) 0)
         ;; Parse flag arguments
         ((and (> (string-length (car args)) 1)
               (char=? (string-ref (car args) 0) #\-)
               (char-alphabetic? (string-ref (car args) 1)))
-         (let floop ((i 1) (nr? nameref?) (int? integer?) (ro? readonly?) (ex? export?))
+         (let floop ((i 1) (nr? nameref?) (int? integer?) (ro? readonly?) (ex? export?)
+                     (ar? array?) (as? assoc?))
            (if (>= i (string-length (car args)))
-             (loop (cdr args) nr? int? ro? ex?)
+             (loop (cdr args) nr? int? ro? ex? ar? as?)
              (let ((ch (string-ref (car args) i)))
                (case ch
-                 ((#\n) (floop (+ i 1) #t int? ro? ex?))
-                 ((#\i) (floop (+ i 1) nr? #t ro? ex?))
-                 ((#\r) (floop (+ i 1) nr? int? #t ex?))
-                 ((#\x) (floop (+ i 1) nr? int? ro? #t))
-                 (else (floop (+ i 1) nr? int? ro? ex?)))))))
+                 ((#\n) (floop (+ i 1) #t int? ro? ex? ar? as?))
+                 ((#\i) (floop (+ i 1) nr? #t ro? ex? ar? as?))
+                 ((#\r) (floop (+ i 1) nr? int? #t ex? ar? as?))
+                 ((#\x) (floop (+ i 1) nr? int? ro? #t ar? as?))
+                 ((#\a) (floop (+ i 1) nr? int? ro? ex? #t as?))
+                 ((#\A) (floop (+ i 1) nr? int? ro? ex? ar? #t))
+                 (else (floop (+ i 1) nr? int? ro? ex? ar? as?)))))))
         (else
          ;; Process name or name=value arguments
          ;; Honor allexport: auto-export when set -a is active
@@ -1810,12 +1814,62 @@
                   ;; Args already expanded by expand-declaration-args (no re-expansion)
                   (let* ((name (substring arg 0 eq-pos))
                          (value (substring arg (+ eq-pos 1) (string-length arg))))
-                    (hash-put! (shell-environment-vars env) name
-                               (make-shell-var value effective-export? readonly? #t
-                                              integer? #f #f nameref? #f #f)))
+                    ;; Check for compound array: value starts with (
+                    (if (and (> (string-length value) 0)
+                             (char=? (string-ref value 0) #\())
+                      ;; Compound array assignment
+                      (let* ((inner (if (and (> (string-length value) 1)
+                                             (char=? (string-ref value (- (string-length value) 1)) #\)))
+                                      (substring value 1 (- (string-length value) 1))
+                                      (substring value 1 (string-length value))))
+                             (tbl (make-hash-table)))
+                        (if assoc?
+                          ;; Associative array
+                          (let ((elems (parse-array-compound-elements inner)))
+                            (for-each
+                             (lambda (elem)
+                               (let ((bracket-start (string-find-char* elem #\[)))
+                                 (if bracket-start
+                                   (let* ((bracket-end (string-find-char-from elem #\] (+ bracket-start 1)))
+                                          (key (substring elem (+ bracket-start 1) (or bracket-end (string-length elem))))
+                                          (eq2 (string-find-char-from elem #\= (or bracket-end 0)))
+                                          (val (if eq2 (substring elem (+ eq2 1) (string-length elem)) "")))
+                                     (hash-put! tbl key val))
+                                   (hash-put! tbl elem ""))))
+                             elems)
+                            (hash-put! (shell-environment-vars env) name
+                                       (make-shell-var tbl effective-export? readonly? #t
+                                                      integer? #f #f nameref? #f #t)))
+                          ;; Indexed array
+                          (let ((elems (parse-array-compound-elements inner)))
+                            (let eloop ((es elems) (idx 0))
+                              (when (pair? es)
+                                (let ((elem (car es)))
+                                  (let ((bracket-start (string-find-char* elem #\[)))
+                                    (if bracket-start
+                                      (let* ((bracket-end (string-find-char-from elem #\] (+ bracket-start 1)))
+                                             (key (or (string->number
+                                                       (substring elem (+ bracket-start 1)
+                                                                  (or bracket-end (string-length elem))))
+                                                      idx))
+                                             (eq2 (string-find-char-from elem #\= (or bracket-end 0)))
+                                             (val (if eq2 (substring elem (+ eq2 1) (string-length elem)) "")))
+                                        (hash-put! tbl key val)
+                                        (eloop (cdr es) (+ key 1)))
+                                      (begin (hash-put! tbl idx elem)
+                                             (eloop (cdr es) (+ idx 1))))))))
+                            (hash-put! (shell-environment-vars env) name
+                                       (make-shell-var tbl effective-export? readonly? #t
+                                                      integer? #f #f nameref? #t #f)))))
+                      ;; Regular scalar assignment
+                      (hash-put! (shell-environment-vars env) name
+                                 (make-shell-var value effective-export? readonly? #t
+                                                integer? #f #f nameref? array? assoc?))))
+                  ;; No value - just declare
                   (hash-put! (shell-environment-vars env) arg
-                             (make-shell-var +unset-sentinel+ effective-export? readonly? #t
-                                            integer? #f #f nameref? #f #f)))))
+                             (make-shell-var (if (or array? assoc?) (make-hash-table) +unset-sentinel+)
+                                            effective-export? readonly? #t
+                                            integer? #f #f nameref? array? assoc?)))))
             args)
            0))))))
 
@@ -1938,17 +1992,11 @@
           ((return-from-declare) status))))
     ;; If -p with no names: print all variables with given attributes
     (when (and print? (null? names))
-      (hash-for-each
-       (lambda (name var)
-         (display-declare-var name var))
-       (shell-environment-vars env))
+      (declare-print-all-vars env flags)
       ((return-from-declare) 0))
     ;; If no flags and no names: print all variables
     (when (and (= (hash-length flags) 0) (null? names) (not print?))
-      (hash-for-each
-       (lambda (name var)
-         (display-declare-var name var))
-       (shell-environment-vars env))
+      (declare-print-all-vars env flags)
       ((return-from-declare) 0))
     ;; Process each name
     (let ((status 0))
@@ -1968,12 +2016,14 @@
                (begin
                  (fprintf (current-error-port) "declare: ~a: not found~n" name)
                  (set! status 1))))
-           ;; Apply attributes
-           (let ((var (or (hash-get (shell-environment-vars env) name)
-                          (let ((new-var (make-shell-var (or value +unset-sentinel+)
-                                                        #f #f #f #f #f #f #f #f #f)))
-                            (hash-put! (shell-environment-vars env) name new-var)
-                            new-var))))
+           ;; Apply attributes — use global scope for -g flag
+           (let* ((target-env (if (hash-get flags 'global)
+                                (env-root env) env))
+                  (var (or (hash-get (shell-environment-vars target-env) name)
+                           (let ((new-var (make-shell-var (or value +unset-sentinel+)
+                                                         #f #f #f #f #f #f #f #f #f)))
+                             (hash-put! (shell-environment-vars target-env) name new-var)
+                             new-var))))
              ;; Set value if provided
              (when value
                ;; Check for compound array assignment: value starts with (
@@ -2083,6 +2133,42 @@
     status)))
 
 ;; Helper: print a variable declaration
+;; Collect all variables from the scope chain, with closer scopes taking priority
+(def (collect-all-vars env)
+  (let ((result (make-hash-table)))
+    (let walk ((e env))
+      (when e
+        ;; Walk parents first so closer scopes override
+        (walk (shell-environment-parent e))
+        (hash-for-each
+         (lambda (name var)
+           (hash-put! result name var))
+         (shell-environment-vars e))))
+    result))
+
+;; Print all variables matching flags criteria from entire scope chain
+(def (declare-print-all-vars env flags)
+  (let* ((all-vars (collect-all-vars env))
+         (filter-export (hash-get flags 'export))
+         (filter-readonly (hash-get flags 'readonly))
+         (filter-nameref (hash-get flags 'nameref))
+         (filter-array (hash-get flags 'array))
+         (filter-assoc (hash-get flags 'assoc))
+         (names (sort! (hash-keys all-vars) string<?)))
+    (for-each
+     (lambda (name)
+       (let ((var (hash-get all-vars name)))
+         (when (and var
+                    (not (eq? (shell-var-value var) +unset-sentinel+))
+                    ;; Apply attribute filters
+                    (or (not filter-export) (shell-var-exported? var))
+                    (or (not filter-readonly) (shell-var-readonly? var))
+                    (or (not filter-nameref) (shell-var-nameref? var))
+                    (or (not filter-array) (shell-var-array? var))
+                    (or (not filter-assoc) (shell-var-assoc? var)))
+           (display-declare-var name var))))
+     names)))
+
 (def (display-declare-var name var)
   (let ((flags (string-append
                 (if (shell-var-assoc? var) "A" "")

@@ -348,11 +348,42 @@
             (let suffix-loop ()
               (let ((tok (parser-peek ps)))
                 (cond
+                  ;; ASSIGNMENT_WORD as argument to builtins like
+                  ;; local, export, readonly, declare
+                  ;; Check for compound array: NAME=( ... )
+                  ((and (token? tok)
+                        (eq? (token-type tok) 'ASSIGNMENT_WORD))
+                   (let* ((t (parser-next! ps))
+                          (asgn (parse-assignment-token t)))
+                     (if (and (string=? (assignment-value asgn) "")
+                              (not (assignment-index asgn))
+                              (parser-check? ps 'LPAREN))
+                       ;; Compound array assignment in suffix: arr=(val1 val2 ...)
+                       ;; Encode as a string "name=(v1 v2 ...)" for declare to parse
+                       (begin
+                         (parser-consume! ps) ;; skip (
+                         (let ((values (parse-compound-array-values ps)))
+                           (let* ((val-strs (map (lambda (v)
+                                                   (if (string? v) v ""))
+                                                 values))
+                                  (compound-str
+                                   (string-append
+                                    (assignment-name asgn) "=("
+                                    (let loop ((vs val-strs) (acc ""))
+                                      (if (null? vs) acc
+                                          (loop (cdr vs)
+                                                (if (string=? acc "")
+                                                  (car vs)
+                                                  (string-append acc " " (car vs))))))
+                                    ")")))
+                             (set! words (cons compound-str words))
+                             (suffix-loop))))
+                       ;; Regular assignment word
+                       (begin
+                         (set! words (cons (token-value t) words))
+                         (suffix-loop)))))
                   ((and (token? tok)
                         (or (eq? (token-type tok) 'WORD)
-                            ;; ASSIGNMENT_WORD as argument to builtins like
-                            ;; local, export, readonly, declare
-                            (eq? (token-type tok) 'ASSIGNMENT_WORD)
                             ;; BANG (!) as argument — only special at pipeline
                             ;; start, not inside command arguments like [ ! -z x ]
                             (eq? (token-type tok) 'BANG)))
