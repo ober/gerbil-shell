@@ -267,7 +267,7 @@
   (let loop ((pats patterns))
     (if (null? pats)
       #f
-      (let ((pat (expand-word-nosplit (car pats) env)))
+      (let ((pat (expand-word-as-pattern (car pats) env)))
         (if (or (string=? pat "*")
                 (glob-match? pat word #f (env-shopt? env "extglob")))
           #t

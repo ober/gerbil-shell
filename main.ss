@@ -89,6 +89,8 @@
   (*execute-input* (lambda (input env) (execute-input input env)))
   ;; Set the arithmetic evaluation callback for integer variable attributes
   (*arith-eval-fn* arith-eval)
+  ;; Set the execute-external callback for 'command' builtin
+  (*execute-external-fn* execute-external)
 
   ;; source / . — source a file into the current environment
   (let ((source-handler

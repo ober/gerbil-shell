@@ -456,8 +456,11 @@
       (error "lexer: empty word")
       ;; Classify the token
       (cond
-        ;; IO_NUMBER: all digits and next char is < or >
-        ((and (all-digits? word)
+        ;; IO_NUMBER: single digit (0-9) and next char is < or >
+        ;; Bash only treats single-digit fds as IO_NUMBERs;
+        ;; multi-digit numbers like 99 or 100 are treated as words
+        ((and (= (string-length word) 1)
+              (char-numeric? (string-ref word 0))
               (not (at-end? (current-lexer)))
               (let ((ch (current-char (current-lexer))))
                 (or (char=? ch #\<) (char=? ch #\>))))

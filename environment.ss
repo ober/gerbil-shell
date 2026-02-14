@@ -713,6 +713,8 @@
 (def (env-array-append-compound! env name values)
   (let* ((name (resolve-nameref name env))
          (var (find-var-in-chain env name)))
+    (when (and var (shell-var-readonly? var))
+      (error (format "~a: readonly variable" name)))
     (if (and var (or (shell-var-array? var) (shell-var-assoc? var)))
       (let* ((tbl (shell-var-value var))
              (assoc? (shell-var-assoc? var))

@@ -26,8 +26,12 @@
       127)
     (with-catch
      (lambda (e)
-       (fprintf (current-error-port) "gsh: ~a: ~a~n" filename (exception-message e))
-       1)
+       (cond
+         ((break-exception? e) 0)
+         ((continue-exception? e) 0)
+         (else
+          (fprintf (current-error-port) "gsh: ~a: ~a~n" filename (exception-message e))
+          1)))
      (lambda ()
        (let* ((content (read-file-to-string filename))
               ;; Strip shebang if present
@@ -52,8 +56,18 @@
       1)
     (with-catch
      (lambda (e)
-       (fprintf (current-error-port) "gsh: ~a: ~a~n" filename (exception-message e))
-       1)
+       (cond
+         ;; break/continue must propagate to caller's loop
+         ((break-exception? e) (raise e))
+         ((continue-exception? e) (raise e))
+         ;; return exits the sourced file, not the calling function
+         ((return-exception? e) (return-exception-status e))
+         ((errexit-exception? e) (raise e))
+         ((subshell-exit-exception? e) (raise e))
+         ((nounset-exception? e) (raise e))
+         (else
+          (fprintf (current-error-port) "gsh: ~a: ~a~n" filename (exception-message e))
+          1)))
      (lambda ()
        (let* ((content (read-file-to-string filename))
               (script-content (strip-shebang content)))
@@ -86,8 +100,8 @@
                        ((nounset-exception? e) (raise e))
                        ((errexit-exception? e)
                         (errexit-exception-status e))
-                       ((break-exception? e) 0)
-                       ((continue-exception? e) 0)
+                       ((break-exception? e) (raise e))
+                       ((continue-exception? e) (raise e))
                        ((subshell-exit-exception? e) (raise e))
                        ((return-exception? e) (raise e))
                        (else

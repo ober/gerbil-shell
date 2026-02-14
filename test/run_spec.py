@@ -17,7 +17,7 @@ def parse_test_file(path):
     tests = []
     current = None
 
-    with open(path) as f:
+    with open(path, encoding='utf-8', errors='surrogateescape') as f:
         lines = f.readlines()
 
     i = 0
@@ -180,12 +180,14 @@ def run_test(test, shell, spec_dir):
             result = subprocess.run(
                 [shell, '-c', code],
                 capture_output=True,
-                text=True,
                 timeout=10,
                 env=env,
                 cwd=tmpdir,
             )
-            return (result.stdout, result.stderr, result.returncode)
+            # Decode without universal newlines to preserve \r
+            stdout = result.stdout.decode('utf-8', errors='surrogateescape')
+            stderr = result.stderr.decode('utf-8', errors='surrogateescape')
+            return (stdout, stderr, result.returncode)
         except subprocess.TimeoutExpired:
             return ('', 'TIMEOUT', -1)
         except Exception as e:

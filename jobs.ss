@@ -95,33 +95,45 @@
           (find (lambda (j)
                   (string-contains-substr? (job-command-text j) substr))
                 *job-table*)))
-       ;; Plain number = look up by PID
+       ;; Plain number = look up by PID (check pgid and individual process PIDs)
        ((string->number spec)
         => (lambda (pid)
-             (find (lambda (j) (= (job-pgid j) pid)) *job-table*)))
+             (or (find (lambda (j) (= (job-pgid j) pid)) *job-table*)
+                 (find (lambda (j)
+                         (any (lambda (p) (= (job-process-pid p) pid))
+                              (job-processes j)))
+                       *job-table*))))
        (else #f)))
     (else #f)))
 
 ;;; --- Job status management ---
 
-;; Update status of all jobs by polling with waitpid
+;; Update status of all jobs by polling with waitpid (or checking thread state)
 (def (job-update-status!)
   (for-each
    (lambda (job)
      (for-each
       (lambda (proc)
         (when (eq? (job-process-status proc) 'running)
-          (let ((result (ffi-waitpid-pid (job-process-pid proc)
-                                          (bitwise-ior WNOHANG WUNTRACED))))
-            (when (> result 0)
-              (let ((raw-status (ffi-waitpid-status)))
-                (cond
-                  ((WIFEXITED raw-status)
-                   (set! (job-process-status proc) 'exited))
-                  ((WIFSIGNALED raw-status)
-                   (set! (job-process-status proc) 'signaled))
-                  ((WIFSTOPPED raw-status)
-                   (set! (job-process-status proc) 'stopped))))))))
+          (let ((port (job-process-port proc)))
+            (if (and port (thread? port))
+              ;; Thread-based job: check if thread has terminated
+              (let ((state (thread-state port)))
+                (when (or (thread-state-normally-terminated? state)
+                          (thread-state-abnormally-terminated? state))
+                  (set! (job-process-status proc) 'exited)))
+              ;; Process-based job: poll with waitpid
+              (let ((result (ffi-waitpid-pid (job-process-pid proc)
+                                              (bitwise-ior WNOHANG WUNTRACED))))
+                (when (> result 0)
+                  (let ((raw-status (ffi-waitpid-status)))
+                    (cond
+                      ((WIFEXITED raw-status)
+                       (set! (job-process-status proc) 'exited))
+                      ((WIFSIGNALED raw-status)
+                       (set! (job-process-status proc) 'signaled))
+                      ((WIFSTOPPED raw-status)
+                       (set! (job-process-status proc) 'stopped))))))))))
       (job-processes job))
      ;; Update overall job status
      (let ((procs (job-processes job)))
@@ -196,24 +208,31 @@
 ;; Wait for a specific job to complete
 ;; Returns exit status of last process
 (def (job-wait job)
-  (let ((last-raw-status 0))
+  (let ((last-exit-code 0))
     (for-each
      (lambda (proc)
        (when (eq? (job-process-status proc) 'running)
          (let ((port (job-process-port proc)))
            (when port
-             (let ((raw (with-catch (lambda (e) 0)
-                          (lambda () (process-status port)))))
-               ;; process-status blocks until exit, so mark directly
-               ;; (ffi-waitpid won't find it — Gambit already reaped it)
-               (set! last-raw-status raw)
-               (cond
-                 ((WIFEXITED raw)
-                  (set! (job-process-status proc) 'exited))
-                 ((WIFSIGNALED raw)
-                  (set! (job-process-status proc) 'signaled))
-                 (else
-                  (set! (job-process-status proc) 'exited))))))))
+             (if (thread? port)
+               ;; Thread-based job (builtin/function/compound command)
+               (let ((result (with-catch (lambda (e) 1)
+                               (lambda () (thread-join! port)))))
+                 (set! last-exit-code (if (integer? result) result 0))
+                 (set! (job-process-status proc) 'exited))
+               ;; Process-based job (external command)
+               (let ((raw (with-catch (lambda (e) 0)
+                            (lambda () (process-status port)))))
+                 ;; process-status blocks until exit, so mark directly
+                 ;; (ffi-waitpid won't find it — Gambit already reaped it)
+                 (set! last-exit-code (status->exit-code raw))
+                 (cond
+                   ((WIFEXITED raw)
+                    (set! (job-process-status proc) 'exited))
+                   ((WIFSIGNALED raw)
+                    (set! (job-process-status proc) 'signaled))
+                   (else
+                    (set! (job-process-status proc) 'exited)))))))))
      (job-processes job))
     ;; Update overall job status
     (let ((procs (job-processes job)))
@@ -224,9 +243,8 @@
              'done 'killed)))
         ((any (lambda (p) (eq? (job-process-status p) 'stopped)) procs)
          (set! (job-status job) 'stopped))))
-    ;; Return exit status from last process
-    (let ((raw last-raw-status))
-      (if (WIFEXITED raw) (WEXITSTATUS raw) (+ 128 (WTERMSIG raw))))))
+    ;; Return exit status
+    last-exit-code))
 
 ;; Bring a job to the foreground
 (def (job-foreground! job)
@@ -249,10 +267,15 @@
          (pid (job-process-pid last-proc))
          (port (job-process-port last-proc)))
     (let-values (((exit-code stopped?)
-                  (if port
-                    (wait-for-foreground-process pid port)
-                    ;; Thread-based job (no port) — use job-wait fallback
-                    (values (job-wait job) #f))))
+                  (cond
+                    ((and port (thread? port))
+                     ;; Thread-based job — use job-wait
+                     (values (job-wait job) #f))
+                    (port
+                     (wait-for-foreground-process pid port))
+                    (else
+                     ;; No port — use job-wait fallback
+                     (values (job-wait job) #f)))))
       ;; Restore shell as foreground
       (with-catch (lambda (e) #!void)
         (lambda ()

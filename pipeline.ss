@@ -15,13 +15,16 @@
         :gsh/expander
         :gsh/redirect
         :gsh/builtins
+        :gsh/functions
         :gsh/util)
 
 ;;; --- Public interface ---
 
 (def (execute-pipeline commands env execute-fn (pipe-types #f))
   (if (= (length commands) 1)
-    (execute-fn (car commands) env)
+    (let ((status (execute-fn (car commands) env)))
+      ;; Return list of exit codes for PIPESTATUS
+      [status])
     (execute-piped-commands commands env execute-fn
                             (or pipe-types (make-list (- (length commands) 1) 'PIPE)))))
 
@@ -115,7 +118,8 @@
       (let ((exit-codes (wait-for-all procs)))
         ;; Clean up any process substitution FIFOs
         (run-procsub-cleanups!)
-        (if (null? exit-codes) 0 (last-elem exit-codes))))))))
+        ;; Return the full list of exit codes (caller sets PIPESTATUS)
+        exit-codes))))))
 
 (def (make-pipes n)
   (let loop ((i 0) (pipes []))
@@ -166,6 +170,7 @@
 
 ;; Launch a builtin/function in a thread.
 ;; Create Gambit character ports wrapping current real fds 0/1.
+;; Each pipeline component runs as a subshell (exit only exits the component).
 (def (launch-thread-piped cmd env execute-fn has-pipe-in? has-pipe-out?)
   (let* ((exit-box (box 0))
          ;; Dup the current real fds so the thread has its own copy
@@ -183,8 +188,18 @@
                                   (string-append "/dev/fd/" (number->string thread-out-fd)))
                                  (current-output-port))))
                   (parameterize ((current-input-port in-port)
-                                 (current-output-port out-port))
-                    (let ((status (execute-fn cmd env)))
+                                 (current-output-port out-port)
+                                 (*in-subshell* #t))
+                    (let ((status (with-catch
+                                   (lambda (e)
+                                     (cond
+                                       ((subshell-exit-exception? e)
+                                        (subshell-exit-exception-status e))
+                                       ((errexit-exception? e)
+                                        (errexit-exception-status e))
+                                       (else (raise e))))
+                                   (lambda ()
+                                     (execute-fn cmd env)))))
                       (set-box! exit-box status)
                       (when thread-out-fd
                         (force-output out-port)
@@ -205,8 +220,17 @@
           (close-port proc)
           (status->exit-code raw-status)))
        ((and (list? proc) (eq? (car proc) 'thread))
-        (thread-join! (cadr proc))
-        (unbox (caddr proc)))
+        ;; Catch exceptions from pipeline threads (e.g. subshell-exit-exception
+        ;; from 'exit N' in a brace group) and use the exit code from the box
+        (with-catch
+         (lambda (e)
+           (cond
+             ((subshell-exit-exception? e) (subshell-exit-exception-status e))
+             ((errexit-exception? e) (errexit-exception-status e))
+             (else (unbox (caddr proc)))))
+         (lambda ()
+           (thread-join! (cadr proc))
+           (unbox (caddr proc)))))
        (else 0)))
    procs))
 

@@ -51,12 +51,11 @@
                  (loop (cons (cons 'sequential next) items))
                  (if (= (length items) 1) (cdar items)
                      (make-command-list (reverse items))))))
-            ;; Ampersand — background
+            ;; Ampersand — background (always wrap in command-list to preserve mode)
             ((parser-check? ps 'AMP)
              (parser-consume! ps)
              (let ((updated (cons (cons 'background (cdar items)) (cdr items))))
-               (if (= (length updated) 1) (cdar updated)
-                   (make-command-list (reverse updated)))))
+               (make-command-list (reverse updated))))
             ;; Newline — stop, let caller execute before parsing next line
             ((parser-check? ps 'NEWLINE)
              (parser-consume! ps)
@@ -716,14 +715,23 @@
   (let* ((init-expr (read-arith-until-semi ps))
          (test-expr (read-arith-until-semi ps))
          (update-expr (read-arith-until-close ps)))
-    ;; Skip optional ; or newlines before do
+    ;; Skip optional ; or newlines before do or {
     (when (parser-check? ps 'SEMI) (parser-consume! ps))
     (skip-newlines! ps)
-    (parser-expect-word! ps "do")
-    (let ((body (parse-list ps)))
-      (skip-newlines! ps)
-      (parser-expect-word! ps "done")
-      (make-arith-for-command init-expr test-expr update-expr body))))
+    ;; Accept both do..done and { .. } syntax
+    (if (parser-check-word? ps "{")
+      (begin
+        (parser-consume! ps)  ;; skip {
+        (let ((body (parse-list ps)))
+          (skip-newlines! ps)
+          (parser-expect-word! ps "}")  ;; expect }
+          (make-arith-for-command init-expr test-expr update-expr body)))
+      (begin
+        (parser-expect-word! ps "do")
+        (let ((body (parse-list ps)))
+          (skip-newlines! ps)
+          (parser-expect-word! ps "done")
+          (make-arith-for-command init-expr test-expr update-expr body))))))
 
 ;; Read raw characters from lexer input, bypassing shell tokenization.
 ;; Arithmetic expressions contain <, >, |, & which the shell lexer

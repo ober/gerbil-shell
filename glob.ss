@@ -156,14 +156,34 @@
                    (display "[^/]*" rx)  ;; * matches anything except /
                    (loop (+ i 1) #f))
                  (begin
-                   (display ".*" rx)  ;; * matches any character (for [[ ]])
+                   (display "[\\s\\S]*" rx)  ;; * matches any char including newline
                    (loop (+ i 1) #f)))))
             ((char=? ch #\?)
-             (display (if path-mode? "[^/]" ".") rx)
+             ;; In path mode, ? matches any char except /
+             ;; In non-path mode (strip, [[ ]]), ? matches any char including newline
+             (display (if path-mode? "[^/]" "[\\s\\S]") rx)
              (loop (+ i 1) #f))
             ((char=? ch #\[)
-             (display "[" rx)
-             (loop (+ i 1) #t))
+             ;; Check if there's a closing ] for this bracket expression
+             ;; In glob syntax, ] right after [ (or [! / [^) is literal
+             (let* ((start (+ i 1))
+                    (skip (cond ((>= start (string-length pattern)) 0)
+                                ((char=? (string-ref pattern start) #\!) (+ 1 (if (and (< (+ start 1) (string-length pattern))
+                                                                                        (char=? (string-ref pattern (+ start 1)) #\]))
+                                                                                    1 0)))
+                                ((char=? (string-ref pattern start) #\^) (+ 1 (if (and (< (+ start 1) (string-length pattern))
+                                                                                        (char=? (string-ref pattern (+ start 1)) #\]))
+                                                                                    1 0)))
+                                ((char=? (string-ref pattern start) #\]) 1)
+                                (else 0)))
+                    (has-close? (let find ((j (+ start skip)))
+                                  (cond ((>= j (string-length pattern)) #f)
+                                        ((char=? (string-ref pattern j) #\]) #t)
+                                        (else (find (+ j 1)))))))
+               (if has-close?
+                 (begin (display "[" rx) (loop (+ i 1) #t))
+                 ;; No closing ] — treat [ as literal
+                 (begin (display "\\[" rx) (loop (+ i 1) #f)))))
             ;; Regex special chars that need escaping
             (else
              (display (pregexp-quote-char ch) rx)

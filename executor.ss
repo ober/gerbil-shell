@@ -84,7 +84,7 @@
            (env-array-set! env name expanded-index val))))
       ;; Scalar assignment (existing behavior)
       (else
-       (let ((val (expand-word-nosplit raw-value env)))
+       (let ((val (expand-assignment-value raw-value env)))
          (if (eq? op '+=)
            (let ((old (or (env-get env name) "")))
              (env-set! env name (string-append old val)))
@@ -144,7 +144,15 @@
                              (if (and (pair? e) (eq? (car e) 'failglob))
                                #f
                                (raise e)))
-                           (lambda () (expand-words raw-words env))))
+                           (lambda ()
+                             ;; For declaration builtins, expand assignment args without splitting
+                             (let ((first-word (if (pair? raw-words)
+                                                 (expand-word-nosplit (car raw-words) env)
+                                                 #f)))
+                               (if (and first-word (declaration-builtin? first-word))
+                                 (cons first-word
+                                       (expand-declaration-args (cdr raw-words) env))
+                                 (expand-words raw-words env))))))
                 (cmd-name (if (and expanded (pair? expanded)) (car expanded) #f))
                 (args (if (and expanded (pair? expanded)) (cdr expanded) [])))
            (if (not expanded)
@@ -214,12 +222,48 @@
                                 ;; Restore redirections
                                 (restore-redirections saved)
                                 result)))))))
-                 ;; Set last status
+                 ;; Set last status and PIPESTATUS
                  (env-set-last-status! env status)
+                 (env-array-set-compound! env "PIPESTATUS"
+                                          [(number->string status)] #f)
                  ;; Check errexit
                  (check-errexit! env status)
                  status)))))
          (run-procsub-cleanups!))))))
+
+;; Check if a string contains a character (executor-local helper)
+(def (has-equals-sign? str)
+  (let ((len (string-length str)))
+    (let loop ((i 0))
+      (cond ((>= i len) #f)
+            ((char=? (string-ref str i) #\=) #t)
+            (else (loop (+ i 1)))))))
+
+;; Check if a command name is a declaration builtin
+;; (export, declare, typeset, local, readonly)
+;; For these, assignment-like args (containing =) should not be word-split
+(def (declaration-builtin? name)
+  (member name '("export" "declare" "typeset" "local" "readonly")))
+
+;; Expand args for declaration builtins.
+;; Flag args (starting with - or +) and assignment args (containing =)
+;; are expanded without word splitting. Other args are expanded normally.
+(def (expand-declaration-args words env)
+  (append-map
+   (lambda (w)
+     (let ((s (if (string? w) w (expand-word-nosplit w env))))
+       (cond
+         ;; Flag argument - no splitting
+         ((and (string? s) (> (string-length s) 0)
+               (or (char=? (string-ref s 0) #\-)
+                   (char=? (string-ref s 0) #\+)))
+          [(expand-word-nosplit w env)])
+         ;; Assignment argument (contains =) - no splitting or globbing
+         ((and (string? w) (has-equals-sign? w))
+          [(expand-word-nosplit w env)])
+         ;; Regular arg - normal expansion with splitting
+         (else (expand-word w env)))))
+   words))
 
 ;; Check if raw-words contain only literal empty strings ('' or "")
 ;; These should result in "command not found" rather than preserving $?
@@ -282,31 +326,57 @@
 (def (execute-exec args redirections env)
   ;; Apply redirections permanently (don't save/restore)
   (apply-redirections-permanent! redirections env)
+  ;; Parse exec flags: -c (clear env), -l (login), -a name (argv[0])
+  (let parse-flags ((args args) (argv0 #f) (clear-env? #f))
+    (cond
+      ((null? args)
+       ;; No command — redirections persist
+       0)
+      ;; -- stops option processing
+      ((string=? (car args) "--")
+       (exec-command (cdr args) argv0 clear-env? env))
+      ;; -a name
+      ((string=? (car args) "-a")
+       (if (pair? (cdr args))
+         (parse-flags (cddr args) (cadr args) clear-env?)
+         (begin
+           (fprintf (current-error-port) "gsh: exec: -a: option requires an argument~n")
+           1)))
+      ;; -c (clear environment)
+      ((string=? (car args) "-c")
+       (parse-flags (cdr args) argv0 #t))
+      ;; -l (login shell prefix)
+      ((string=? (car args) "-l")
+       (parse-flags (cdr args) (or argv0 'login) clear-env?))
+      ;; Not a flag — it's the command
+      (else
+       (exec-command args argv0 clear-env? env)))))
+
+(def (exec-command args argv0 clear-env? env)
   (if (null? args)
-    ;; No command — redirections persist
     0
-    ;; Has command — replace shell process with it
-    (let ((cmd-name (car args))
-          (cmd-args (cdr args)))
-      (let ((path (which cmd-name)))
-        (if (not path)
-          (begin
-            (fprintf (current-error-port) "gsh: exec: ~a: not found~n" cmd-name)
-            127)
-          ;; Replace shell with external command
-          ;; Use Gambit's open-process and then exit with its status
-          ;; (A true exec would use ffi-execvp but Gambit doesn't let us)
-          (let* ((proc (open-process
-                        [path: path
-                         arguments: cmd-args
-                         environment: (env-exported-alist env)
-                         stdin-redirection: #f
-                         stdout-redirection: #f
-                         stderr-redirection: #f]))
-                 (status (process-status proc)))
-            (close-port proc)
-            (let ((code (status->exit-code status)))
-              (exit code))))))))
+    (let* ((cmd-name (car args))
+           (cmd-args (cdr args))
+           (path (which cmd-name)))
+      (if (not path)
+        (begin
+          (fprintf (current-error-port) "gsh: exec: ~a: not found~n" cmd-name)
+          127)
+        ;; Replace shell with external command
+        ;; Use Gambit's open-process and then exit with its status
+        ;; (A true exec would use ffi-execvp but Gambit doesn't let us)
+        (let* ((env-alist (if clear-env? [] (env-exported-alist env)))
+               (proc (open-process
+                      [path: path
+                       arguments: cmd-args
+                       environment: env-alist
+                       stdin-redirection: #f
+                       stdout-redirection: #f
+                       stderr-redirection: #f]))
+               (status (process-status proc)))
+          (close-port proc)
+          (let ((code (status->exit-code status)))
+            (exit code)))))))
 
 ;;; --- Pipeline execution ---
 
@@ -315,10 +385,14 @@
          (bang? (ast-pipeline-bang? cmd))
          (pipe-types (ast-pipeline-pipe-types cmd))
          ;; ! prefix suppresses errexit
-         (status (if bang?
-                   (parameterize ((*in-condition-context* #t))
-                     (execute-pipeline commands env execute-command pipe-types))
-                   (execute-pipeline commands env execute-command pipe-types))))
+         (exit-codes (if bang?
+                       (parameterize ((*in-condition-context* #t))
+                         (execute-pipeline commands env execute-command pipe-types))
+                       (execute-pipeline commands env execute-command pipe-types)))
+         (status (if (pair? exit-codes) (last-elem exit-codes) 0)))
+    ;; Set PIPESTATUS array
+    (env-array-set-compound! env "PIPESTATUS"
+                             (map number->string exit-codes) #f)
     (let ((final (if bang? (if (= status 0) 1 0) status)))
       (env-set-last-status! env final)
       final)))
@@ -396,9 +470,15 @@
                        ((subshell-exit-exception? e) (subshell-exit-exception-status e))
                        ((errexit-exception? e) (errexit-exception-status e))
                        ((nounset-exception? e) (nounset-exception-status e))
+                       ;; break/continue/return inside subshell must NOT propagate
+                       ;; to parent — they are contained within the subshell
+                       ((break-exception? e) 0)
+                       ((continue-exception? e) 0)
+                       ((return-exception? e) (return-exception-status e))
                        (else (raise e))))
                    (lambda ()
-                     (parameterize ((*in-subshell* #t))
+                     (parameterize ((*in-subshell* #t)
+                                    (*loop-depth* 0))
                        (execute-command (subshell-body cmd) child-env))))))
       ;; Restore parent's working directory
       (current-directory saved-cwd)
@@ -769,30 +849,56 @@
 
 ;;; --- Background execution ---
 
+;; Counter for fake PIDs for thread-based background jobs
+(def *next-fake-pid* 100000)
+(def (next-fake-pid!)
+  (let ((pid *next-fake-pid*))
+    (set! *next-fake-pid* (+ pid 1))
+    pid))
+
 ;; Launch a command in the background.
 ;; Returns (pid . process-list) where process-list is for job-table-add!
 ;; For external commands: launches via open-process, returns real PID
-;; For builtins/functions/compound: launches in a thread, returns 0
+;; For builtins/functions/compound: launches in a thread with fake PID
 (def (launch-background cmd env)
   (if (simple-command? cmd)
     (launch-background-simple cmd env)
-    ;; Compound command: run in thread
-    (begin
-      (spawn (lambda () (execute-command cmd env)))
-      (cons 0 []))))
+    ;; Compound command: run in thread (acts like subshell for exit/variable isolation)
+    (let* ((fake-pid (next-fake-pid!))
+           (child-env (env-clone env))
+           (th (spawn (lambda ()
+                        (with-catch
+                         (lambda (e)
+                           (cond
+                             ((subshell-exit-exception? e) (subshell-exit-exception-status e))
+                             ((errexit-exception? e) (errexit-exception-status e))
+                             (else 1)))
+                         (lambda ()
+                           (parameterize ((*in-subshell* #t))
+                             (execute-command cmd child-env))))))))
+      (cons fake-pid [(cons fake-pid th)]))))
 
 (def (launch-background-simple cmd env)
   (let* ((raw-words (simple-command-words cmd))
-         (redirections (simple-command-redirections cmd))
-         (assignments (simple-command-assignments cmd))
-         (expanded (expand-words raw-words env))
-         (cmd-name (if (pair? expanded) (car expanded) #f))
-         (args (if (pair? expanded) (cdr expanded) [])))
+         ;; Quick peek at first word to decide external vs builtin/function
+         ;; Use raw token value to avoid expansion side effects
+         (first-raw (and (pair? raw-words) (if (token? (car raw-words))
+                                             (token-value (car raw-words))
+                                             (car raw-words))))
+         ;; Only use raw value if it's a simple literal (no $ or ` that need expansion)
+         (cmd-name (and first-raw (string? first-raw)
+                        (not (string-index first-raw #\$))
+                        (not (string-index first-raw #\`))
+                        first-raw)))
     (if (and cmd-name
              (not (function-lookup env cmd-name))
              (not (builtin-lookup cmd-name)))
-      ;; External command: launch without waiting
-      (let ((path (which cmd-name)))
+      ;; External command: launch without waiting via open-process
+      ;; Expand args and set up env in parent (external command forks anyway)
+      (let* ((assignments (simple-command-assignments cmd))
+             (expanded (expand-words raw-words env))
+             (actual-args (if (pair? expanded) (cdr expanded) []))
+             (path (which cmd-name)))
         (if path
           (let* ((temp-env (if (pair? assignments)
                              (let ((child (env-push-scope env)))
@@ -803,25 +909,38 @@
                              env))
                  (proc (open-process
                         [path: path
-                         arguments: args
+                         arguments: actual-args
                          environment: (env-exported-alist temp-env)
                          stdin-redirection: #f
                          stdout-redirection: #f
                          stderr-redirection: #f]))
                  (pid (process-pid proc)))
             ;; Put background process in its own process group
-            ;; so it doesn't receive terminal signals (SIGINT, SIGTSTP)
-            (with-catch (lambda (e) #!void) ;; ignore if setpgid fails (e.g. child already exited)
+            (with-catch (lambda (e) #!void)
               (lambda () (ffi-setpgid pid pid)))
             (cons pid [(cons pid proc)]))
           ;; Command not found — still launch in thread for error message
-          (begin
-            (spawn (lambda () (execute-command cmd env)))
-            (cons 0 []))))
-      ;; Builtin or function: run in thread
-      (begin
-        (spawn (lambda () (execute-command cmd env)))
-        (cons 0 [])))))
+          (let* ((fake-pid (next-fake-pid!))
+                 (child-env (env-clone env))
+                 (th (spawn (lambda ()
+                              (parameterize ((*in-subshell* #t))
+                                (execute-command cmd child-env))))))
+            (cons fake-pid [(cons fake-pid th)]))))
+      ;; Builtin or function: run everything in thread (acts like subshell)
+      ;; Expansion happens in the child so side effects don't leak to parent
+      (let* ((fake-pid (next-fake-pid!))
+             (child-env (env-clone env))
+             (th (spawn (lambda ()
+                          (with-catch
+                           (lambda (e)
+                             (cond
+                               ((subshell-exit-exception? e) (subshell-exit-exception-status e))
+                               ((errexit-exception? e) (errexit-exception-status e))
+                               (else 1)))
+                           (lambda ()
+                             (parameterize ((*in-subshell* #t))
+                               (execute-command cmd child-env))))))))
+        (cons fake-pid [(cons fake-pid th)])))))
 
 ;; Extract command text from an AST for display in job listing
 (def (ast->command-text cmd)

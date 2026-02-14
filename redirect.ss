@@ -142,27 +142,30 @@
          (redirect-fd-to-file! fd target-str
                                (bitwise-ior O_WRONLY O_CREAT O_TRUNC)
                                #o666)
-         (when (or (= fd 1) (= fd 2))
-           (set-port-for-fd! fd target-str 'truncate))
-         save))
+         (if (or (= fd 1) (= fd 2))
+           (let ((new-port (set-port-for-fd! fd target-str 'truncate)))
+             (append save [new-port]))
+           save)))
       ;; >> file — output to file (append)
       ((>>)
        (let ((save (save-fd fd)))
          (redirect-fd-to-file! fd target-str
                                (bitwise-ior O_WRONLY O_CREAT O_APPEND)
                                #o666)
-         (when (or (= fd 1) (= fd 2))
-           (set-port-for-fd! fd target-str 'append))
-         save))
+         (if (or (= fd 1) (= fd 2))
+           (let ((new-port (set-port-for-fd! fd target-str 'append)))
+             (append save [new-port]))
+           save)))
       ;; clobber (>|) — output to file ignoring noclobber
       ((clobber)
        (let ((save (save-fd fd)))
          (redirect-fd-to-file! fd target-str
                                (bitwise-ior O_WRONLY O_CREAT O_TRUNC)
                                #o666)
-         (when (or (= fd 1) (= fd 2))
-           (set-port-for-fd! fd target-str 'truncate))
-         save))
+         (if (or (= fd 1) (= fd 2))
+           (let ((new-port (set-port-for-fd! fd target-str 'truncate)))
+             (append save [new-port]))
+           save)))
       ;; &> file — stdout+stderr to file
       ((&>)
        (let ((save1 (save-fd 1))
@@ -440,14 +443,15 @@
       (ffi-dup2 raw-fd fd)
       (ffi-close-fd raw-fd))))
 
-;; Set Gambit port parameter for an output fd
+;; Set Gambit port parameter for an output fd. Returns the new port.
 (def (set-port-for-fd! fd filename mode)
   (let ((port (case mode
                 ((truncate) (open-output-file [path: filename truncate: #t]))
                 ((append) (open-output-file [path: filename append: #t])))))
     (case fd
       ((1) (current-output-port port))
-      ((2) (current-error-port port)))))
+      ((2) (current-error-port port)))
+    port))
 
 ;; Create a fresh Gambit port for a standard fd (0/1/2) after dup2
 ;; Uses /dev/fd/N so Gambit creates a proper port with write() not sendto()

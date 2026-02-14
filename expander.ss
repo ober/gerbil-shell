@@ -276,6 +276,60 @@
     (expand-string word env)
     word))
 
+;; Expand a word as a glob pattern — quoted glob chars become literal
+(def (expand-word-as-pattern word env)
+  (if (string? word)
+    (expand-pattern word env)
+    word))
+
+;; Expand assignment value: like expand-word-nosplit but also expands ~ after :
+;; In assignment context, tilde expansion occurs at start AND after each unquoted :
+;; But we must not expand tilde inside quotes.
+;; Strategy: split on unquoted : first, expand tilde at start of each segment,
+;; then expand the rest normally, and rejoin with :
+(def (expand-assignment-value word env)
+  (if (string? word)
+    ;; Split on unquoted colons, expand each segment, rejoin
+    (let ((segments (split-assignment-on-colon word)))
+      (string-join
+       (map (lambda (seg) (expand-string seg env)) segments)
+       ":"))
+    word))
+
+;; Split an assignment value on unquoted : characters
+;; Returns list of segments. Respects single and double quoting.
+(def (split-assignment-on-colon str)
+  (let ((len (string-length str))
+        (out (open-output-string))
+        (result []))
+    (let loop ((i 0) (in-sq? #f) (in-dq? #f))
+      (if (>= i len)
+        (reverse (cons (get-output-string out) result))
+        (let ((ch (string-ref str i)))
+          (cond
+            ;; Single quote toggle
+            ((and (char=? ch #\') (not in-dq?))
+             (display ch out)
+             (loop (+ i 1) (not in-sq?) in-dq?))
+            ;; Double quote toggle
+            ((and (char=? ch #\") (not in-sq?))
+             (display ch out)
+             (loop (+ i 1) in-sq? (not in-dq?)))
+            ;; Backslash in double quotes
+            ((and (char=? ch #\\) in-dq? (< (+ i 1) len))
+             (display ch out)
+             (display (string-ref str (+ i 1)) out)
+             (loop (+ i 2) in-sq? in-dq?))
+            ;; Unquoted colon — split point
+            ((and (char=? ch #\:) (not in-sq?) (not in-dq?))
+             (set! result (cons (get-output-string out) result))
+             (set! out (open-output-string))
+             (loop (+ i 1) in-sq? in-dq?))
+            ;; Everything else
+            (else
+             (display ch out)
+             (loop (+ i 1) in-sq? in-dq?))))))))
+
 ;; Expand heredoc body: $, `, \ escaping, but NO quote processing (" and ' are literal)
 (def (expand-heredoc-body body env)
   (let ((len (string-length body))
@@ -369,6 +423,70 @@
                (display content out)
                (loop end)))
             ;; Regular character
+            (else
+             (display ch out)
+             (loop (+ i 1)))))))))
+
+;; Escape glob-special characters in a string by prefixing with backslash
+(def (glob-quote str)
+  (let ((len (string-length str))
+        (out (open-output-string)))
+    (let loop ((i 0))
+      (if (>= i len)
+        (get-output-string out)
+        (let ((ch (string-ref str i)))
+          (when (memq ch '(#\* #\? #\[ #\]))
+            (display "\\" out))
+          (display ch out)
+          (loop (+ i 1)))))))
+
+;; Expand a string as a pattern — like expand-string but preserves
+;; glob-literal distinction: quoted glob chars are backslash-escaped
+;; so glob-pattern->pregexp treats them as literals.
+(def (expand-pattern str env)
+  (let ((len (string-length str))
+        (out (open-output-string)))
+    (let loop ((i 0))
+      (if (>= i len)
+        (get-output-string out)
+        (let ((ch (string-ref str i)))
+          (cond
+            ;; Tilde at start — expanded text is literal (quote glob chars)
+            ((and (= i 0) (char=? ch #\~))
+             (let-values (((expanded end) (expand-tilde-in str i env)))
+               (display (glob-quote expanded) out)
+               (loop end)))
+            ;; Dollar expansion — expanded text is literal (quote glob chars)
+            ((char=? ch #\$)
+             (let-values (((expanded end) (expand-dollar str i env)))
+               (display (glob-quote expanded) out)
+               (loop end)))
+            ;; Backtick command substitution — expanded text is literal
+            ((char=? ch #\`)
+             (let-values (((expanded end) (expand-backtick str i env)))
+               (display (glob-quote expanded) out)
+               (loop end)))
+            ;; Backslash escape — escaped char is literal
+            ((char=? ch #\\)
+             (if (< (+ i 1) len)
+               (let ((next (string-ref str (+ i 1))))
+                 ;; Emit backslash-escaped char so glob treats it as literal
+                 (display "\\" out) (display next out)
+                 (loop (+ i 2)))
+               (begin
+                 (display "\\" out)
+                 (loop (+ i 1)))))
+            ;; Single quote — content is literal, escape glob chars
+            ((char=? ch #\')
+             (let-values (((content end) (read-single-quote str (+ i 1))))
+               (display (glob-quote content) out)
+               (loop end)))
+            ;; Double quote — expand $, but escape glob chars in result
+            ((char=? ch #\")
+             (let-values (((content end) (expand-double-quote str (+ i 1) env)))
+               (display (glob-quote content) out)
+               (loop end)))
+            ;; Regular unquoted character — keep as-is (glob chars stay as glob)
             (else
              (display ch out)
              (loop (+ i 1)))))))))
@@ -478,7 +596,11 @@
                     (val (env-array-get env name (expand-word-nosplit idx env))))
                (number->string (string-length val)))
              ;; ${#name} — string length
-             (let ((val (or (env-get env rest) "")))
+             (let* ((val (env-get env rest))
+                    (val (or val (begin
+                                  (when (env-option? env "nounset")
+                                    (nounset-error! rest env))
+                                  ""))))
                (number->string (string-length val)))))))
       ;; ${!name[@]} or ${!name[*]} — array keys/indices
       ;; Also handle ${!name} — indirect expansion
@@ -841,13 +963,13 @@
     ;; ${name+word} — alternate if set
     ((+) (if val (expand-string arg env) ""))
     ;; ${name%pattern} — remove shortest suffix
-    ((%) (if val (remove-suffix val (expand-string arg env) #f (env-shopt? env "extglob")) ""))
+    ((%) (if val (remove-suffix val (expand-pattern arg env) #f (env-shopt? env "extglob")) ""))
     ;; ${name%%pattern} — remove longest suffix
-    ((%%) (if val (remove-suffix val (expand-string arg env) #t (env-shopt? env "extglob")) ""))
+    ((%%) (if val (remove-suffix val (expand-pattern arg env) #t (env-shopt? env "extglob")) ""))
     ;; ${name#pattern} — remove shortest prefix
-    ((prefix-short) (if val (remove-prefix val (expand-string arg env) #f (env-shopt? env "extglob")) ""))
+    ((prefix-short) (if val (remove-prefix val (expand-pattern arg env) #f (env-shopt? env "extglob")) ""))
     ;; ${name##pattern} — remove longest prefix
-    ((prefix-long) (if val (remove-prefix val (expand-string arg env) #t (env-shopt? env "extglob")) ""))
+    ((prefix-long) (if val (remove-prefix val (expand-pattern arg env) #t (env-shopt? env "extglob")) ""))
     ;; ${name^^} — uppercase all
     ((^^) (if val (string-upcase val) ""))
     ;; ${name^} — uppercase first
@@ -890,14 +1012,14 @@
            ""))
     ;; ${name/pattern/replacement} — replace first match
     ((/) (if val
-           (let ((pattern (expand-string (car arg) env))
+           (let ((pattern (expand-pattern (car arg) env))
                  (replacement (expand-string (cdr arg) env)))
              (pattern-substitute-first val pattern replacement
                                        (env-shopt? env "extglob")))
            ""))
     ;; ${name//pattern/replacement} — replace all matches
     ((//) (if val
-            (let ((pattern (expand-string (car arg) env))
+            (let ((pattern (expand-pattern (car arg) env))
                   (replacement (expand-string (cdr arg) env)))
               (pattern-substitute-all val pattern replacement
                                       (env-shopt? env "extglob")))
