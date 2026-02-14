@@ -456,10 +456,11 @@
              (let-values (((expanded end) (expand-tilde-in str i env)))
                (display (glob-quote expanded) out)
                (loop end)))
-            ;; Dollar expansion — expanded text is literal (quote glob chars)
+            ;; Dollar expansion — when unquoted in pattern context, preserve
+            ;; glob chars so $pat where pat='[ab]*' works as a glob pattern
             ((char=? ch #\$)
              (let-values (((expanded end) (expand-dollar str i env)))
-               (display (glob-quote expanded) out)
+               (display expanded out)
                (loop end)))
             ;; Backtick command substitution — expanded text is literal
             ((char=? ch #\`)
@@ -1182,6 +1183,30 @@
               (let-values (((val end) (expand-simple-var expr i env)))
                 (display val buf)
                 (loop end)))
+             ;; $'...' — ANSI-C quoting: extract content (just strip quotes for arith)
+             ((char=? next #\')
+              (let qloop ((j (+ i 2)))
+                (cond
+                  ((>= j len) (display (substring expr (+ i 2) len) buf) (loop len))
+                  ((char=? (string-ref expr j) #\')
+                   ;; For arithmetic, the content is usually just a digit string
+                   (display (substring expr (+ i 2) j) buf)
+                   (loop (+ j 1)))
+                  ((char=? (string-ref expr j) #\\)
+                   (qloop (min (+ j 2) len)))
+                  (else (qloop (+ j 1))))))
+             ;; $"..." — locale quoting: strip $ and process as double-quoted
+             ((char=? next #\")
+              (let qloop ((j (+ i 2)))
+                (cond
+                  ((>= j len) (display (substring expr (+ i 2) len) buf) (loop len))
+                  ((char=? (string-ref expr j) #\")
+                   (let ((inner (substring expr (+ i 2) j)))
+                     (display (expand-arith-expr inner env) buf)
+                     (loop (+ j 1))))
+                  ((char=? (string-ref expr j) #\\)
+                   (qloop (min (+ j 2) len)))
+                  (else (qloop (+ j 1))))))
              (else
               (display #\$ buf)
               (loop (+ i 1))))))
