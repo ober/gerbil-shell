@@ -213,3 +213,34 @@
   (or (and (char>=? ch #\0) (char<=? ch #\9))
       (and (char>=? ch #\a) (char<=? ch #\f))
       (and (char>=? ch #\A) (char<=? ch #\F))))
+
+;; Count UTF-8 code points in a string.
+;; If the string contains actual unicode chars (char-integer > 127),
+;; string-length is already correct. But if it contains raw bytes
+;; from command substitution (Latin-1 encoding), we need to count
+;; UTF-8 sequences by examining lead bytes.
+(def (utf8-string-length str)
+  (let ((len (string-length str)))
+    ;; Check if string has any chars > 127 (raw bytes from ffi-read-all)
+    (let check ((i 0))
+      (if (>= i len)
+        ;; All chars <= 127 — pure ASCII, string-length is correct
+        len
+        (let ((c (char->integer (string-ref str i))))
+          (if (> c 127)
+            ;; Contains high bytes — count UTF-8 sequences
+            (utf8-count-codepoints str len)
+            (check (+ i 1))))))))
+
+;; Count UTF-8 code points by examining lead bytes
+(def (utf8-count-codepoints str len)
+  (let loop ((i 0) (count 0))
+    (if (>= i len)
+      count
+      (let ((b (char->integer (string-ref str i))))
+        (cond
+          ((< b #x80) (loop (+ i 1) (+ count 1)))      ;; ASCII
+          ((< b #xC0) (loop (+ i 1) count))             ;; continuation byte
+          ((< b #xE0) (loop (+ i 1) (+ count 1)))       ;; 2-byte lead
+          ((< b #xF0) (loop (+ i 1) (+ count 1)))       ;; 3-byte lead
+          (else        (loop (+ i 1) (+ count 1))))))))

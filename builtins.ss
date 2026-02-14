@@ -2065,7 +2065,7 @@
 (builtin-register! "ulimit"
   (lambda (args env)
     (let ((soft? #t) (hard? #f) (show-all? #f)
-          (resource-flag #f) (value #f))
+          (resource-flag #f) (value #f) (explicit-sh? #f))
       ;; Parse args
       (let loop ((rest args) (seen-resource #f))
         (cond
@@ -2125,9 +2125,10 @@
                                       (else
                                        (let ((n (string->number value)))
                                          (and n (* n block-size))))))
-                           ;; Default: set both soft and hard when neither -S nor -H specified explicitly
-                           (only-soft (and soft? (not hard?)))
-                           (only-hard (and hard? (not soft?))))
+                           ;; When -S or -H was explicitly given, only set that one
+                           ;; Otherwise set both (default behavior)
+                           (only-soft (and explicit-sh? soft? (not hard?)))
+                           (only-hard (and explicit-sh? hard? (not soft?))))
                       (if (not raw-val)
                         (begin
                           (fprintf (current-error-port)
@@ -2142,17 +2143,20 @@
                                 1)))))))))))
           ;; Parse flags
           ((string=? (car rest) "-S")
-           (set! soft? #t) (set! hard? #f)
+           (set! soft? #t) (set! hard? #f) (set! explicit-sh? #t)
            (loop (cdr rest) seen-resource))
           ((string=? (car rest) "-H")
-           (set! hard? #t) (set! soft? #f)
+           (set! hard? #t) (set! soft? #f) (set! explicit-sh? #t)
            (loop (cdr rest) seen-resource))
-          ((string=? (car rest) "-a")
-           (set! show-all? #t)
-           (loop (cdr rest) seen-resource))
-          ((string=? (car rest) "--all")
-           (set! show-all? #t)
-           (loop (cdr rest) seen-resource))
+          ((or (string=? (car rest) "-a") (string=? (car rest) "--all"))
+           (if seen-resource
+             ;; Can't combine -a with resource flag
+             (begin
+               (fprintf (current-error-port) "ulimit: ~a: too many arguments~n" (car rest))
+               2)
+             (begin
+               (set! show-all? #t)
+               (loop (cdr rest) #t))))  ;; mark as seen-resource to reject further flags
           ((and (> (string-length (car rest)) 1)
                 (char=? (string-ref (car rest) 0) #\-))
            ;; Resource flag like -n, -f, etc.
@@ -2167,8 +2171,14 @@
                (loop (cdr rest) #t))))
           (else
            ;; Value argument
-           (set! value (car rest))
-           (loop (cdr rest) seen-resource)))))))
+           (if show-all?
+             ;; -a doesn't accept arguments
+             (begin
+               (fprintf (current-error-port) "ulimit: ~a: too many arguments~n" (car rest))
+               2)
+             (begin
+               (set! value (car rest))
+               (loop (cdr rest) seen-resource)))))))))
 
 ;; dirs [-clpv]
 (builtin-register! "dirs"

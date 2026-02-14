@@ -596,13 +596,13 @@
                     (idx (substring rest (+ bracket-pos 1) (or close (string-length rest))))
                     (val (env-array-get env name (expand-word-nosplit idx env))))
                (number->string (string-length val)))
-             ;; ${#name} — string length
+             ;; ${#name} — string length (UTF-8 code points)
              (let* ((val (env-get env rest))
                     (val (or val (begin
                                   (when (env-option? env "nounset")
                                     (nounset-error! rest env))
                                   ""))))
-               (number->string (string-length val)))))))
+               (number->string (utf8-string-length val)))))))
       ;; ${!name[@]} or ${!name[*]} — array keys/indices
       ;; Also handle ${!name} — indirect expansion
       ((and (> len 1)

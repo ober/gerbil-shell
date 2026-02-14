@@ -636,7 +636,8 @@
 ;; Creates the array if it doesn't exist.
 (def (env-array-set! env name index value)
   (let* ((name (resolve-nameref name env))
-         (var (find-var-in-chain env name)))
+         ;; Use for-write to find vars with unset sentinel (e.g. local x; x[3]=foo)
+         (var (find-var-in-chain-for-write env name)))
     (cond
       ((and var (shell-var-readonly? var))
        (error (format "~a: readonly variable" name)))
@@ -649,7 +650,7 @@
               (final-val (apply-var-attrs var value env)))
          (hash-put! tbl key final-val)))
       (var
-       ;; Existing scalar — convert to indexed array
+       ;; Existing scalar (or unset-sentinel) — convert to indexed array
        (let ((tbl (make-hash-table))
              (key (if (string? index) (or (string->number index) 0) index)))
          (hash-put! tbl key (apply-var-attrs var value env))
