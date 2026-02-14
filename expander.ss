@@ -1938,7 +1938,9 @@
     (cond
       ;; Numeric range
       ((and start-num end-num)
-       (let* ((step (or step-num (if (< end-num start-num) -1 1)))
+       (let* (;; Bash uses absolute value of step, direction from start/end
+              (raw-step (or step-num (if (< end-num start-num) -1 1)))
+              (step (if (<= start-num end-num) (abs raw-step) (- (abs raw-step))))
               ;; Zero-padding: if either has leading zeros, pad to max width
               (pad-width (max (string-length start-str) (string-length end-str)))
               (needs-pad? (or (and (> (string-length start-str) 1)
@@ -1947,9 +1949,6 @@
                                    (char=? (string-ref end-str 0) #\0)))))
          (cond
            ((= step 0) #f)
-           ;; If user specified step, validate direction
-           ((and step-num (> end-num start-num) (< step 0)) #f)
-           ((and step-num (< end-num start-num) (> step 0)) #f)
            (else
             (let loop ((i start-num) (result []))
               (if (if (> step 0) (> i end-num) (< i end-num))
@@ -1960,21 +1959,20 @@
                               (number->string i))
                             result))))))))
       ;; Single-char alphabetic range
+      ;; Mixed case (z..A) is treated as invalid — bash has a bug with backtick in result
       ((and (= (string-length start-str) 1) (= (string-length end-str) 1)
             (char-alphabetic? (string-ref start-str 0))
             (char-alphabetic? (string-ref end-str 0))
-            ;; Mixed case (e.g., z..A) is invalid
             (eq? (char-upper-case? (string-ref start-str 0))
                  (char-upper-case? (string-ref end-str 0))))
        (let* ((start-ch (char->integer (string-ref start-str 0)))
               (end-ch (char->integer (string-ref end-str 0)))
-              (step (or (and step-num (inexact->exact step-num))
-                        (if (<= start-ch end-ch) 1 -1))))
+              ;; Bash uses absolute value of step, direction from start/end
+              (raw-step (or (and step-num (inexact->exact step-num))
+                            (if (<= start-ch end-ch) 1 -1)))
+              (step (if (<= start-ch end-ch) (abs raw-step) (- (abs raw-step)))))
          (cond
            ((= step 0) #f)
-           ;; If user specified step, validate direction
-           ((and step-num (> end-ch start-ch) (< step 0)) #f)
-           ((and step-num (< end-ch start-ch) (> step 0)) #f)
            (else
             (let loop ((i start-ch) (result []))
               (if (if (> step 0) (> i end-ch) (< i end-ch))

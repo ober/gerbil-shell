@@ -822,6 +822,53 @@
            ((char=? (current-char lex) #\})
             (display "}" buf) (advance! lex)
             (when (> depth 1) (loop (- depth 1))))
+           ;; Backslash: handle line continuation and escapes
+           ((char=? (current-char lex) #\\)
+            (advance! lex)
+            (cond
+              ((at-end? lex) (display "\\" buf))
+              ;; Line continuation: backslash-newline is consumed silently
+              ((char=? (current-char lex) #\newline)
+               (advance! lex)
+               (loop depth))
+              (else
+               (display "\\" buf)
+               (display (current-char lex) buf)
+               (advance! lex)
+               (loop depth))))
+           ;; Single quotes: read verbatim until closing quote
+           ((char=? (current-char lex) #\')
+            (display "'" buf) (advance! lex)
+            (let inner ()
+              (cond
+                ((at-end? lex) (set! (lexer-want-more? lex) #t))
+                ((char=? (current-char lex) #\')
+                 (display "'" buf) (advance! lex))
+                (else (display (current-char lex) buf) (advance! lex) (inner))))
+            (loop depth))
+           ;; Double quotes: read until closing, handling backslash escapes
+           ((char=? (current-char lex) #\")
+            (display "\"" buf) (advance! lex)
+            (let inner ()
+              (cond
+                ((at-end? lex) (set! (lexer-want-more? lex) #t))
+                ((char=? (current-char lex) #\")
+                 (display "\"" buf) (advance! lex))
+                ((char=? (current-char lex) #\\)
+                 (display "\\" buf) (advance! lex)
+                 (unless (at-end? lex)
+                   (display (current-char lex) buf) (advance! lex))
+                 (inner))
+                (else (display (current-char lex) buf) (advance! lex) (inner))))
+            (loop depth))
+           ;; Nested $... expressions
+           ((char=? (current-char lex) #\$)
+            (display (read-dollar! lex) buf)
+            (loop depth))
+           ;; Backtick command substitution
+           ((char=? (current-char lex) #\`)
+            (display (read-backtick! lex) buf)
+            (loop depth))
            (else
             (display (current-char lex) buf) (advance! lex) (loop depth))))
        (get-output-string buf))

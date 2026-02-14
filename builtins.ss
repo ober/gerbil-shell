@@ -425,10 +425,13 @@
 (builtin-register! "break"
   (lambda (args env)
     (cond
-      ;; Too many arguments — error, don't break (bash compat: returns 1)
+      ;; Too many arguments — special builtin error is fatal (bash aborts the script)
       ((> (length args) 1)
        (fprintf (current-error-port) "gsh: break: too many arguments~n")
-       1)
+       (force-output (current-error-port))
+       (if (*in-subshell*)
+         (raise (make-subshell-exit-exception 1))
+         (exit 1)))
       ((pair? args)
        (let ((n (string->number (car args))))
          (cond
@@ -448,10 +451,13 @@
 (builtin-register! "continue"
   (lambda (args env)
     (cond
-      ;; Too many arguments — error, don't continue (bash returns 1)
+      ;; Too many arguments — special builtin error is fatal (bash aborts the script)
       ((> (length args) 1)
        (fprintf (current-error-port) "gsh: continue: too many arguments~n")
-       1)
+       (force-output (current-error-port))
+       (if (*in-subshell*)
+         (raise (make-subshell-exit-exception 1))
+         (exit 1)))
       ((pair? args)
        (let ((n (string->number (car args))))
          (cond
