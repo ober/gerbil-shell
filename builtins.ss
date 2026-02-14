@@ -1820,11 +1820,60 @@
            0))))))
 
 ;; declare/typeset [-aAfFgilnrtux] [-p] [name[=value] ...]
+;; Parse compound array elements from the content inside (...).
+;; Handles shell quoting: single quotes, double quotes, backslash escapes.
+;; Returns a list of element strings.
+(def (parse-array-compound-elements inner)
+  (let ((len (string-length inner))
+        (elems [])
+        (buf (open-output-string)))
+    (let loop ((i 0) (in-single? #f) (in-double? #f))
+      (cond
+        ((>= i len)
+         ;; Flush remaining content
+         (let ((s (get-output-string buf)))
+           (reverse (if (> (string-length s) 0) (cons s elems) elems))))
+        (in-single?
+         (if (char=? (string-ref inner i) #\')
+           (loop (+ i 1) #f in-double?)
+           (begin (display (string-ref inner i) buf) (loop (+ i 1) #t in-double?))))
+        (in-double?
+         (cond
+           ((char=? (string-ref inner i) #\")
+            (loop (+ i 1) in-single? #f))
+           ((and (char=? (string-ref inner i) #\\) (< (+ i 1) len))
+            (display (string-ref inner (+ i 1)) buf)
+            (loop (+ i 2) in-single? #t))
+           (else (display (string-ref inner i) buf) (loop (+ i 1) in-single? #t))))
+        ((char=? (string-ref inner i) #\')
+         (loop (+ i 1) #t in-double?))
+        ((char=? (string-ref inner i) #\")
+         (loop (+ i 1) in-single? #t))
+        ((and (char=? (string-ref inner i) #\\) (< (+ i 1) len))
+         (display (string-ref inner (+ i 1)) buf)
+         (loop (+ i 2) in-single? in-double?))
+        ;; Whitespace separates elements
+        ((or (char=? (string-ref inner i) #\space)
+             (char=? (string-ref inner i) #\tab)
+             (char=? (string-ref inner i) #\newline))
+         (let ((s (get-output-string buf)))
+           (if (> (string-length s) 0)
+             (begin
+               (set! elems (cons s elems))
+               (set! buf (open-output-string))
+               (loop (+ i 1) #f #f))
+             (loop (+ i 1) #f #f))))
+        (else
+         (display (string-ref inner i) buf)
+         (loop (+ i 1) in-single? in-double?))))))
+
 (def (builtin-declare args env)
   (let ((flags (make-hash-table))
         (names [])
         (print? #f)
-        (remove? #f))
+        (remove? #f)
+        (func-mode #f)          ;; 'f for -f, 'F for -F
+        )
     ;; Parse flags and name arguments
     (let loop ((args args))
       (when (pair? args)
@@ -1851,7 +1900,8 @@
                        ((#\A) (hash-put! flags 'assoc #t))
                        ((#\g) (hash-put! flags 'global #t))
                        ;; -f: functions, -F: function names only
-                       ((#\f #\F) #!void)
+                       ((#\f) (set! func-mode 'f))
+                       ((#\F) (set! func-mode 'F))
                        (else #!void)))
                    (floop (+ i 1))))
                (loop (cdr args))))
@@ -1859,20 +1909,47 @@
             (else
              (set! names (cons arg names))
              (loop (cdr args)))))))
+    ;; Handle -f/-F: function operations
+    (when func-mode
+      (if (null? names)
+        ;; No names: list all functions
+        (begin
+          (let ((fnames (sort! (hash-keys (shell-environment-functions env)) string<?)))
+            (for-each
+             (lambda (fname)
+               (if (eq? func-mode 'F)
+                 (displayln (format "declare -f ~a" fname))
+                 (displayln (format "~a () { ... }" fname))))
+             fnames))
+          ((return-from-declare) 0))
+        ;; With names: check if each function exists
+        (let ((status 0))
+          (for-each
+           (lambda (fname)
+             (let ((func (hash-get (shell-environment-functions env) fname)))
+               (if func
+                 (if (eq? func-mode 'F)
+                   (displayln (format "declare -f ~a" fname))
+                   (displayln (format "~a () { ... }" fname)))
+                 (begin
+                   (fprintf (current-error-port) "declare: ~a: not found~n" fname)
+                   (set! status 1)))))
+           (reverse names))
+          ((return-from-declare) status))))
     ;; If -p with no names: print all variables with given attributes
     (when (and print? (null? names))
       (hash-for-each
        (lambda (name var)
          (display-declare-var name var))
        (shell-environment-vars env))
-      (return-from-declare 0))
+      ((return-from-declare) 0))
     ;; If no flags and no names: print all variables
     (when (and (= (hash-length flags) 0) (null? names) (not print?))
       (hash-for-each
        (lambda (name var)
          (display-declare-var name var))
        (shell-environment-vars env))
-      (return-from-declare 0))
+      ((return-from-declare) 0))
     ;; Process each name
     (let ((status 0))
     (for-each
@@ -1899,10 +1976,61 @@
                             new-var))))
              ;; Set value if provided
              (when value
-               (let ((final (apply-var-attrs var value env)))
-                 (set! (shell-var-value var) final)
-                 (when (shell-var-exported? var)
-                   (setenv name final))))
+               ;; Check for compound array assignment: value starts with (
+               (if (and (> (string-length value) 0)
+                        (char=? (string-ref value 0) #\())
+                 ;; Compound array assignment: parse (elem1 elem2 ...)
+                 (let ((inner (if (and (> (string-length value) 1)
+                                      (char=? (string-ref value (- (string-length value) 1)) #\)))
+                               (substring value 1 (- (string-length value) 1))
+                               (substring value 1 (string-length value)))))
+                   (let ((tbl (make-hash-table)))
+                     (if (hash-get flags 'assoc)
+                       ;; Associative array: parse [key]=value pairs
+                       (begin
+                         (let ((elems (parse-array-compound-elements inner)))
+                           (for-each
+                            (lambda (elem)
+                              (let ((bracket-start (string-find-char* elem #\[)))
+                                (if bracket-start
+                                  (let* ((bracket-end (string-find-char-from elem #\] (+ bracket-start 1)))
+                                         (key (substring elem (+ bracket-start 1) (or bracket-end (string-length elem))))
+                                         (eq-pos (string-find-char-from elem #\= (or bracket-end 0)))
+                                         (val (if eq-pos (substring elem (+ eq-pos 1) (string-length elem)) "")))
+                                    (hash-put! tbl key val))
+                                  ;; Plain value — shouldn't happen for -A but handle gracefully
+                                  #!void)))
+                            elems))
+                         (set! (shell-var-value var) tbl)
+                         (set! (shell-var-assoc? var) #t)
+                         (set! (shell-var-array? var) #f))
+                       ;; Indexed array: elements are positional
+                       (begin
+                         (let ((elems (parse-array-compound-elements inner))
+                               (idx 0))
+                           (for-each
+                            (lambda (elem)
+                              ;; Check for [idx]=value syntax
+                              (if (and (> (string-length elem) 0)
+                                       (char=? (string-ref elem 0) #\[))
+                                (let* ((bracket-end (string-find-char* elem #\]))
+                                       (key-str (substring elem 1 (or bracket-end (string-length elem))))
+                                       (eq-pos (string-find-char-from elem #\= (or bracket-end 0)))
+                                       (val (if eq-pos (substring elem (+ eq-pos 1) (string-length elem)) ""))
+                                       (key (or (string->number key-str) idx)))
+                                  (hash-put! tbl key val)
+                                  (set! idx (+ key 1)))
+                                (begin
+                                  (hash-put! tbl idx elem)
+                                  (set! idx (+ idx 1)))))
+                            elems))
+                         (set! (shell-var-value var) tbl)
+                         (set! (shell-var-array? var) #t)))))
+                 ;; Regular scalar value
+                 (let ((final (apply-var-attrs var value env)))
+                   (set! (shell-var-value var) final)
+                   (when (shell-var-exported? var)
+                     (setenv name final)))))
              ;; Honor allexport: auto-export when set -a is active
              (when (and (env-option? env "allexport")
                         (not (hash-key? flags 'export)))
@@ -3254,20 +3382,45 @@
                     (if (< (string-length estr) 2)
                       (string-append "0" estr) estr)))))
 
-;; Shell-quote a string for %q
+;; Shell-quote a string for %q — uses backslash-escaping style like bash
 (def (shell-quote-string s)
   (if (string=? s "")
     "''"
-    (let ((buf (open-output-string)))
-      (display "'" buf)
-      (let loop ((i 0))
-        (when (< i (string-length s))
-          (let ((ch (string-ref s i)))
-            (if (char=? ch #\')
-              (begin (display "'\\''" buf) (loop (+ i 1)))
-              (begin (display ch buf) (loop (+ i 1)))))))
-      (display "'" buf)
-      (get-output-string buf))))
+    ;; Check if string contains only safe chars (no quoting needed)
+    (let ((needs-quoting?
+           (let loop ((i 0))
+             (if (>= i (string-length s)) #f
+               (let ((ch (string-ref s i)))
+                 (if (or (char-alphabetic? ch) (char-numeric? ch)
+                         (char=? ch #\_) (char=? ch #\/) (char=? ch #\.)
+                         (char=? ch #\-) (char=? ch #\+) (char=? ch #\,)
+                         (char=? ch #\:) (char=? ch #\@))
+                   (loop (+ i 1))
+                   #t))))))
+      (if (not needs-quoting?)
+        s
+        ;; Use $'...' for strings with special chars
+        (let ((buf (open-output-string)))
+          (display "$'" buf)
+          (let loop ((i 0))
+            (when (< i (string-length s))
+              (let ((ch (string-ref s i)))
+                (cond
+                  ((char=? ch #\') (display "\\'" buf))
+                  ((char=? ch #\\) (display "\\\\" buf))
+                  ((char=? ch #\newline) (display "\\n" buf))
+                  ((char=? ch #\tab) (display "\\t" buf))
+                  ((char=? ch #\return) (display "\\r" buf))
+                  ((char=? ch (integer->char 7)) (display "\\a" buf))
+                  ((char=? ch (integer->char 8)) (display "\\b" buf))
+                  ((char=? ch (integer->char 27)) (display "\\e" buf))
+                  ((< (char->integer ch) 32)
+                   ;; Other control chars: \xHH
+                   (display (format "\\x~a" (number->string (char->integer ch) 16)) buf))
+                  (else (display ch buf))))
+              (loop (+ i 1))))
+          (display "'" buf)
+          (get-output-string buf))))))
 
 (def (apply-set-options! env flag-str enable?)
   (let ((len (string-length flag-str)))

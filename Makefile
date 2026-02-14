@@ -37,7 +37,8 @@ compat-tier2: build $(OILS_DIR)
 	@for f in arith glob brace-expansion case_ if_ loop for-expr subshell \
 	          sh-func builtin-echo builtin-printf builtin-read builtin-cd \
 	          builtin-set builtin-type builtin-trap builtin-bracket \
-	          builtin-misc builtin-process background command-parsing; do \
+	          builtin-misc builtin-process background command-parsing \
+	          var-op-bash var-op-slice assign-extended; do \
 	  echo "=== $$f ==="; \
 	  $(SH_SPEC) $(OILS_DIR)/spec/$$f.test.sh $(BASH) $(GSH) || true; \
 	  echo; \

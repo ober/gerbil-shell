@@ -304,9 +304,17 @@
                                        split-words))
                          (n (length split-words)))
                     (cond
-                      ;; Empty expansion: nothing to add, but mark as having unquoted content
+                      ;; Empty expansion (all IFS whitespace): create word boundary if we
+                      ;; have content accumulated AND there are more segments after this one
                       ((= n 0)
-                       (seg-loop (cdr segs) words current (or cur-can-glob? #t) word-started?))
+                       (if (and word-started? (pair? (cdr segs))
+                                (> (string-length text) 0))
+                         ;; IFS whitespace between content — emit current word, start new
+                         (let ((w (get-output-string current)))
+                           (seg-loop (cdr segs)
+                                     (cons (cons w #t) words)
+                                     (open-output-string) #f #f))
+                         (seg-loop (cdr segs) words current (or cur-can-glob? #t) word-started?)))
                       ;; Single word: append to current (joining with adjacent)
                       ;; Mark word-started if the original text was non-empty (IFS produced an empty field)
                       ((= n 1)
@@ -741,7 +749,7 @@
                (if (and (or (string=? name "@") (string=? name "*"))
                         modifier
                         (memq modifier '(% %% prefix-short prefix-long
-                                         ^^ ^ lc-all lc-first / //)))
+                                         ^^ ^ lc-all lc-first / // at-op)))
                  (let* ((params (env-positional-list env))
                         (transformed (map (lambda (p)
                                            (apply-parameter-modifier p name modifier arg env))
@@ -876,6 +884,11 @@
            (if (and (> rlen 1) (char=? (string-ref rest 1) #\#))
              (values 'prefix-long (substring rest 2 rlen))
              (values 'prefix-short (substring rest 1 rlen))))
+          ((char=? mod-ch #\@)
+           ;; ${var@operator} — Q, a, P, u, U, L, K, E etc.
+           (if (> rlen 1)
+             (values 'at-op (substring rest 1 rlen))
+             (values #f "")))
           (else #f))))))
 
 (def (parse-parameter-modifier content)
@@ -898,7 +911,7 @@
     (let loop ((i 0))
       (cond
         ((>= i len) (values content #f ""))
-        ((memq (string-ref content i) '(#\: #\% #\# #\/ #\^ #\,))
+        ((memq (string-ref content i) '(#\: #\% #\# #\/ #\^ #\, #\@))
          (let ((ch (string-ref content i)))
            (case ch
              ((#\:)
@@ -956,6 +969,9 @@
                         (substring content (+ i 2) len))
                 (values (substring content 0 i) 'lc-first
                         (substring content (+ i 1) len))))
+             ((#\@)
+              (values (substring content 0 i) 'at-op
+                      (substring content (+ i 1) len)))
              (else (loop (+ i 1))))))
         ;; Check for uncolon modifiers: - + = ?
         ((and (memq (string-ref content i) '(#\- #\+ #\= #\?))
@@ -1044,6 +1060,69 @@
                    (loop end)))
                 (else (inner (- end 1)))))))))))
 
+;; Take elements from index start to end of a list
+(def (take-sublist lst start end)
+  (let loop ((l lst) (i 0) (result []))
+    (cond
+      ((or (null? l) (>= i end)) (reverse result))
+      ((< i start) (loop (cdr l) (+ i 1) result))
+      (else (loop (cdr l) (+ i 1) (cons (car l) result))))))
+
+;; Shell-quote a value for ${var@Q} — always quotes, using single-quote style like bash
+(def (shell-quote-for-at-q s)
+  (if (string=? s "")
+    "''"
+    ;; Use single-quote style: 'text' with ' escaped as '\''
+    (let ((buf (open-output-string)))
+      (display "'" buf)
+      (let loop ((i 0))
+        (when (< i (string-length s))
+          (let ((ch (string-ref s i)))
+            (if (char=? ch #\')
+              (display "'\\''" buf)
+              (display ch buf)))
+          (loop (+ i 1))))
+      (display "'" buf)
+      (get-output-string buf))))
+
+;; Get variable attribute flags for ${var@a}
+(def (get-var-attributes name env)
+  (let ((var (hash-get (shell-environment-vars env) name)))
+    (if (not var) ""
+      (string-append
+        (if (shell-var-array? var) "a" "")
+        (if (shell-var-assoc? var) "A" "")
+        (if (shell-var-exported? var) "x" "")
+        (if (shell-var-readonly? var) "r" "")
+        (if (shell-var-integer? var) "i" "")
+        (if (shell-var-uppercase? var) "u" "")
+        (if (shell-var-lowercase? var) "l" "")
+        (if (shell-var-nameref? var) "n" "")))))
+
+;; Expand ANSI-C escape sequences for ${var@E} — subset of $'...' escapes
+(def (expand-ansi-c-escapes s)
+  (let ((buf (open-output-string))
+        (len (string-length s)))
+    (let loop ((i 0))
+      (if (>= i len) (get-output-string buf)
+        (let ((ch (string-ref s i)))
+          (if (and (char=? ch #\\) (< (+ i 1) len))
+            (let ((esc (string-ref s (+ i 1))))
+              (case esc
+                ((#\n) (display #\newline buf) (loop (+ i 2)))
+                ((#\t) (display #\tab buf) (loop (+ i 2)))
+                ((#\r) (display #\return buf) (loop (+ i 2)))
+                ((#\a) (display (integer->char 7) buf) (loop (+ i 2)))
+                ((#\b) (display (integer->char 8) buf) (loop (+ i 2)))
+                ((#\e #\E) (display (integer->char 27) buf) (loop (+ i 2)))
+                ((#\f) (display (integer->char 12) buf) (loop (+ i 2)))
+                ((#\v) (display (integer->char 11) buf) (loop (+ i 2)))
+                ((#\\) (display #\\ buf) (loop (+ i 2)))
+                ((#\') (display #\' buf) (loop (+ i 2)))
+                ((#\") (display #\" buf) (loop (+ i 2)))
+                (else (display ch buf) (display esc buf) (loop (+ i 2)))))
+            (begin (display ch buf) (loop (+ i 1)))))))))
+
 ;; Apply parameter modifier
 (def (apply-parameter-modifier val name modifier arg env)
   (case modifier
@@ -1118,31 +1197,60 @@
                           (substring val 1 (string-length val)))
            (or val "")))
     ;; ${name:offset} or ${name:offset:length} — substring expansion
-    ((:) (if val
-           (let* ((str val)
-                  (slen (string-length str))
-                  ;; arg is "offset" or "offset:length"
-                  (colon-pos (string-find-char-from arg #\: 0))
-                  (offset-str (if colon-pos (substring arg 0 colon-pos)
-                                  (string-trim-whitespace-str arg)))
-                  (length-str (if colon-pos
-                                (string-trim-whitespace-str
-                                 (substring arg (+ colon-pos 1) (string-length arg)))
-                                #f))
-                  (offset (or (string->number (string-trim-whitespace-str offset-str)) 0))
-                  ;; Handle negative offset (from end) — bash requires space before minus
-                  (start (if (< offset 0) (max 0 (+ slen offset)) (min offset slen))))
-             (if length-str
-               (let ((length (or (string->number length-str) 0)))
-                 (if (< length 0)
-                   ;; Negative length: trim from end
-                   (let ((end (max start (+ slen length))))
-                     (substring str start end))
-                   ;; Positive length
-                   (substring str start (min slen (+ start length)))))
-               ;; No length — from offset to end
-               (substring str start slen)))
-           ""))
+    ((:) (cond
+           ;; Special: ${@:offset} / ${*:offset} — positional param list slicing
+           ((and val (or (string=? name "@") (string=? name "*")))
+            (let* ((colon-pos (string-find-char-from arg #\: 0))
+                   (offset-str (if colon-pos (substring arg 0 colon-pos)
+                                   (string-trim-whitespace-str arg)))
+                   (length-str (if colon-pos
+                                 (string-trim-whitespace-str
+                                  (substring arg (+ colon-pos 1) (string-length arg)))
+                                 #f))
+                   (offset (or (string->number (string-trim-whitespace-str offset-str)) 0))
+                   ;; Build the full list: for offset 0, prepend $0
+                   (params (env-positional-list env))
+                   (full-list (if (<= offset 0)
+                                (cons (shell-environment-shell-name env) params)
+                                params))
+                   (slen (length full-list))
+                   ;; For offset 0: start at 0 in full-list (which has $0 prepended)
+                   ;; For negative: from end of full-list
+                   ;; For offset > 0: index into params (subtract 1 since $1 is first)
+                   (start (cond
+                            ((= offset 0) 0)
+                            ((< offset 0) (max 0 (+ slen offset)))
+                            (else (min (- offset 1) (max 0 (- slen 1))))))
+                   (start (max 0 start)))
+              (let* ((sliced (if length-str
+                               (let ((ln (or (string->number length-str) 0)))
+                                 (if (< ln 0)
+                                   (let ((end (max start (+ slen ln))))
+                                     (take-sublist full-list start end))
+                                   (take-sublist full-list start (min slen (+ start ln)))))
+                               (take-sublist full-list start slen))))
+                (string-join-with " " sliced))))
+           ;; Normal string substring
+           (val
+            (let* ((str val)
+                   (slen (string-length str))
+                   (colon-pos (string-find-char-from arg #\: 0))
+                   (offset-str (if colon-pos (substring arg 0 colon-pos)
+                                   (string-trim-whitespace-str arg)))
+                   (length-str (if colon-pos
+                                 (string-trim-whitespace-str
+                                  (substring arg (+ colon-pos 1) (string-length arg)))
+                                 #f))
+                   (offset (or (string->number (string-trim-whitespace-str offset-str)) 0))
+                   (start (if (< offset 0) (max 0 (+ slen offset)) (min offset slen))))
+              (if length-str
+                (let ((length (or (string->number length-str) 0)))
+                  (if (< length 0)
+                    (let ((end (max start (+ slen length))))
+                      (substring str start end))
+                    (substring str start (min slen (+ start length)))))
+                (substring str start slen))))
+           (else "")))
     ;; ${name/pattern/replacement} — replace first match
     ((/) (if val
            (let ((pattern (expand-pattern (car arg) env))
@@ -1159,6 +1267,30 @@
               (pattern-substitute-all val pattern replacement
                                       (env-shopt? env "extglob")))
             ""))
+    ;; ${name@operator} — value transformation
+    ((at-op)
+     (let ((op (if (> (string-length arg) 0) (string-ref arg 0) #f)))
+       (case op
+         ;; ${var@Q} — shell-quoted value
+         ((#\Q) (if val (shell-quote-for-at-q val) "''"))
+         ;; ${var@a} — attribute flags
+         ((#\a) (get-var-attributes name env))
+         ;; ${var@U} — uppercase all
+         ((#\U) (if val (string-upcase val) ""))
+         ;; ${var@u} — uppercase first char
+         ((#\u) (if (and val (> (string-length val) 0))
+                  (string-append (string (char-upcase (string-ref val 0)))
+                                 (substring val 1 (string-length val)))
+                  (or val "")))
+         ;; ${var@L} — lowercase all
+         ((#\L) (if val (string-downcase val) ""))
+         ;; ${var@E} — expand backslash escapes (like $'...')
+         ((#\E) (if val (expand-ansi-c-escapes val) (or val "")))
+         ;; ${var@P} — prompt expansion (stub: just return value)
+         ((#\P) (or val ""))
+         ;; ${var@K} — display as key-value pairs (for assoc arrays)
+         ((#\K) (or val ""))
+         (else (or val "")))))
     ;; No modifier
     ((#f) (or val ""))
     (else (or val ""))))
