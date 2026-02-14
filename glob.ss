@@ -64,6 +64,7 @@
   (let ((rx (open-output-string))
         (len (string-length pattern)))
     (display "^" rx)
+    ;; in-bracket? is #f (outside), 'start (first char after [/[!/[^), or #t (inside)
     (let loop ((i 0) (in-bracket? #f))
       (if (>= i (string-length pattern))
         (begin (display "$" rx)
@@ -73,13 +74,22 @@
             ;; Inside bracket expression
             (in-bracket?
              (cond
+               ;; ] as first char after [ or [!/[^ is literal
+               ((and (char=? ch #\]) (eq? in-bracket? 'start))
+                (display "\\]" rx)
+                (loop (+ i 1) #t))
                ((char=? ch #\])
                 (display "]" rx)
                 (loop (+ i 1) #f))
-               ((char=? ch #\!)
-                ;; [! at start of bracket = negation
+               ;; ! or ^ at start of bracket = negation
+               ((and (memq ch '(#\! #\^)) (eq? in-bracket? 'start))
                 (display "^" rx)
-                (loop (+ i 1) #t))
+                ;; Check if ] follows immediately after negation
+                (if (and (< (+ i 1) (string-length pattern))
+                         (char=? (string-ref pattern (+ i 1)) #\]))
+                  (begin (display "\\]" rx)
+                         (loop (+ i 2) #t))
+                  (loop (+ i 1) #t)))
                ;; POSIX character class [:name:]
                ((and (char=? ch #\[)
                      (< (+ i 1) (string-length pattern))
@@ -97,6 +107,14 @@
                     ;; No closing :], treat [ as literal
                     (begin (display "\\[" rx)
                            (loop (+ i 1) #t)))))
+               ;; [ inside bracket that's not a POSIX class — escape it
+               ((char=? ch #\[)
+                (display "\\[" rx)
+                (loop (+ i 1) #t))
+               ;; Backslash escape inside brackets: \] stays in bracket, etc.
+               ((and (char=? ch #\\) (< (+ i 1) (string-length pattern)))
+                (display (pregexp-quote-char (string-ref pattern (+ i 1))) rx)
+                (loop (+ i 2) #t))
                (else
                 (display (pregexp-quote-char ch) rx)
                 (loop (+ i 1) #t))))
@@ -181,7 +199,7 @@
                                         ((char=? (string-ref pattern j) #\]) #t)
                                         (else (find (+ j 1)))))))
                (if has-close?
-                 (begin (display "[" rx) (loop (+ i 1) #t))
+                 (begin (display "[" rx) (loop (+ i 1) 'start))
                  ;; No closing ] — treat [ as literal
                  (begin (display "\\[" rx) (loop (+ i 1) #f)))))
             ;; Regex special chars that need escaping
