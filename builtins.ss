@@ -425,10 +425,10 @@
 (builtin-register! "break"
   (lambda (args env)
     (cond
-      ;; Too many arguments — bash breaks out of loop
+      ;; Too many arguments — error, don't break (bash compat: returns 1)
       ((> (length args) 1)
        (fprintf (current-error-port) "gsh: break: too many arguments~n")
-       (shell-break! 1))
+       1)
       ((pair? args)
        (let ((n (string->number (car args))))
          (cond
@@ -448,10 +448,10 @@
 (builtin-register! "continue"
   (lambda (args env)
     (cond
-      ;; Too many arguments — bash breaks out of loop
+      ;; Too many arguments — error, don't continue (bash returns 1)
       ((> (length args) 1)
        (fprintf (current-error-port) "gsh: continue: too many arguments~n")
-       (shell-break! 1))
+       1)
       ((pair? args)
        (let ((n (string->number (car args))))
          (cond
@@ -1723,7 +1723,7 @@
                                (make-shell-var value effective-export? readonly? #t
                                               integer? #f #f nameref? #f #f)))
                   (hash-put! (shell-environment-vars env) arg
-                             (make-shell-var "" effective-export? readonly? #t
+                             (make-shell-var +unset-sentinel+ effective-export? readonly? #t
                                             integer? #f #f nameref? #f #f)))))
             args)
            0))))))
@@ -1783,6 +1783,7 @@
        (shell-environment-vars env))
       (return-from-declare 0))
     ;; Process each name
+    (let ((status 0))
     (for-each
      (lambda (arg)
        (let* ((eq-pos (string-find-char* arg #\=))
@@ -1792,12 +1793,16 @@
                          (expand-assignment-value raw env))
                        #f)))
          (if print?
-           ;; -p name: print declaration
+           ;; -p name: print declaration (return 1 if var not found)
            (let ((var (env-get-var env name)))
-             (when var (display-declare-var name var)))
+             (if var
+               (display-declare-var name var)
+               (begin
+                 (fprintf (current-error-port) "declare: ~a: not found~n" name)
+                 (set! status 1))))
            ;; Apply attributes
            (let ((var (or (hash-get (shell-environment-vars env) name)
-                          (let ((new-var (make-shell-var (or value "")
+                          (let ((new-var (make-shell-var (or value +unset-sentinel+)
                                                         #f #f #f #f #f #f #f #f #f)))
                             (hash-put! (shell-environment-vars env) name new-var)
                             new-var))))
@@ -1832,11 +1837,13 @@
              (when (hash-get flags 'uppercase)
                (set! (shell-var-uppercase? var) #t)
                (set! (shell-var-lowercase? var) #f)
-               (set! (shell-var-value var) (string-upcase (shell-var-value var))))
+               (when (string? (shell-var-value var))
+                 (set! (shell-var-value var) (string-upcase (shell-var-value var)))))
              (when (hash-get flags 'lowercase)
                (set! (shell-var-lowercase? var) #t)
                (set! (shell-var-uppercase? var) #f)
-               (set! (shell-var-value var) (string-downcase (shell-var-value var))))
+               (when (string? (shell-var-value var))
+                 (set! (shell-var-value var) (string-downcase (shell-var-value var)))))
              (when (hash-get flags 'nameref)
                (set! (shell-var-nameref? var) #t))
              (when (hash-get flags 'array)
@@ -1854,7 +1861,7 @@
                  (set! (shell-var-assoc? var) #t)
                  (set! (shell-var-array? var) #f)))))))
      (reverse names))
-    0))
+    status)))
 
 ;; Helper: print a variable declaration
 (def (display-declare-var name var)

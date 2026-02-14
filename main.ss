@@ -105,9 +105,10 @@
                  2)
                (let* ((filename (car args))
                       ;; Search PATH if file doesn't contain /
+                      ;; source doesn't require execute permission, just a regular file
                       (filepath (if (string-contains? filename "/")
                                   filename
-                                  (or (which filename) filename))))
+                                  (or (find-file-in-path filename) filename))))
                  ;; Set positional params if extra args given, restore after
                  (if (pair? (cdr args))
                    (let ((saved-pos (shell-environment-positional env)))

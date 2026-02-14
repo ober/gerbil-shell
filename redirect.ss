@@ -194,7 +194,7 @@
          (list save1 save2)))
       ;; << heredoc — here-document
       ((<< <<- <<q <<-q)
-       (let ((save (save-fd 0)))
+       (let ((save (save-fd fd)))
          ;; For heredoc, we use a pipe: write content, read from pipe
          (let-values (((read-fd write-fd) (ffi-pipe-raw)))
            ;; Write the heredoc content to the write end via /dev/fd
@@ -204,14 +204,15 @@
              (force-output write-port)
              (close-port write-port))
            (ffi-close-fd write-fd)
-           ;; Redirect stdin to read end
-           (ffi-dup2 read-fd 0)
+           ;; Redirect to target fd (defaults to 0/stdin)
+           (ffi-dup2 read-fd fd)
            (ffi-close-fd read-fd))
-         (current-input-port (open-input-string target-str))
+         (when (= fd 0)
+           (current-input-port (open-input-string target-str)))
          save))
       ;; <<< word — here-string
       ((<<<)
-       (let ((save (save-fd 0)))
+       (let ((save (save-fd fd)))
          (let-values (((read-fd write-fd) (ffi-pipe-raw)))
            (let ((write-port (open-output-file
                               (string-append "/dev/fd/" (number->string write-fd)))))
@@ -220,7 +221,7 @@
              (force-output write-port)
              (close-port write-port))
            (ffi-close-fd write-fd)
-           (ffi-dup2 read-fd 0)
+           (ffi-dup2 read-fd fd)
            (ffi-close-fd read-fd))
          (current-input-port (open-input-string (string-append target-str "\n")))
          save))

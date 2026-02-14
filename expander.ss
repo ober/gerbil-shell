@@ -1794,9 +1794,10 @@
                       (map (lambda (item)
                              (string-append preamble item postscript))
                            seq)
-                      [word])))
-                 ;; Not valid — literal brace
-                 (else [word])))
+                      ;; Invalid sequence — skip this brace, continue searching
+                      (find-open (+ close 1)))))
+                 ;; Not valid — skip this brace, continue searching
+                 (else (find-open (+ close 1)))))
              ;; No matching } — literal
              [word])))
         (else (find-open (+ i 1)))))))

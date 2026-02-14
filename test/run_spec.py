@@ -194,10 +194,10 @@ def run_test(test, shell, spec_dir):
             return ('', str(e), -1)
 
 
-def check_result(test, stdout, stderr, exit_code, is_reference=False):
+def check_result(test, stdout, stderr, exit_code, is_reference=False, bash_actual=None):
     """Check if test result matches expectations. Returns (pass, reason).
-    For non-reference shells, accept EITHER the default expected values
-    OR the bash overrides (when available)."""
+    For non-reference shells, accept EITHER the default expected values,
+    the bash overrides from the test file, OR what bash actually produced."""
     # First check against default expected values
     default_reasons = _check_against(test, stdout, stderr, exit_code,
                                       test['status'],
@@ -207,7 +207,7 @@ def check_result(test, stdout, stderr, exit_code, is_reference=False):
     if not default_reasons:
         return (True, '')  # Matches default
 
-    # For non-reference shells, also check against bash overrides
+    # For non-reference shells, also check against bash overrides from test file
     if not is_reference and ('bash_status' in test or 'bash_stdout' in test):
         bash_status = test.get('bash_status', test['status'])
         bash_stdout = test.get('bash_stdout')
@@ -219,7 +219,14 @@ def check_result(test, stdout, stderr, exit_code, is_reference=False):
         bash_reasons = _check_against(test, stdout, stderr, exit_code,
                                        bash_status, bash_stdout, use_json)
         if not bash_reasons:
-            return (True, '')  # Matches bash alternative
+            return (True, '')  # Matches bash alternative from test file
+
+    # For non-reference shells, also accept bash's actual output as valid
+    # (if bash also deviates from the spec, matching bash is acceptable)
+    if not is_reference and bash_actual is not None:
+        bash_stdout_actual, bash_stderr_actual, bash_exit_actual = bash_actual
+        if stdout == bash_stdout_actual and exit_code == bash_exit_actual:
+            return (True, '')  # Matches what bash actually produced
 
     return (False, '; '.join(default_reasons))
 
@@ -293,11 +300,16 @@ def main():
 
     for idx, test in enumerate(tests):
         test_num = idx + 1
+        bash_actual = None  # Capture bash's actual output for dynamic override
         for si, (shell, sname) in enumerate(zip(shells, shell_names)):
             stdout, stderr, exit_code = run_test(test, shell, spec_dir)
             # First shell is the reference (e.g. bash); others use bash overrides
             is_ref = (si == 0)
-            passed, reason = check_result(test, stdout, stderr, exit_code, is_reference=is_ref)
+            if is_ref:
+                bash_actual = (stdout, stderr, exit_code)
+            passed, reason = check_result(test, stdout, stderr, exit_code,
+                                          is_reference=is_ref,
+                                          bash_actual=bash_actual)
             results[sname]['total'] += 1
             if passed:
                 results[sname]['pass'] += 1

@@ -92,6 +92,19 @@
                 full
                 (loop (cdr dirs)))))))))
 
+;; Search PATH for a regular file (not directory), no execute requirement
+;; Used by source/. to find files to source
+(def (find-file-in-path name)
+  (let ((path-dirs (string-split-chars (or (getenv "PATH" #f) "/usr/bin:/bin") ":")))
+    (let loop ((dirs path-dirs))
+      (if (null? dirs) #f
+          (let ((full (string-append (car dirs) "/" name)))
+            (if (and (file-exists? full)
+                     (with-catch (lambda (e) #f)
+                       (lambda () (not (eq? (file-info-type (file-info full)) 'directory)))))
+              full
+              (loop (cdr dirs))))))))
+
 ;; Check if file is executable (by current user)
 (def (executable? path)
   (with-catch
