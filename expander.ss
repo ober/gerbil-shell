@@ -35,6 +35,15 @@
 (def (modifier-segments-list x) (vector-ref x 1))
 (def (segments->string segs)
   (apply string-append (map car segs)))
+;; Re-tag literal segments as expanded so they undergo IFS word splitting.
+;; Used for modifier default/alternate values where unquoted literal text
+;; (e.g. ${Unset:-a b c}) should be split just like a variable expansion.
+(def (segments-literals-splittable segs)
+  (map (lambda (seg)
+         (if (eq? (cdr seg) 'literal)
+           (cons (car seg) 'expanded)
+           seg))
+       segs))
 
 ;;; --- Process substitution state ---
 ;; Accumulates cleanup thunks for process substitutions created during expansion.
@@ -795,13 +804,21 @@
              (let-values (((mname modifier arg)
                            (parse-parameter-modifier
                             (string-append "x" after-bracket))))
-               ;; For @, apply modifier per-element
+               ;; For @, conditionals apply to whole array, transforms per-element
                (if (string=? subscript "@")
-                 (let ((modified-vals
-                        (map (lambda (v)
-                               (apply-parameter-modifier v name modifier arg env))
-                             vals)))
-                   (string-join-with " " modified-vals))
+                 (if (memq modifier '(- :- + :+ = := ? :?))
+                   ;; Conditional modifier: treat array as whole
+                   (let ((val (if (null? vals) #f (string-join-with " " vals))))
+                     ;; For :- and :+, empty array also triggers default/alternate
+                     (apply-parameter-modifier
+                       (if (and (memq modifier '(:- :+ := :?)) (null? vals)) #f val)
+                       name modifier arg env))
+                   ;; Transform modifier: apply per-element
+                   (let ((modified-vals
+                          (map (lambda (v)
+                                 (apply-parameter-modifier v name modifier arg env))
+                               vals)))
+                     (string-join-with " " modified-vals)))
                  ;; For *, join first then apply
                  (let* ((ifs (or (env-get env "IFS") " \t\n"))
                         (sep (if (> (string-length ifs) 0) (string (string-ref ifs 0)) ""))
@@ -1034,13 +1051,13 @@
     ((:-) (if (or (not val) (string=? val ""))
             (if (*in-dquote-context*)
               (expand-string arg env)
-              (make-modifier-segments (expand-string-segments arg env)))
+              (make-modifier-segments (segments-literals-splittable (expand-string-segments arg env))))
             val))
     ;; ${name-word} — default if unset
     ((-) (if (not val)
            (if (*in-dquote-context*)
              (expand-string arg env)
-             (make-modifier-segments (expand-string-segments arg env)))
+             (make-modifier-segments (segments-literals-splittable (expand-string-segments arg env))))
            val))
     ;; ${name:=word} — assign default if unset or null
     ((:=) (if (or (not val) (string=? val ""))
@@ -1048,7 +1065,7 @@
               (env-set! env name default)
               (if (*in-dquote-context*)
                 default
-                (make-modifier-segments (expand-string-segments arg env))))
+                (make-modifier-segments (segments-literals-splittable (expand-string-segments arg env)))))
             val))
     ;; ${name=word} — assign default if unset
     ((=) (if (not val)
@@ -1056,7 +1073,7 @@
              (env-set! env name default)
              (if (*in-dquote-context*)
                default
-               (make-modifier-segments (expand-string-segments arg env))))
+               (make-modifier-segments (segments-literals-splittable (expand-string-segments arg env)))))
            val))
     ;; ${name:?word} — error if unset or null
     ((:?) (if (or (not val) (string=? val ""))
@@ -1070,13 +1087,13 @@
     ((:+) (if (and val (not (string=? val "")))
             (if (*in-dquote-context*)
               (expand-string arg env)
-              (make-modifier-segments (expand-string-segments arg env)))
+              (make-modifier-segments (segments-literals-splittable (expand-string-segments arg env))))
             ""))
     ;; ${name+word} — alternate if set
     ((+) (if val
            (if (*in-dquote-context*)
              (expand-string arg env)
-             (make-modifier-segments (expand-string-segments arg env)))
+             (make-modifier-segments (segments-literals-splittable (expand-string-segments arg env))))
            ""))
     ;; ${name%pattern} — remove shortest suffix
     ((%) (if val (remove-suffix val (expand-pattern arg env) #f (env-shopt? env "extglob")) ""))
@@ -1129,14 +1146,16 @@
     ;; ${name/pattern/replacement} — replace first match
     ((/) (if val
            (let ((pattern (expand-pattern (car arg) env))
-                 (replacement (expand-string (cdr arg) env)))
+                 (replacement (parameterize ((*in-dquote-context* #f))
+                                (expand-string (cdr arg) env))))
              (pattern-substitute-first val pattern replacement
                                        (env-shopt? env "extglob")))
            ""))
     ;; ${name//pattern/replacement} — replace all matches
     ((//) (if val
             (let ((pattern (expand-pattern (car arg) env))
-                  (replacement (expand-string (cdr arg) env)))
+                  (replacement (parameterize ((*in-dquote-context* #f))
+                                 (expand-string (cdr arg) env))))
               (pattern-substitute-all val pattern replacement
                                       (env-shopt? env "extglob")))
             ""))
@@ -1485,152 +1504,168 @@
                (loop (+ i 2) 0))
               (else (loop (+ i 1) depth))))))))
 
-;; Check if a word contains $@ or ${@} or ${name[@]} inside double quotes (not inside $() or ``)
+;; Check if a word contains $@ or ${@} or ${name[@]} inside double quotes
+;; (not inside $(), ``, or nested ${...})
 ;; Used to detect the need for "$@" / "${arr[@]}" multi-word expansion
 (def (word-has-quoted-at? word)
   (let ((len (string-length word)))
-    (let loop ((i 0) (in-dq #f) (depth 0))
+    (let loop ((i 0) (in-dq #f) (depth 0) (brace-depth 0))
       (if (>= i len) #f
           (let ((ch (string-ref word i)))
             (cond
               ;; Backslash: skip next char
-              ((char=? ch #\\) (loop (min (+ i 2) len) in-dq depth))
-              ;; Double quote: only toggle at depth 0
-              ((and (char=? ch #\") (= depth 0))
-               (loop (+ i 1) (not in-dq) depth))
-              ;; Single quote outside double-quotes at depth 0: skip to closing
-              ((and (= depth 0) (not in-dq) (char=? ch #\'))
+              ((char=? ch #\\) (loop (min (+ i 2) len) in-dq depth brace-depth))
+              ;; Double quote: only toggle at depth 0 and brace-depth 0
+              ((and (char=? ch #\") (= depth 0) (= brace-depth 0))
+               (loop (+ i 1) (not in-dq) depth brace-depth))
+              ;; Single quote outside double-quotes at depth 0, brace-depth 0: skip
+              ((and (= depth 0) (= brace-depth 0) (not in-dq) (char=? ch #\'))
                (let skip ((j (+ i 1)))
                  (if (or (>= j len) (char=? (string-ref word j) #\'))
-                   (loop (+ j 1) in-dq depth)
+                   (loop (+ j 1) in-dq depth brace-depth)
                    (skip (+ j 1)))))
-              ;; $( — increase depth (handles both $( and $(()
-              ((and (char=? ch #\$) (< (+ i 1) len)
-                    (char=? (string-ref word (+ i 1)) #\())
-               (loop (+ i 2) in-dq (+ depth 1)))
-              ;; ( inside command sub — increase depth
-              ((and (> depth 0) (char=? ch #\())
-               (loop (+ i 1) in-dq (+ depth 1)))
-              ;; ) — decrease depth
-              ((and (> depth 0) (char=? ch #\)))
-               (loop (+ i 1) in-dq (- depth 1)))
-              ;; Backtick at depth 0: skip to matching backtick
-              ((and (= depth 0) (char=? ch #\`))
-               (let skip ((j (+ i 1)))
-                 (cond
-                   ((>= j len) (loop j in-dq depth))
-                   ((char=? (string-ref word j) #\\) (skip (+ j 2)))
-                   ((char=? (string-ref word j) #\`) (loop (+ j 1) in-dq depth))
-                   (else (skip (+ j 1))))))
-              ;; $@ at depth 0 inside double quotes — MATCH
-              ((and in-dq (= depth 0) (char=? ch #\$) (< (+ i 1) len)
+              ;; $@ at depth 0 inside double quotes (any brace-depth) — MATCH
+              ((and in-dq (= depth 0) (= brace-depth 0) (char=? ch #\$) (< (+ i 1) len)
                     (char=? (string-ref word (+ i 1)) #\@))
                #t)
-              ;; ${@} at depth 0 inside double quotes — MATCH
-              ((and in-dq (= depth 0) (char=? ch #\$) (< (+ i 3) len)
-                    (char=? (string-ref word (+ i 1)) #\{)
-                    (char=? (string-ref word (+ i 2)) #\@)
-                    (char=? (string-ref word (+ i 3)) #\}))
-               #t)
-              ;; ${name[@]} at depth 0 inside double quotes — MATCH
-              ((and in-dq (= depth 0) (char=? ch #\$) (< (+ i 1) len)
+              ;; ${ at depth 0 — check for ${@}, ${name[@]}, or generic ${...}
+              ((and (char=? ch #\$) (< (+ i 1) len)
                     (char=? (string-ref word (+ i 1)) #\{))
-               ;; Scan for [@]} pattern
-               (let scan ((j (+ i 2)))
+               (cond
+                 ;; ${@} inside double quotes at top-level brace — MATCH
+                 ((and in-dq (= depth 0) (= brace-depth 0)
+                       (< (+ i 3) len)
+                       (char=? (string-ref word (+ i 2)) #\@)
+                       (char=? (string-ref word (+ i 3)) #\}))
+                  #t)
+                 ;; ${name[@]} inside double quotes at top-level brace — MATCH
+                 ((and in-dq (= depth 0) (= brace-depth 0))
+                  ;; Scan for name[@]} pattern
+                  (let scan ((j (+ i 2)))
+                    (cond
+                      ((>= j len)
+                       ;; No match — still enter the brace
+                       (loop (+ i 2) in-dq depth (+ brace-depth 1)))
+                      ;; Found [@]} — match!
+                      ((and (char=? (string-ref word j) #\[)
+                            (< (+ j 2) len)
+                            (char=? (string-ref word (+ j 1)) #\@)
+                            (char=? (string-ref word (+ j 2)) #\]))
+                       (let ((k (+ j 3)))
+                         (if (and (< k len) (char=? (string-ref word k) #\}))
+                           #t
+                           ;; Not a simple ${name[@]} — enter brace
+                           (loop (+ i 2) in-dq depth (+ brace-depth 1)))))
+                      ;; Valid identifier chars — keep scanning
+                      ((or (char-alphabetic? (string-ref word j))
+                           (char-numeric? (string-ref word j))
+                           (char=? (string-ref word j) #\_))
+                       (scan (+ j 1)))
+                      ;; Not a simple name — enter brace
+                      (else (loop (+ i 2) in-dq depth (+ brace-depth 1))))))
+                 ;; Not in matching context — just enter the brace
+                 (else (loop (+ i 2) in-dq depth (+ brace-depth 1)))))
+              ;; } at brace-depth > 0 — decrease brace depth
+              ((and (> brace-depth 0) (char=? ch #\}))
+               (loop (+ i 1) in-dq depth (- brace-depth 1)))
+              ;; $( — increase depth
+              ((and (char=? ch #\$) (< (+ i 1) len)
+                    (char=? (string-ref word (+ i 1)) #\())
+               (loop (+ i 2) in-dq (+ depth 1) brace-depth))
+              ;; ( inside command sub — increase depth
+              ((and (> depth 0) (char=? ch #\())
+               (loop (+ i 1) in-dq (+ depth 1) brace-depth))
+              ;; ) — decrease depth
+              ((and (> depth 0) (char=? ch #\)))
+               (loop (+ i 1) in-dq (- depth 1) brace-depth))
+              ;; Backtick at depth 0: skip to matching backtick
+              ((and (= depth 0) (= brace-depth 0) (char=? ch #\`))
+               (let skip ((j (+ i 1)))
                  (cond
-                   ((>= j len) (loop (+ i 1) in-dq depth))
-                   ;; Found [@]} — match!
-                   ((and (char=? (string-ref word j) #\[)
-                         (< (+ j 2) len)
-                         (char=? (string-ref word (+ j 1)) #\@)
-                         (char=? (string-ref word (+ j 2)) #\]))
-                    ;; Check for closing }
-                    (let ((k (+ j 3)))
-                      (if (and (< k len) (char=? (string-ref word k) #\}))
-                        #t
-                        (loop (+ i 1) in-dq depth))))
-                   ;; Valid identifier chars — keep scanning
-                   ((or (char-alphabetic? (string-ref word j))
-                        (char-numeric? (string-ref word j))
-                        (char=? (string-ref word j) #\_))
-                    (scan (+ j 1)))
-                   ;; Not an array[@] pattern — fall through
-                   (else (loop (+ i 1) in-dq depth)))))
-              (else (loop (+ i 1) in-dq depth))))))))
+                   ((>= j len) (loop j in-dq depth brace-depth))
+                   ((char=? (string-ref word j) #\\) (skip (+ j 2)))
+                   ((char=? (string-ref word j) #\`) (loop (+ j 1) in-dq depth brace-depth))
+                   (else (skip (+ j 1))))))
+              (else (loop (+ i 1) in-dq depth brace-depth))))))))
 
 ;; Find $@ or ${@} or ${name[@]} inside double quotes and split into prefix/suffix
 ;; Returns (values prefix-str suffix-str array-name-or-false) where quotes are balanced
 ;; array-name is #f for $@/${@}, or the array name string for ${name[@]}
 (def (split-word-at-quoted-at word)
   (let ((len (string-length word)))
-    (let loop ((i 0) (in-dq #f) (depth 0))
+    (let loop ((i 0) (in-dq #f) (depth 0) (brace-depth 0))
       (cond
         ((>= i len)
          (values word "" #f))
         ((char=? (string-ref word i) #\\)
-         (loop (min (+ i 2) len) in-dq depth))
-        ((and (char=? (string-ref word i) #\") (= depth 0))
-         (loop (+ i 1) (not in-dq) depth))
-        ((and (= depth 0) (not in-dq) (char=? (string-ref word i) #\'))
+         (loop (min (+ i 2) len) in-dq depth brace-depth))
+        ((and (char=? (string-ref word i) #\") (= depth 0) (= brace-depth 0))
+         (loop (+ i 1) (not in-dq) depth brace-depth))
+        ((and (= depth 0) (= brace-depth 0) (not in-dq) (char=? (string-ref word i) #\'))
          (let skip ((j (+ i 1)))
            (if (or (>= j len) (char=? (string-ref word j) #\'))
-             (loop (+ j 1) in-dq depth)
+             (loop (+ j 1) in-dq depth brace-depth)
              (skip (+ j 1)))))
-        ((and (char=? (string-ref word i) #\$) (< (+ i 1) len)
-              (char=? (string-ref word (+ i 1)) #\())
-         (loop (+ i 2) in-dq (+ depth 1)))
-        ((and (> depth 0) (char=? (string-ref word i) #\())
-         (loop (+ i 1) in-dq (+ depth 1)))
-        ((and (> depth 0) (char=? (string-ref word i) #\)))
-         (loop (+ i 1) in-dq (- depth 1)))
-        ((and (= depth 0) (char=? (string-ref word i) #\`))
-         (let skip ((j (+ i 1)))
-           (cond
-             ((>= j len) (loop j in-dq depth))
-             ((char=? (string-ref word j) #\\) (skip (+ j 2)))
-             ((char=? (string-ref word j) #\`) (loop (+ j 1) in-dq depth))
-             (else (skip (+ j 1))))))
-        ;; $@ inside double quotes at depth 0
-        ((and in-dq (= depth 0) (char=? (string-ref word i) #\$) (< (+ i 1) len)
+        ;; $@ inside double quotes at depth 0, brace-depth 0
+        ((and in-dq (= depth 0) (= brace-depth 0) (char=? (string-ref word i) #\$) (< (+ i 1) len)
               (char=? (string-ref word (+ i 1)) #\@))
-         ;; Close double quote for prefix, reopen for suffix
          (values (string-append (substring word 0 i) "\"")
                  (string-append "\"" (substring word (+ i 2) len))
                  #f))
-        ;; ${@} inside double quotes at depth 0
-        ((and in-dq (= depth 0) (char=? (string-ref word i) #\$) (< (+ i 3) len)
-              (char=? (string-ref word (+ i 1)) #\{)
-              (char=? (string-ref word (+ i 2)) #\@)
-              (char=? (string-ref word (+ i 3)) #\}))
-         (values (string-append (substring word 0 i) "\"")
-                 (string-append "\"" (substring word (+ i 4) len))
-                 #f))
-        ;; ${name[@]} inside double quotes at depth 0
-        ((and in-dq (= depth 0) (char=? (string-ref word i) #\$) (< (+ i 1) len)
+        ;; ${ — check for ${@}, ${name[@]}, or generic ${...}
+        ((and (char=? (string-ref word i) #\$) (< (+ i 1) len)
               (char=? (string-ref word (+ i 1)) #\{))
-         ;; Try to match name[@]}
-         (let scan ((j (+ i 2)))
+         (cond
+           ;; ${@} inside double quotes at top-level brace
+           ((and in-dq (= depth 0) (= brace-depth 0)
+                 (< (+ i 3) len)
+                 (char=? (string-ref word (+ i 2)) #\@)
+                 (char=? (string-ref word (+ i 3)) #\}))
+            (values (string-append (substring word 0 i) "\"")
+                    (string-append "\"" (substring word (+ i 4) len))
+                    #f))
+           ;; ${name[@]} inside double quotes at top-level brace
+           ((and in-dq (= depth 0) (= brace-depth 0))
+            (let scan ((j (+ i 2)))
+              (cond
+                ((>= j len) (loop (+ i 2) in-dq depth (+ brace-depth 1)))
+                ((and (char=? (string-ref word j) #\[)
+                      (< (+ j 3) len)
+                      (char=? (string-ref word (+ j 1)) #\@)
+                      (char=? (string-ref word (+ j 2)) #\])
+                      (char=? (string-ref word (+ j 3)) #\}))
+                 (let ((arr-name (substring word (+ i 2) j))
+                       (end-pos (+ j 4)))
+                   (values (string-append (substring word 0 i) "\"")
+                           (string-append "\"" (substring word end-pos len))
+                           arr-name)))
+                ((or (char-alphabetic? (string-ref word j))
+                     (char-numeric? (string-ref word j))
+                     (char=? (string-ref word j) #\_))
+                 (scan (+ j 1)))
+                (else (loop (+ i 2) in-dq depth (+ brace-depth 1))))))
+           ;; Not in matching context — enter brace
+           (else (loop (+ i 2) in-dq depth (+ brace-depth 1)))))
+        ;; } at brace-depth > 0
+        ((and (> brace-depth 0) (char=? (string-ref word i) #\}))
+         (loop (+ i 1) in-dq depth (- brace-depth 1)))
+        ((and (char=? (string-ref word i) #\$) (< (+ i 1) len)
+              (char=? (string-ref word (+ i 1)) #\())
+         (loop (+ i 2) in-dq (+ depth 1) brace-depth))
+        ((and (> depth 0) (char=? (string-ref word i) #\())
+         (loop (+ i 1) in-dq (+ depth 1) brace-depth))
+        ((and (> depth 0) (char=? (string-ref word i) #\)))
+         (loop (+ i 1) in-dq (- depth 1) brace-depth))
+        ((and (= depth 0) (= brace-depth 0) (char=? (string-ref word i) #\`))
+         (let skip ((j (+ i 1)))
            (cond
-             ((>= j len) (loop (+ i 1) in-dq depth))
-             ((and (char=? (string-ref word j) #\[)
-                   (< (+ j 3) len)
-                   (char=? (string-ref word (+ j 1)) #\@)
-                   (char=? (string-ref word (+ j 2)) #\])
-                   (char=? (string-ref word (+ j 3)) #\}))
-              (let ((arr-name (substring word (+ i 2) j))
-                    (end-pos (+ j 4)))
-                (values (string-append (substring word 0 i) "\"")
-                        (string-append "\"" (substring word end-pos len))
-                        arr-name)))
-             ((or (char-alphabetic? (string-ref word j))
-                  (char-numeric? (string-ref word j))
-                  (char=? (string-ref word j) #\_))
-              (scan (+ j 1)))
-             (else (loop (+ i 1) in-dq depth)))))
+             ((>= j len) (loop j in-dq depth brace-depth))
+             ((char=? (string-ref word j) #\\) (skip (+ j 2)))
+             ((char=? (string-ref word j) #\`) (loop (+ j 1) in-dq depth brace-depth))
+             (else (skip (+ j 1))))))
         (else
-         (loop (+ i 1) in-dq depth))))))
+         (loop (+ i 1) in-dq depth brace-depth))))))
 
-;; Expand a word containing "$@" or "${arr[@]}" in double quotes to multiple words
 (def (expand-word-with-at word env)
   (let-values (((prefix-raw suffix-raw array-name) (split-word-at-quoted-at word)))
     (let ((elements (if array-name
