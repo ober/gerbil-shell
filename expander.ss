@@ -884,12 +884,34 @@
            (if (and (> rlen 1) (char=? (string-ref rest 1) #\#))
              (values 'prefix-long (substring rest 2 rlen))
              (values 'prefix-short (substring rest 1 rlen))))
+          ((char=? mod-ch #\/)
+           (if (and (> rlen 1) (char=? (string-ref rest 1) #\/))
+             ;; ${name//pattern/replacement}
+             (let ((sep (string-find-char-from rest #\/ 2)))
+               (if sep
+                 (values '// (cons (substring rest 2 sep)
+                                   (substring rest (+ sep 1) rlen)))
+                 (values '// (cons (substring rest 2 rlen) ""))))
+             ;; ${name/pattern/replacement}
+             (let ((sep (string-find-char-from rest #\/ 1)))
+               (if sep
+                 (values '/ (cons (substring rest 1 sep)
+                                  (substring rest (+ sep 1) rlen)))
+                 (values '/ (cons (substring rest 1 rlen) ""))))))
+          ((char=? mod-ch #\^)
+           (if (and (> rlen 1) (char=? (string-ref rest 1) #\^))
+             (values '^^ (substring rest 2 rlen))
+             (values '^ (substring rest 1 rlen))))
+          ((char=? mod-ch #\,)
+           (if (and (> rlen 1) (char=? (string-ref rest 1) #\,))
+             (values 'lc-all (substring rest 2 rlen))
+             (values 'lc-first (substring rest 1 rlen))))
           ((char=? mod-ch #\@)
            ;; ${var@operator} — Q, a, P, u, U, L, K, E etc.
            (if (> rlen 1)
              (values 'at-op (substring rest 1 rlen))
              (values #f "")))
-          (else #f))))))
+          (else (values #f "")))))))
 
 (def (parse-parameter-modifier content)
   (let ((len (string-length content)))
@@ -1124,6 +1146,19 @@
             (begin (display ch buf) (loop (+ i 1)))))))))
 
 ;; Apply parameter modifier
+;; Evaluate a string as an arithmetic expression for slice offset/length.
+;; Bash evaluates ${var:expr:expr} offset and length as arithmetic.
+(def (slice-arith-eval str env)
+  (let ((trimmed (string-trim-whitespace-str str)))
+    (if (string=? trimmed "")
+      0
+      ;; Try simple number first for speed
+      (or (string->number trimmed)
+          (arith-eval (expand-arith-expr trimmed env)
+                      (arith-env-getter env)
+                      (arith-env-setter env)
+                      (env-option? env "nounset"))))))
+
 (def (apply-parameter-modifier val name modifier arg env)
   (case modifier
     ;; ${name:-word} — default if unset or null
@@ -1207,7 +1242,7 @@
                                  (string-trim-whitespace-str
                                   (substring arg (+ colon-pos 1) (string-length arg)))
                                  #f))
-                   (offset (or (string->number (string-trim-whitespace-str offset-str)) 0))
+                   (offset (slice-arith-eval offset-str env))
                    ;; Build the full list: for offset 0, prepend $0
                    (params (env-positional-list env))
                    (full-list (if (<= offset 0)
@@ -1223,7 +1258,7 @@
                             (else (min (- offset 1) (max 0 (- slen 1))))))
                    (start (max 0 start)))
               (let* ((sliced (if length-str
-                               (let ((ln (or (string->number length-str) 0)))
+                               (let ((ln (slice-arith-eval length-str env)))
                                  (if (< ln 0)
                                    (let ((end (max start (+ slen ln))))
                                      (take-sublist full-list start end))
@@ -1241,10 +1276,10 @@
                                  (string-trim-whitespace-str
                                   (substring arg (+ colon-pos 1) (string-length arg)))
                                  #f))
-                   (offset (or (string->number (string-trim-whitespace-str offset-str)) 0))
+                   (offset (slice-arith-eval offset-str env))
                    (start (if (< offset 0) (max 0 (+ slen offset)) (min offset slen))))
               (if length-str
-                (let ((length (or (string->number length-str) 0)))
+                (let ((length (slice-arith-eval length-str env)))
                   (if (< length 0)
                     (let ((end (max start (+ slen length))))
                       (substring str start end))
