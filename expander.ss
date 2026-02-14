@@ -437,8 +437,8 @@
         (get-output-string out)
         (let ((ch (string-ref str i)))
           (cond
-            ;; Tilde at start
-            ((and (= i 0) (char=? ch #\~))
+            ;; Tilde at start (not in double-quote context)
+            ((and (= i 0) (char=? ch #\~) (not (*in-dquote-context*)))
              (let-values (((expanded end) (expand-tilde-in str i env)))
                (display expanded out)
                (loop end)))
@@ -465,11 +465,15 @@
                (begin
                  (display "\\" out)
                  (loop (+ i 1)))))
-            ;; Single quote — literal
+            ;; Single quote — literal (but in dquote context, treated as literal char)
             ((char=? ch #\')
-             (let-values (((content end) (read-single-quote str (+ i 1))))
-               (display content out)
-               (loop end)))
+             (if (*in-dquote-context*)
+               ;; Inside double quotes, single quotes are literal characters
+               (begin (display ch out)
+                      (loop (+ i 1)))
+               (let-values (((content end) (read-single-quote str (+ i 1))))
+                 (display content out)
+                 (loop end))))
             ;; Double quote — partial expansion
             ((char=? ch #\")
              (let-values (((content end) (expand-double-quote str (+ i 1) env)))
