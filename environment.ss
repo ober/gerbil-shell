@@ -198,6 +198,15 @@
        (let ((parent (shell-environment-parent env)))
          (if parent (env-get-var parent name) #f))))))
 
+;; Like env-get-var but also returns declared-but-unset variables (sentinel value)
+(def (env-get-raw-var env name)
+  (let ((var (hash-get (shell-environment-vars env) name)))
+    (cond
+      (var var)
+      (else
+       (let ((parent (shell-environment-parent env)))
+         (if parent (env-get-raw-var parent name) #f))))))
+
 ;; List all variable names matching a prefix, sorted.
 ;; Walks scope chain and OS environment.
 (def (env-matching-names env prefix)

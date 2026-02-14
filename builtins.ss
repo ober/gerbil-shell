@@ -302,27 +302,33 @@
 ;; export [name[=value] ...]
 (builtin-register! "export"
   (lambda (args env)
-    (if (null? args)
-      ;; List all exports
-      (begin
-        (for-each
-         (lambda (pair)
-           (displayln (format "declare -x ~a=\"~a\"" (car pair) (cdr pair))))
-         (env-exported-alist-pairs env))
-        0)
+    (cond
+      ;; export with no args or export -p: list exported vars
+      ((or (null? args)
+           (and (pair? args) (string=? (car args) "-p")))
+       (let* ((all-vars (collect-all-vars env))
+              (names (sort! (hash-keys all-vars) string<?)))
+         (for-each
+          (lambda (name)
+            (let ((var (hash-get all-vars name)))
+              (when (and var (shell-var-exported? var)
+                         (not (eq? (shell-var-value var) +unset-sentinel+)))
+                (display-declare-var name var))))
+          names))
+       0)
       ;; Export variables
-      (begin
-        (for-each
-         (lambda (arg)
-           (let ((eq-pos (string-find-char* arg #\=)))
-             (if eq-pos
-               ;; Args already expanded by expand-declaration-args (no re-expansion)
-               (let* ((name (substring arg 0 eq-pos))
-                      (value (substring arg (+ eq-pos 1) (string-length arg))))
-                 (env-export! env name value))
-               (env-export! env arg))))
-         args)
-        0))))
+      (else
+       (for-each
+        (lambda (arg)
+          (let ((eq-pos (string-find-char* arg #\=)))
+            (if eq-pos
+              ;; Args already expanded by expand-declaration-args (no re-expansion)
+              (let* ((name (substring arg 0 eq-pos))
+                     (value (substring arg (+ eq-pos 1) (string-length arg))))
+                (env-export! env name value))
+              (env-export! env arg))))
+        args)
+       0))))
 
 ;; unset [-fvn] name ...
 (builtin-register! "unset"
@@ -365,24 +371,48 @@
           args)
          0)))))
 
-;; readonly [name[=value] ...]
+;; readonly [-p] [name[=value] ...]
 (builtin-register! "readonly"
   (lambda (args env)
-    (if (null? args)
-      0  ;; TODO: list readonly vars
-      (begin
-        (for-each
-         (lambda (arg)
-           (let ((eq-pos (string-find-char* arg #\=)))
-             (if eq-pos
-               ;; Args are already expanded by expand-declaration-args
-               ;; Don't re-expand the value (would cause double tilde expansion etc.)
-               (let* ((name (substring arg 0 eq-pos))
-                      (value (substring arg (+ eq-pos 1) (string-length arg))))
-                 (env-readonly! env name value))
-               (env-readonly! env arg))))
-         args)
-        0))))
+    (cond
+      ;; readonly -p: list all readonly vars in declare format
+      ((and (pair? args) (string=? (car args) "-p"))
+       (let* ((all-vars (collect-all-vars env))
+              (names (sort! (hash-keys all-vars) string<?)))
+         (for-each
+          (lambda (name)
+            (let ((var (hash-get all-vars name)))
+              (when (and var (shell-var-readonly? var)
+                         (not (eq? (shell-var-value var) +unset-sentinel+)))
+                (display-declare-var name var))))
+          names))
+       0)
+      ;; readonly with no args: list readonly vars in declare format
+      ((null? args)
+       (let* ((all-vars (collect-all-vars env))
+              (names (sort! (hash-keys all-vars) string<?)))
+         (for-each
+          (lambda (name)
+            (let ((var (hash-get all-vars name)))
+              (when (and var (shell-var-readonly? var)
+                         (not (eq? (shell-var-value var) +unset-sentinel+)))
+                (display-declare-var name var))))
+          names))
+       0)
+      ;; readonly name=value ...
+      (else
+       (for-each
+        (lambda (arg)
+          (let ((eq-pos (string-find-char* arg #\=)))
+            (if eq-pos
+              ;; Args are already expanded by expand-declaration-args
+              ;; Don't re-expand the value (would cause double tilde expansion etc.)
+              (let* ((name (substring arg 0 eq-pos))
+                     (value (substring arg (+ eq-pos 1) (string-length arg))))
+                (env-readonly! env name value))
+              (env-readonly! env arg))))
+        args)
+       0))))
 
 ;; exit [n]
 (builtin-register! "exit"
@@ -1782,6 +1812,30 @@
 ;; local [-n] [-i] [-r] [-x] var[=value] ...
 (builtin-register! "local"
   (lambda (args env)
+    ;; Handle local -p: print local vars in declare format
+    (if (and (pair? args) (string=? (car args) "-p"))
+      (begin
+        (let ((names (sort! (hash-keys (shell-environment-vars env)) string<?)))
+          (for-each
+           (lambda (name)
+             (let ((var (hash-get (shell-environment-vars env) name)))
+               (when (and var (shell-var-local? var)
+                          (not (eq? (shell-var-value var) +unset-sentinel+)))
+                 (display-declare-var name var))))
+           names))
+        0)
+    ;; Bare local (no args): list local vars in simple name=value format
+    (if (null? args)
+      (begin
+        (let ((names (sort! (hash-keys (shell-environment-vars env)) string<?)))
+          (for-each
+           (lambda (name)
+             (let ((var (hash-get (shell-environment-vars env) name)))
+               (when (and var (shell-var-local? var)
+                          (not (eq? (shell-var-value var) +unset-sentinel+)))
+                 (displayln (format "~a=~a" name (shell-var-scalar-value var))))))
+           names))
+        0)
     (let loop ((args args) (nameref? #f) (integer? #f) (readonly? #f) (export? #f)
                (array? #f) (assoc? #f))
       (cond
@@ -1871,7 +1925,7 @@
                                             effective-export? readonly? #t
                                             integer? #f #f nameref? array? assoc?)))))
             args)
-           0))))))
+           0))))))))
 
 ;; declare/typeset [-aAfFgilnrtux] [-p] [name[=value] ...]
 ;; Parse compound array elements from the content inside (...).
@@ -1983,7 +2037,8 @@
              (let ((func (hash-get (shell-environment-functions env) fname)))
                (if func
                  (if (eq? func-mode 'F)
-                   (displayln (format "declare -f ~a" fname))
+                   ;; declare -F name: just the name (no "declare -f" prefix)
+                   (displayln fname)
                    (displayln (format "~a () { ... }" fname)))
                  (begin
                    (fprintf (current-error-port) "declare: ~a: not found~n" fname)
@@ -1992,11 +2047,12 @@
           ((return-from-declare) status))))
     ;; If -p with no names: print all variables with given attributes
     (when (and print? (null? names))
-      (declare-print-all-vars env flags)
+      (let ((target (if (hash-get flags 'global) (env-root env) env)))
+        (declare-print-all-vars target flags))
       ((return-from-declare) 0))
-    ;; If no flags and no names: print all variables
+    ;; If no flags and no names: print all variables (simple name=value format)
     (when (and (= (hash-length flags) 0) (null? names) (not print?))
-      (declare-print-all-vars env flags)
+      (declare-print-all-vars-simple env)
       ((return-from-declare) 0))
     ;; Process each name
     (let ((status 0))
@@ -2010,7 +2066,11 @@
                        #f)))
          (if print?
            ;; -p name: print declaration (return 1 if var not found)
-           (let ((var (env-get-var env name)))
+           ;; -pg: look in global scope only
+           ;; Also find declared-but-unset vars (env-get-var skips those)
+           (let* ((lookup-env (if (hash-get flags 'global) (env-root env) env))
+                  (var (or (env-get-var lookup-env name)
+                           (env-get-raw-var lookup-env name))))
              (if var
                (display-declare-var name var)
                (begin
@@ -2095,6 +2155,9 @@
                  (set! (shell-var-exported? var) #f)))
              (when (hash-get flags 'readonly)
                (set! (shell-var-readonly? var) #t))
+             (when (hash-key? flags 'readonly)
+               (unless (hash-get flags 'readonly)
+                 (set! (shell-var-readonly? var) #f)))
              (when (hash-get flags 'integer)
                (set! (shell-var-integer? var) #t)
                ;; Apply arithmetic evaluation to current value
@@ -2169,40 +2232,96 @@
            (display-declare-var name var))))
      names)))
 
+;; Print all variables in simple name=value format (for bare `declare`)
+(def (declare-print-all-vars-simple env)
+  (let* ((all-vars (collect-all-vars env))
+         (names (sort! (hash-keys all-vars) string<?)))
+    (for-each
+     (lambda (name)
+       (let ((var (hash-get all-vars name)))
+         (when (and var (not (eq? (shell-var-value var) +unset-sentinel+)))
+           (displayln (format "~a=~a" name (shell-var-scalar-value var))))))
+     names)))
+
+;; Build flag string in bash canonical order: A a i l n r t u x
+(def (declare-var-flags var)
+  (string-append
+   (if (shell-var-assoc? var) "A" "")
+   (if (shell-var-array? var) "a" "")
+   (if (shell-var-integer? var) "i" "")
+   (if (shell-var-lowercase? var) "l" "")
+   (if (shell-var-nameref? var) "n" "")
+   (if (shell-var-readonly? var) "r" "")
+   (if (shell-var-uppercase? var) "u" "")
+   (if (shell-var-exported? var) "x" "")))
+
+;; Check if an indexed array is dense (keys are 0, 1, 2, ..., n-1)
+(def (array-dense? tbl)
+  (let ((keys (hash-keys tbl)))
+    (and (pair? keys)
+         (let ((n (length keys)))
+           (let loop ((i 0))
+             (if (>= i n) #t
+                 (and (hash-key? tbl i)
+                      (loop (+ i 1)))))))))
+
+;; Quote a value for declare -p output (bash-compatible quoting)
+(def (declare-quote-value val)
+  ;; Simple values: no quoting needed. Complex: use single quotes.
+  ;; For now, just pass through — bash uses $'...' for control chars
+  val)
+
 (def (display-declare-var name var)
-  (let ((flags (string-append
-                (if (shell-var-assoc? var) "A" "")
-                (if (shell-var-array? var) "a" "")
-                (if (shell-var-exported? var) "x" "")
-                (if (shell-var-readonly? var) "r" "")
-                (if (shell-var-integer? var) "i" "")
-                (if (shell-var-uppercase? var) "u" "")
-                (if (shell-var-lowercase? var) "l" "")
-                (if (shell-var-nameref? var) "n" ""))))
-    (let ((flag-str (if (string=? flags "") "--" (string-append "-" flags))))
-      (cond
-        ((shell-var-array? var)
-         ;; Indexed array: declare -a arr=([0]="val0" [1]="val1" ...)
-         (let ((tbl (shell-var-value var)))
-           (display (format "declare ~a ~a=(" flag-str name))
-           (let ((keys (sort! (hash-keys tbl) <)))
+  (let* ((flags (declare-var-flags var))
+         (flag-str (if (string=? flags "") "--" (string-append "-" flags))))
+    (cond
+      ;; Unset variable (declared but no value)
+      ((eq? (shell-var-value var) +unset-sentinel+)
+       (displayln (format "declare ~a ~a" flag-str name)))
+      ((shell-var-array? var)
+       ;; Indexed array
+       (let ((tbl (shell-var-value var)))
+         (if (and (hash-table? tbl) (> (hash-length tbl) 0) (array-dense? tbl))
+           ;; Dense array: declare -a arr=(val0 val1 val2)
+           (begin
+             (display (format "declare ~a ~a=(" flag-str name))
+             (let ((n (hash-length tbl)))
+               (let loop ((i 0))
+                 (when (< i n)
+                   (when (> i 0) (display " "))
+                   (display (hash-get tbl i))
+                   (loop (+ i 1)))))
+             (displayln ")"))
+           ;; Sparse/empty: declare -a arr=([3]=foo)
+           (begin
+             (display (format "declare ~a ~a=(" flag-str name))
+             (when (hash-table? tbl)
+               (let* ((keys (sort! (hash-keys tbl) <))
+                      (last-key (and (pair? keys) (last keys))))
+                 (for-each
+                  (lambda (k)
+                    (display (format "[~a]=~a" k (hash-get tbl k)))
+                    (unless (equal? k last-key) (display " ")))
+                  keys)))
+             (displayln ")")))))
+      ((shell-var-assoc? var)
+       ;; Assoc array: declare -A map=(['key1']=val1 ['key2']=val2)
+       (let ((tbl (shell-var-value var)))
+         (display (format "declare ~a ~a=(" flag-str name))
+         (when (hash-table? tbl)
+           (let* ((keys (sort! (map (lambda (k) (if (string? k) k (format "~a" k)))
+                                    (hash-keys tbl))
+                               string<?))
+                  (last-key (and (pair? keys) (last keys))))
              (for-each
               (lambda (k)
-                (display (format "[~a]=\"~a\" " k (hash-get tbl k))))
-              keys))
-           (displayln ")")))
-        ((shell-var-assoc? var)
-         ;; Assoc array: declare -A map=([key1]="val1" [key2]="val2" ...)
-         (let ((tbl (shell-var-value var)))
-           (display (format "declare ~a ~a=(" flag-str name))
-           (hash-for-each
-            (lambda (k v)
-              (display (format "[~a]=\"~a\" " k v)))
-            tbl)
-           (displayln ")")))
-        (else
-         (displayln (format "declare ~a ~a=\"~a\"" flag-str name
-                           (shell-var-scalar-value var))))))))
+                (display (format "['~a']=~a" k (hash-get tbl k)))
+                (unless (string=? k last-key) (display " ")))
+              keys)))
+         (displayln ")")))
+      (else
+       (displayln (format "declare ~a ~a=~a" flag-str name
+                         (shell-var-scalar-value var)))))))
 
 ;; Continuation for early return from declare
 (def return-from-declare (make-parameter #f))
