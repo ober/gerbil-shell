@@ -367,7 +367,11 @@
                                               (- (string-length name) 1))))
                          (env-array-unset-element! env var-name index))
                        ;; Unset whole variable (resolves namerefs)
-                       (env-unset! env name))))))))
+                       ;; If no variable exists, also try to unset function (POSIX)
+                       (let ((var (env-get-raw-var env name)))
+                         (if var
+                           (env-unset! env name)
+                           (function-unset! env name))))))))))
           args)
          0)))))
 
@@ -2152,7 +2156,8 @@
                (setenv name (shell-var-value var)))
              (when (hash-key? flags 'export)
                (unless (hash-get flags 'export)
-                 (set! (shell-var-exported? var) #f)))
+                 (set! (shell-var-exported? var) #f)
+                 (ffi-unsetenv name)))
              (when (hash-get flags 'readonly)
                (set! (shell-var-readonly? var) #t))
              (when (hash-key? flags 'readonly)
@@ -3587,45 +3592,63 @@
                     (if (< (string-length estr) 2)
                       (string-append "0" estr) estr)))))
 
-;; Shell-quote a string for %q — uses backslash-escaping style like bash
+;; Shell-quote a string for %q — uses quoting style like bash:
+;; - No quoting for simple strings (alphanumeric, _, /, ., -, +, etc.)
+;; - Single quotes for strings with spaces/shell metachars but no single quotes
+;; - $'...' for strings with control chars or single quotes
 (def (shell-quote-string s)
   (if (string=? s "")
     "''"
     ;; Check if string contains only safe chars (no quoting needed)
-    (let ((needs-quoting?
+    (let* ((needs-quoting?
+            (let loop ((i 0))
+              (if (>= i (string-length s)) #f
+                (let ((ch (string-ref s i)))
+                  (if (or (char-alphabetic? ch) (char-numeric? ch)
+                          (char=? ch #\_) (char=? ch #\/) (char=? ch #\.)
+                          (char=? ch #\-) (char=? ch #\+) (char=? ch #\,)
+                          (char=? ch #\:) (char=? ch #\@))
+                    (loop (+ i 1))
+                    #t)))))
+           ;; Check if single quotes work (no single quotes or control chars)
+           (can-single-quote?
+            (and needs-quoting?
+                 (let loop ((i 0))
+                   (if (>= i (string-length s)) #t
+                     (let ((ch (string-ref s i)))
+                       (cond
+                         ((char=? ch #\') #f)
+                         ((< (char->integer ch) 32) #f)
+                         (else (loop (+ i 1))))))))))
+      (cond
+        ((not needs-quoting?) s)
+        (can-single-quote?
+         ;; Use single quotes: 'string with spaces'
+         (string-append "'" s "'"))
+        (else
+         ;; Use $'...' for strings with control chars or single quotes
+         (let ((buf (open-output-string)))
+           (display "$'" buf)
            (let loop ((i 0))
-             (if (>= i (string-length s)) #f
+             (when (< i (string-length s))
                (let ((ch (string-ref s i)))
-                 (if (or (char-alphabetic? ch) (char-numeric? ch)
-                         (char=? ch #\_) (char=? ch #\/) (char=? ch #\.)
-                         (char=? ch #\-) (char=? ch #\+) (char=? ch #\,)
-                         (char=? ch #\:) (char=? ch #\@))
-                   (loop (+ i 1))
-                   #t))))))
-      (if (not needs-quoting?)
-        s
-        ;; Use $'...' for strings with special chars
-        (let ((buf (open-output-string)))
-          (display "$'" buf)
-          (let loop ((i 0))
-            (when (< i (string-length s))
-              (let ((ch (string-ref s i)))
-                (cond
-                  ((char=? ch #\') (display "\\'" buf))
-                  ((char=? ch #\\) (display "\\\\" buf))
-                  ((char=? ch #\newline) (display "\\n" buf))
-                  ((char=? ch #\tab) (display "\\t" buf))
-                  ((char=? ch #\return) (display "\\r" buf))
-                  ((char=? ch (integer->char 7)) (display "\\a" buf))
-                  ((char=? ch (integer->char 8)) (display "\\b" buf))
-                  ((char=? ch (integer->char 27)) (display "\\e" buf))
-                  ((< (char->integer ch) 32)
-                   ;; Other control chars: \xHH
-                   (display (format "\\x~a" (number->string (char->integer ch) 16)) buf))
-                  (else (display ch buf))))
-              (loop (+ i 1))))
-          (display "'" buf)
-          (get-output-string buf))))))
+                 (cond
+                   ((char=? ch #\') (display "\\'" buf))
+                   ((char=? ch #\\) (display "\\\\" buf))
+                   ((char=? ch #\newline) (display "\\n" buf))
+                   ((char=? ch #\tab) (display "\\t" buf))
+                   ((char=? ch #\return) (display "\\r" buf))
+                   ((char=? ch (integer->char 7)) (display "\\a" buf))
+                   ((char=? ch (integer->char 8)) (display "\\b" buf))
+                   ((char=? ch (integer->char 27)) (display "\\e" buf))
+                   ((< (char->integer ch) 32)
+                    ;; Other control chars: \xHH
+                    (display (format "\\x~a" (number->string (char->integer ch) 16)) buf))
+                   (else (display ch buf))))
+               (loop (+ i 1))))
+           (display "'" buf)
+           (get-output-string buf)))))))
+
 
 (def (apply-set-options! env flag-str enable?)
   (let ((len (string-length flag-str)))
