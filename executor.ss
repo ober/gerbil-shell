@@ -292,31 +292,43 @@
          (fprintf (current-error-port) "gsh: ~a: ~a~n" cmd-name (exception-message e))
          126)
        (lambda ()
-         (let* ((proc (open-process
-                       [path: path
-                        arguments: args
-                        environment: (env-exported-alist env)
-                        stdin-redirection: #f
-                        stdout-redirection: #f
-                        stderr-redirection: #f]))
-                (pid (process-pid proc)))
-           (let-values (((exit-code stopped?)
-                         (wait-for-foreground-process pid proc)))
-             (if stopped?
-               ;; Ctrl-Z: add to job table as stopped
-               (let ((cmd-text (string-join-words (cons cmd-name args)))
-                     (job (job-table-add! [(cons pid proc)] "" pid)))
-                 (set! (job-command-text job) cmd-text)
-                 (set! (job-status job) 'stopped)
-                 (for-each (lambda (p) (set! (job-process-status p) 'stopped))
-                           (job-processes job))
-                 (fprintf (current-error-port) "~n[~a]+  Stopped                 ~a~n"
-                          (job-id job) cmd-text)
-                 (+ 128 20))  ;; 148 = 128 + SIGTSTP(20)
-               ;; Normal exit
-               (begin
-                 (close-port proc)
-                 exit-code)))))))))
+         ;; If running inside a pipeline thread, dup2 the pipe fds onto
+         ;; fd 0/1 so the child process inherits them. Save/restore around
+         ;; open-process to minimize the window of altered fds.
+         (let* ((pipe-in (*pipeline-stdin-fd*))
+                (pipe-out (*pipeline-stdout-fd*))
+                (saved-0 (and pipe-in (ffi-dup 0)))
+                (saved-1 (and pipe-out (ffi-dup 1))))
+           (when pipe-in (ffi-dup2 pipe-in 0))
+           (when pipe-out (ffi-dup2 pipe-out 1))
+           (let* ((proc (open-process
+                         [path: path
+                          arguments: args
+                          environment: (env-exported-alist env)
+                          stdin-redirection: #f
+                          stdout-redirection: #f
+                          stderr-redirection: #f]))
+                  (pid (process-pid proc)))
+             ;; Restore fds immediately after fork
+             (when saved-1 (ffi-dup2 saved-1 1) (ffi-close-fd saved-1))
+             (when saved-0 (ffi-dup2 saved-0 0) (ffi-close-fd saved-0))
+             (let-values (((exit-code stopped?)
+                           (wait-for-foreground-process pid proc)))
+               (if stopped?
+                 ;; Ctrl-Z: add to job table as stopped
+                 (let ((cmd-text (string-join-words (cons cmd-name args)))
+                       (job (job-table-add! [(cons pid proc)] "" pid)))
+                   (set! (job-command-text job) cmd-text)
+                   (set! (job-status job) 'stopped)
+                   (for-each (lambda (p) (set! (job-process-status p) 'stopped))
+                             (job-processes job))
+                   (fprintf (current-error-port) "~n[~a]+  Stopped                 ~a~n"
+                            (job-id job) cmd-text)
+                   (+ 128 20))  ;; 148 = 128 + SIGTSTP(20)
+                 ;; Normal exit
+                 (begin
+                   (close-port proc)
+                   exit-code))))))))))
 
 ;;; --- exec builtin ---
 

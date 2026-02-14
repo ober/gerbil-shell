@@ -18,6 +18,13 @@
         :gsh/functions
         :gsh/util)
 
+;; Parameters for pipeline stdin/stdout fds.
+;; When set (non-#f), execute-external should dup2 these onto fd 0/1
+;; before open-process so external commands in pipeline threads
+;; inherit the pipe endpoints.
+(def *pipeline-stdin-fd* (make-parameter #f))
+(def *pipeline-stdout-fd* (make-parameter #f))
+
 ;;; --- Public interface ---
 
 (def (execute-pipeline commands env execute-fn (pipe-types #f))
@@ -189,7 +196,9 @@
                                  (current-output-port))))
                   (parameterize ((current-input-port in-port)
                                  (current-output-port out-port)
-                                 (*in-subshell* #t))
+                                 (*in-subshell* #t)
+                                 (*pipeline-stdin-fd* thread-in-fd)
+                                 (*pipeline-stdout-fd* thread-out-fd))
                     (let ((status (with-catch
                                    (lambda (e)
                                      (cond
