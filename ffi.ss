@@ -12,6 +12,7 @@
             ffi-isatty ffi-setsid ffi-pipe-raw ffi-close-fd
             ffi-open-raw ffi-mkfifo ffi-unlink ffi-getpid
             ffi-read-all-from-fd ffi-unsetenv ffi-strftime
+            ffi-getrlimit-soft ffi-getrlimit-hard ffi-setrlimit
             WNOHANG WUNTRACED WCONTINUED
             WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG WIFSTOPPED WSTOPSIG)
 
@@ -237,4 +238,47 @@ END-STRFTIME
   )
   (define-c-lambda _ffi_strftime (char-string int) char-string "ffi_do_strftime")
   (define (ffi-strftime fmt epoch) (_ffi_strftime fmt epoch))
+
+  ;; getrlimit / setrlimit — resource limits for ulimit builtin
+  (c-declare #<<END-RLIMIT
+#include <sys/resource.h>
+
+/* Get soft limit. Returns -1 for RLIM_INFINITY, -2 on error */
+static long long ffi_do_getrlimit_soft(int resource) {
+    struct rlimit rl;
+    if (getrlimit(resource, &rl) != 0) return -2;
+    if (rl.rlim_cur == RLIM_INFINITY) return -1;
+    return (long long)rl.rlim_cur;
+}
+
+/* Get hard limit. Returns -1 for RLIM_INFINITY, -2 on error */
+static long long ffi_do_getrlimit_hard(int resource) {
+    struct rlimit rl;
+    if (getrlimit(resource, &rl) != 0) return -2;
+    if (rl.rlim_max == RLIM_INFINITY) return -1;
+    return (long long)rl.rlim_max;
+}
+
+/* Set resource limit. soft/hard of -1 means RLIM_INFINITY.
+   If only_soft is 1, only change soft limit (keep hard as-is).
+   If only_hard is 1, only change hard limit (keep soft as-is).
+   Returns 0 on success, -1 on failure. */
+static int ffi_do_setrlimit(int resource, long long soft, long long hard,
+                            int only_soft, int only_hard) {
+    struct rlimit rl;
+    if (getrlimit(resource, &rl) != 0) return -1;
+    if (!only_hard) rl.rlim_cur = (soft == -1) ? RLIM_INFINITY : (rlim_t)soft;
+    if (!only_soft) rl.rlim_max = (hard == -1) ? RLIM_INFINITY : (rlim_t)hard;
+    return setrlimit(resource, &rl);
+}
+
+/* Resource constants */
+END-RLIMIT
+  )
+  (define-c-lambda ffi-getrlimit-soft (int) int64 "ffi_do_getrlimit_soft")
+  (define-c-lambda ffi-getrlimit-hard (int) int64 "ffi_do_getrlimit_hard")
+  (define-c-lambda _ffi_setrlimit (int int64 int64 int int) int "ffi_do_setrlimit")
+  (define (ffi-setrlimit resource soft hard only-soft only-hard)
+    (_ffi_setrlimit resource soft hard (if only-soft 1 0) (if only-hard 1 0)))
+
 )

@@ -2038,6 +2038,138 @@
           (begin (ffi-umask mode) 0)
           (begin (fprintf (current-error-port) "umask: ~a: invalid octal number~n" (car args)) 1))))))
 
+;; ulimit [-SHa] [-cdefilmnpqrstuvx] [limit]
+;; Resource limit management
+(def *ulimit-resources*
+  ;; (flag description resource-const block-size)
+  ;; Resource constants from sys/resource.h (Linux):
+  ;; RLIMIT_CPU=0 DATA=2 FSIZE=1 CORE=4 NOFILE=7 STACK=3 AS=9
+  ;; NPROC=6 MEMLOCK=8 LOCKS=10 SIGPENDING=11 MSGQUEUE=12 NICE=13 RTPRIO=14
+  '((#\c "core file size          (blocks, -c)" 4 512)
+    (#\d "data seg size           (kbytes, -d)" 2 1024)
+    (#\f "file size               (blocks, -f)" 1 512)
+    (#\i "pending signals                 (-i)" 11 1)
+    (#\l "max locked memory       (kbytes, -l)" 8 1024)
+    (#\m "max memory size         (kbytes, -m)" 9 1024)
+    (#\n "open files                      (-n)" 7 1)
+    (#\q "POSIX message queues     (bytes, -q)" 12 1)
+    (#\r "real-time priority              (-r)" 14 1)
+    (#\s "stack size              (kbytes, -s)" 3 1024)
+    (#\t "cpu time               (seconds, -t)" 0 1)
+    (#\u "max user processes              (-u)" 6 1)
+    (#\v "virtual memory          (kbytes, -v)" 9 1024)
+    (#\x "file locks                      (-x)" 10 1)
+    (#\e "scheduling priority             (-e)" 13 1)
+    (#\p "pipe size            (512 bytes, -p)" #f 1)))  ;; pipe size is read-only
+
+(builtin-register! "ulimit"
+  (lambda (args env)
+    (let ((soft? #t) (hard? #f) (show-all? #f)
+          (resource-flag #f) (value #f))
+      ;; Parse args
+      (let loop ((rest args) (seen-resource #f))
+        (cond
+          ((null? rest)
+           ;; Execute
+           (let ((flag (or resource-flag #\f)))  ;; default is -f (file size)
+             (if show-all?
+               ;; -a: show all limits
+               (begin
+                 (for-each
+                  (lambda (entry)
+                    (let* ((ch (car entry))
+                           (desc (cadr entry))
+                           (res-const (caddr entry))
+                           (block-size (cadddr entry)))
+                      (if (not res-const)
+                        (displayln (format "~a 8" desc))  ;; pipe size is always 8
+                        (let* ((raw (if hard?
+                                      (ffi-getrlimit-hard res-const)
+                                      (ffi-getrlimit-soft res-const)))
+                               (display-val (cond
+                                              ((= raw -1) "unlimited")
+                                              ((= raw -2) "error")
+                                              (else (number->string (quotient raw block-size))))))
+                          (displayln (format "~a ~a" desc display-val))))))
+                  *ulimit-resources*)
+                 0)
+               ;; Single resource
+               (let* ((entry (assoc flag *ulimit-resources*))
+                      (res-const (and entry (caddr entry)))
+                      (block-size (and entry (cadddr entry))))
+                 (cond
+                   ((not entry)
+                    (fprintf (current-error-port) "ulimit: invalid option '~a'~n" flag)
+                    1)
+                   ((not value)
+                    ;; Display current value
+                    (if (not res-const)
+                      (begin (displayln "8") 0)  ;; pipe size
+                      (let ((raw (if hard?
+                                   (ffi-getrlimit-hard res-const)
+                                   (ffi-getrlimit-soft res-const))))
+                        (cond
+                          ((= raw -1) (displayln "unlimited") 0)
+                          ((= raw -2) (fprintf (current-error-port) "ulimit: error getting limit~n") 1)
+                          (else (displayln (quotient raw block-size)) 0)))))
+                   ;; Set value
+                   ((not res-const)
+                    (fprintf (current-error-port) "ulimit: -p: cannot modify limit~n") 1)
+                   (else
+                    (let* ((raw-val (cond
+                                      ((string=? value "unlimited") -1)
+                                      ((string=? value "hard")
+                                       (ffi-getrlimit-hard res-const))
+                                      ((string=? value "soft")
+                                       (ffi-getrlimit-soft res-const))
+                                      (else
+                                       (let ((n (string->number value)))
+                                         (and n (* n block-size))))))
+                           ;; Default: set both soft and hard when neither -S nor -H specified explicitly
+                           (only-soft (and soft? (not hard?)))
+                           (only-hard (and hard? (not soft?))))
+                      (if (not raw-val)
+                        (begin
+                          (fprintf (current-error-port)
+                                   "ulimit: ~a: invalid number~n" value)
+                          1)
+                        (let ((rc (ffi-setrlimit res-const raw-val raw-val
+                                                 only-soft only-hard)))
+                          (if (= rc 0) 0
+                              (begin
+                                (fprintf (current-error-port)
+                                         "ulimit: error setting limit~n")
+                                1)))))))))))
+          ;; Parse flags
+          ((string=? (car rest) "-S")
+           (set! soft? #t) (set! hard? #f)
+           (loop (cdr rest) seen-resource))
+          ((string=? (car rest) "-H")
+           (set! hard? #t) (set! soft? #f)
+           (loop (cdr rest) seen-resource))
+          ((string=? (car rest) "-a")
+           (set! show-all? #t)
+           (loop (cdr rest) seen-resource))
+          ((string=? (car rest) "--all")
+           (set! show-all? #t)
+           (loop (cdr rest) seen-resource))
+          ((and (> (string-length (car rest)) 1)
+                (char=? (string-ref (car rest) 0) #\-))
+           ;; Resource flag like -n, -f, etc.
+           (if seen-resource
+             ;; Multiple resource flags not allowed
+             (begin
+               (fprintf (current-error-port)
+                        "ulimit: ~a: too many arguments~n" (car rest))
+               2)
+             (let ((ch (string-ref (car rest) 1)))
+               (set! resource-flag ch)
+               (loop (cdr rest) #t))))
+          (else
+           ;; Value argument
+           (set! value (car rest))
+           (loop (cdr rest) seen-resource)))))))
+
 ;; dirs [-clpv]
 (builtin-register! "dirs"
   (lambda (args env)

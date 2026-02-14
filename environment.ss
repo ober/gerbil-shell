@@ -157,10 +157,11 @@
 
 ;; Get the scalar value of a shell-var.
 ;; For arrays, returns element [0] (bash behavior: $arr == ${arr[0]}).
+;; Returns #f if element [0] doesn't exist (e.g. a=() or a=([1]=x)).
 (def (shell-var-scalar-value var)
   (let ((v (shell-var-value var)))
     (if (hash-table? v)
-      (or (hash-get v 0) (hash-get v "0") "")
+      (or (hash-get v 0) (hash-get v "0"))
       v)))
 
 ;; Apply variable attributes (integer, uppercase, lowercase) to a value
@@ -196,6 +197,29 @@
       (else
        (let ((parent (shell-environment-parent env)))
          (if parent (env-get-var parent name) #f))))))
+
+;; List all variable names matching a prefix, sorted.
+;; Walks scope chain and OS environment.
+(def (env-matching-names env prefix)
+  (let ((result (make-hash-table)))
+    ;; Walk scope chain
+    (let walk ((e env))
+      (when e
+        (hash-for-each
+         (lambda (k v)
+           (when (and (string? k)
+                      (string-prefix? prefix k)
+                      (not (eq? (shell-var-value v) +unset-sentinel+)))
+             (hash-put! result k #t)))
+         (shell-environment-vars e))
+        (walk (shell-environment-parent e))))
+    ;; Also check OS environment
+    (for-each
+     (lambda (pair)
+       (when (string-prefix? prefix (car pair))
+         (hash-put! result (car pair) #t)))
+     (get-environment-variables))
+    (sort! (hash-keys result) string<?)))
 
 ;; Set a variable — respects scope chain for non-local vars
 ;; Resolves namerefs: if `name` is a nameref, sets the target variable instead.
@@ -589,6 +613,24 @@
       (if (and var (or (equal? index "0") (equal? index 0)))
         (or (shell-var-scalar-value var) "")
         ""))))
+
+;; Check if an array element is set (distinct from "empty").
+;; Returns #t if the element exists in the array.
+(def (env-array-element-set? env name index)
+  (let* ((name (resolve-nameref name env))
+         (var (find-var-in-chain env name)))
+    (cond
+      ((not var) #f)
+      ((or (shell-var-array? var) (shell-var-assoc? var))
+       (let ((tbl (shell-var-value var))
+             (key (if (shell-var-assoc? var)
+                    index
+                    (if (string? index) (or (string->number index) 0) index))))
+         (hash-key? tbl key)))
+      ;; Scalar treated as single-element array at index 0
+      ((or (equal? index "0") (equal? index 0))
+       (not (eq? (shell-var-value var) +unset-sentinel+)))
+      (else #f))))
 
 ;; Set an array element.
 ;; Creates the array if it doesn't exist.

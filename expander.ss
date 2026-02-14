@@ -621,13 +621,21 @@
            (let* ((name (substring rest 0 bracket-pos))
                   (keys (env-array-keys env name)))
              (string-join-with " " keys))
-           ;; ${!name} — indirect expansion, possibly with modifiers
-           (let-values (((iname modifier arg) (parse-parameter-modifier rest)))
-             (let* ((ref-name (env-get env iname))
-                    (val (if ref-name (env-get env ref-name) #f)))
-               (if modifier
-                 (apply-parameter-modifier val (or ref-name iname) modifier arg env)
-                 (or val "")))))))
+           ;; Check for ${!prefix@} or ${!prefix*} — variable name matching
+           (let* ((rlen (string-length rest))
+                  (last-ch (and (> rlen 0) (string-ref rest (- rlen 1)))))
+             (if (and last-ch (or (char=? last-ch #\@) (char=? last-ch #\*)))
+               ;; ${!prefix@} or ${!prefix*} — list variable names with matching prefix
+               (let* ((prefix (substring rest 0 (- rlen 1)))
+                      (names (env-matching-names env prefix)))
+                 (string-join-with " " names))
+               ;; ${!name} — indirect expansion, possibly with modifiers
+               (let-values (((iname modifier arg) (parse-parameter-modifier rest)))
+                 (let* ((ref-name (env-get env iname))
+                        (val (if ref-name (env-get env ref-name) #f)))
+                   (if modifier
+                     (apply-parameter-modifier val (or ref-name iname) modifier arg env)
+                     (or val "")))))))))
       (else
        ;; Check for array subscript: name[idx] or name[@] or name[*]
        (let ((bracket-pos (find-array-subscript-start content)))
@@ -727,12 +735,15 @@
                ;; Simple element access
                (env-array-get env name expanded-idx)
                ;; Element access with modifier: ${arr[0]:-default}
-               (let* ((val (env-array-get env name expanded-idx)))
+               (let* ((raw-val (env-array-get env name expanded-idx))
+                      ;; Distinguish unset (-> #f) from empty string (-> "")
+                      (val (if (env-array-element-set? env name expanded-idx)
+                             raw-val
+                             #f)))
                  (let-values (((mname modifier arg)
                                (parse-parameter-modifier
                                 (string-append "x" after-bracket))))
-                   (apply-parameter-modifier (if (string=? val "") #f val)
-                                            name modifier arg env)))))))))))
+                   (apply-parameter-modifier val name modifier arg env)))))))))))
 
 ;; Parse NAME and modifier from parameter content
 (def (special-param-char? ch)
