@@ -1411,8 +1411,8 @@
                    (start (cond
                             ((= offset 0) 0)
                             ((< offset 0) (max 0 (+ slen offset)))
-                            (else (min (- offset 1) (max 0 (- slen 1))))))
-                   (start (max 0 start)))
+                            (else (- offset 1))))
+                   (start (max 0 (min start slen))))
               (let* ((sliced (if length-str
                                (let ((ln (slice-arith-eval length-str env)))
                                  (if (< ln 0)
@@ -1865,11 +1865,10 @@
               ((and (char=? ch #\$) (< (+ i 1) len)
                     (char=? (string-ref word (+ i 1)) #\{))
                (cond
-                 ;; ${@} inside double quotes at top-level brace — MATCH
+                 ;; ${@...} inside double quotes — any form (${@}, ${@:...}, ${@//...}, etc.)
                  ((and in-dq (= depth 0) (= brace-depth 0)
-                       (< (+ i 3) len)
-                       (char=? (string-ref word (+ i 2)) #\@)
-                       (char=? (string-ref word (+ i 3)) #\}))
+                       (< (+ i 2) len)
+                       (char=? (string-ref word (+ i 2)) #\@))
                   #t)
                  ;; ${name[@]} inside double quotes at top-level brace — MATCH
                  ((and in-dq (= depth 0) (= brace-depth 0))
@@ -1929,7 +1928,7 @@
     (let loop ((i 0) (in-dq #f) (depth 0) (brace-depth 0))
       (cond
         ((>= i len)
-         (values word "" #f))
+         (values word "" #f #f))
         ((char=? (string-ref word i) #\\)
          (loop (min (+ i 2) len) in-dq depth brace-depth))
         ((and (char=? (string-ref word i) #\") (= depth 0) (= brace-depth 0))
@@ -1944,19 +1943,37 @@
               (char=? (string-ref word (+ i 1)) #\@))
          (values (string-append (substring word 0 i) "\"")
                  (string-append "\"" (substring word (+ i 2) len))
-                 #f))
+                 #f #f))
         ;; ${ — check for ${@}, ${name[@]}, or generic ${...}
         ((and (char=? (string-ref word i) #\$) (< (+ i 1) len)
               (char=? (string-ref word (+ i 1)) #\{))
          (cond
-           ;; ${@} inside double quotes at top-level brace
+           ;; ${@...} inside double quotes — any positional param form
+           ;; (${@}, ${@:slice}, ${@//pat/rep}, ${@%pat}, etc.)
            ((and in-dq (= depth 0) (= brace-depth 0)
-                 (< (+ i 3) len)
-                 (char=? (string-ref word (+ i 2)) #\@)
-                 (char=? (string-ref word (+ i 3)) #\}))
-            (values (string-append (substring word 0 i) "\"")
-                    (string-append "\"" (substring word (+ i 4) len))
-                    #f))
+                 (< (+ i 2) len)
+                 (char=? (string-ref word (+ i 2)) #\@))
+            ;; Check for simple ${@}
+            (if (and (< (+ i 3) len)
+                     (char=? (string-ref word (+ i 3)) #\}))
+              (values (string-append (substring word 0 i) "\"")
+                      (string-append "\"" (substring word (+ i 4) len))
+                      #f #f)
+              ;; ${@modifier...} — find the closing } tracking nested braces
+              (let find-close ((j (+ i 3)) (bd 1))
+                (cond
+                  ((>= j len) (loop (+ i 2) in-dq depth (+ brace-depth 1)))
+                  ((char=? (string-ref word j) #\{) (find-close (+ j 1) (+ bd 1)))
+                  ((char=? (string-ref word j) #\})
+                   (if (= bd 1)
+                     ;; Found the closing }, extract body after @ up to }
+                     (let ((at-body (substring word (+ i 3) j))
+                           (end-pos (+ j 1)))
+                       (values (string-append (substring word 0 i) "\"")
+                               (string-append "\"" (substring word end-pos len))
+                               #f at-body))
+                     (find-close (+ j 1) (- bd 1))))
+                  (else (find-close (+ j 1) bd))))))
            ;; ${name[@]} inside double quotes at top-level brace
            ((and in-dq (= depth 0) (= brace-depth 0))
             (let scan ((j (+ i 2)))
@@ -1971,7 +1988,7 @@
                        (end-pos (+ j 4)))
                    (values (string-append (substring word 0 i) "\"")
                            (string-append "\"" (substring word end-pos len))
-                           arr-name)))
+                           arr-name #f)))
                 ((or (char-alphabetic? (string-ref word j))
                      (char-numeric? (string-ref word j))
                      (char=? (string-ref word j) #\_))
@@ -2000,12 +2017,52 @@
          (loop (+ i 1) in-dq depth brace-depth))))))
 
 (def (expand-word-with-at word env)
-  (let-values (((prefix-raw suffix-raw array-name) (split-word-at-quoted-at word)))
-    (let ((elements (if array-name
-                      (env-array-values env array-name)
-                      (env-positional-list env)))
-          (expanded-prefix (expand-string prefix-raw env))
-          (expanded-suffix (expand-string suffix-raw env)))
+  (let-values (((prefix-raw suffix-raw array-name at-body) (split-word-at-quoted-at word)))
+    (let* ((all-elements (if array-name
+                           (env-array-values env array-name)
+                           (env-positional-list env)))
+           ;; Apply at-body modifier/slice if present
+           (elements
+            (cond
+              ((not at-body) all-elements)
+              ;; Slice: starts with : (e.g. ":1:3", ":2")
+              ((char=? (string-ref at-body 0) #\:)
+               (let* ((spec (substring at-body 1 (string-length at-body)))
+                      (colon-pos (string-find-char-from spec #\: 0))
+                      (offset-str (if colon-pos
+                                    (substring spec 0 colon-pos)
+                                    spec))
+                      (length-str (if colon-pos
+                                    (substring spec (+ colon-pos 1)
+                                               (string-length spec))
+                                    #f))
+                      (offset (slice-arith-eval offset-str env))
+                      (full-list (if (<= offset 0)
+                                   (cons (shell-environment-shell-name env) all-elements)
+                                   all-elements))
+                      (slen (length full-list))
+                      (start (cond
+                               ((= offset 0) 0)
+                               ((< offset 0) (max 0 (+ slen offset)))
+                               (else (- offset 1))))
+                      (start (max 0 (min start slen))))
+                 (if length-str
+                   (let ((ln (slice-arith-eval length-str env)))
+                     (if (< ln 0)
+                       (let ((end (max start (+ slen ln))))
+                         (take-sublist full-list start end))
+                       (take-sublist full-list start (min slen (+ start ln)))))
+                   (take-sublist full-list start slen))))
+              ;; Other modifier: //pat/rep, %pat, %%pat, #pat, ##pat, ^, ^^, ,, etc.
+              (else
+               (let-values (((name modifier arg) (parse-parameter-modifier
+                                                   (string-append "@" at-body))))
+                 (if modifier
+                   (map (lambda (p) (apply-parameter-modifier p "@" modifier arg env))
+                        all-elements)
+                   all-elements)))))
+           (expanded-prefix (expand-string prefix-raw env))
+           (expanded-suffix (expand-string suffix-raw env)))
       (if (null? elements)
         ;; No elements: "$@"/"${arr[@]}" produces nothing, but prefix/suffix may remain
         (let ((combined (string-append expanded-prefix expanded-suffix)))

@@ -2283,8 +2283,20 @@
                       (loop (+ i 1)))))))))
 
 ;; Quote a value for declare -p output (bash-compatible quoting)
+;; Wraps in double quotes, escaping $, `, \, " inside
 (def (declare-quote-value val)
-  val)
+  (let ((s (if (string? val) val (format "~a" val))))
+    (let ((out (open-output-string)))
+      (write-char #\" out)
+      (let loop ((i 0))
+        (if (>= i (string-length s))
+          (begin (write-char #\" out)
+                 (get-output-string out))
+          (let ((c (string-ref s i)))
+            (when (or (char=? c #\\) (char=? c #\") (char=? c #\$) (char=? c #\`))
+              (write-char #\\ out))
+            (write-char c out)
+            (loop (+ i 1))))))))
 
 (def (display-declare-var name var)
   (let* ((flags (declare-var-flags var))
@@ -2304,7 +2316,7 @@
                (let loop ((i 0))
                  (when (< i n)
                    (when (> i 0) (display " "))
-                   (display (hash-get tbl i))
+                   (display (declare-quote-value (hash-get tbl i)))
                    (loop (+ i 1)))))
              (displayln ")"))
            ;; Sparse/empty: declare -a arr=([3]=foo)
@@ -2315,7 +2327,7 @@
                       (last-key (and (pair? keys) (last keys))))
                  (for-each
                   (lambda (k)
-                    (display (format "[~a]=~a" k (hash-get tbl k)))
+                    (display (format "[~a]=~a" k (declare-quote-value (hash-get tbl k))))
                     (unless (equal? k last-key) (display " ")))
                   keys)))
              (displayln ")")))))
@@ -2330,13 +2342,13 @@
                   (last-key (and (pair? keys) (last keys))))
              (for-each
               (lambda (k)
-                (display (format "['~a']=~a" k (hash-get tbl k)))
+                (display (format "['~a']=~a" k (declare-quote-value (hash-get tbl k))))
                 (unless (string=? k last-key) (display " ")))
               keys)))
          (displayln ")")))
       (else
        (displayln (format "declare ~a ~a=~a" flag-str name
-                         (shell-var-scalar-value var)))))))
+                         (declare-quote-value (shell-var-scalar-value var))))))))
 
 ;; Continuation for early return from declare
 (def return-from-declare (make-parameter #f))
