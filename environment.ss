@@ -659,10 +659,14 @@
     (cond
       ((not var) #f)
       ((or (shell-var-array? var) (shell-var-assoc? var))
-       (let ((tbl (shell-var-value var))
-             (key (if (shell-var-assoc? var)
-                    index
-                    (if (string? index) (or (string->number index) 0) index))))
+       (let* ((tbl (shell-var-value var))
+              (raw-key (if (shell-var-assoc? var)
+                         index
+                         (if (string? index) (or (string->number index) 0) index)))
+              (key (if (and (not (shell-var-assoc? var)) (number? raw-key) (< raw-key 0))
+                     (let ((max-key (hash-fold (lambda (k v mx) (if (> k mx) k mx)) -1 tbl)))
+                       (+ max-key 1 raw-key))
+                     raw-key)))
          (hash-key? tbl key)))
       ;; Scalar treated as single-element array at index 0
       ((or (equal? index "0") (equal? index 0))
@@ -681,9 +685,14 @@
       ((and var (or (shell-var-array? var) (shell-var-assoc? var)))
        ;; Existing array — set element
        (let* ((tbl (shell-var-value var))
-              (key (if (shell-var-assoc? var)
-                     index
-                     (if (string? index) (or (string->number index) 0) index)))
+              (raw-key (if (shell-var-assoc? var)
+                         index
+                         (if (string? index) (or (string->number index) 0) index)))
+              ;; Handle negative indexing for indexed arrays
+              (key (if (and (not (shell-var-assoc? var)) (number? raw-key) (< raw-key 0))
+                     (let ((max-key (hash-fold (lambda (k v mx) (if (> k mx) k mx)) -1 tbl)))
+                       (+ max-key 1 raw-key))
+                     raw-key))
               (final-val (apply-var-attrs var value env)))
          (hash-put! tbl key final-val)))
       (var

@@ -4,7 +4,8 @@
 (import :std/sugar
         :std/format
         :gsh/ast
-        :gsh/environment)
+        :gsh/environment
+        :gsh/ffi)
 
 ;;; --- Shell functions ---
 
@@ -38,16 +39,37 @@
          (_ (env-set! child-env "FUNCNAME" (shell-function-name func))))
     ;; Execute the function body
     ;; break/continue/return are handled by the caller
-    (with-catch
-     (lambda (e)
-       (if (return-exception? e)
-         (return-exception-status e)
-         (raise e)))
-     (lambda ()
-       (let ((status (execute-fn (shell-function-body func) child-env)))
-         ;; Copy last-status back to parent
-         (env-set-last-status! env status)
-         status)))))
+    (let ((status
+           (with-catch
+            (lambda (e)
+              (if (return-exception? e)
+                (return-exception-status e)
+                (raise e)))
+            (lambda ()
+              (let ((s (execute-fn (shell-function-body func) child-env)))
+                ;; Copy last-status back to parent
+                (env-set-last-status! env s)
+                s)))))
+      ;; Clean up exported locals: when a local variable was exported in the
+      ;; child scope, restore the OS environment to match the parent scope
+      (cleanup-exported-locals! child-env env)
+      status)))
+
+;; After function return, restore OS environment for variables that were
+;; local+exported in the child scope but shouldn't persist in parent
+(def (cleanup-exported-locals! child-env parent-env)
+  (hash-for-each
+   (lambda (name var)
+     (when (and (shell-var-local? var) (shell-var-exported? var))
+       ;; Check if parent scope has this variable
+       (let ((parent-var (env-get-raw-var parent-env name)))
+         (if (and parent-var (shell-var-exported? parent-var))
+           ;; Parent has it exported — restore parent's value
+           (let ((v (shell-var-scalar-value parent-var)))
+             (if v (setenv name v) (ffi-unsetenv name)))
+           ;; Parent doesn't have it exported — remove from OS env
+           (ffi-unsetenv name)))))
+   (shell-environment-vars child-env)))
 
 ;;; --- Return exception ---
 ;; Used to implement 'return' from functions
