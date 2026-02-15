@@ -783,10 +783,14 @@
       ;; ${#name[@]} or ${#name[*]} — array length
       ((and (> len 1) (char=? (string-ref content 0) #\#))
        (let* ((rest (substring content 1 len))
-              (bracket-pos (string-find-char-from rest #\[ 0)))
-         (if (and bracket-pos
-                  (let ((subscript (substring rest (+ bracket-pos 1)
-                                             (- (string-length rest) 1))))
+              (bracket-pos (string-find-char-from rest #\[ 0))
+              (close-pos (and bracket-pos
+                              (string-find-char-from rest #\] (+ bracket-pos 1)))))
+         ;; If there's content after ], it's a bad substitution like ${#A[@]@P}
+         (when (and close-pos (< (+ close-pos 1) (string-length rest)))
+           (error (format "bad substitution")))
+         (if (and bracket-pos close-pos
+                  (let ((subscript (substring rest (+ bracket-pos 1) close-pos)))
                     (or (string=? subscript "@") (string=? subscript "*"))))
            ;; ${#name[@]} — number of elements
            (let ((name (substring rest 0 bracket-pos)))
@@ -795,8 +799,8 @@
            (if bracket-pos
              ;; ${#name[idx]} — length of specific element
              (let* ((name (substring rest 0 bracket-pos))
-                    (close (string-find-char-from rest #\] (+ bracket-pos 1)))
-                    (idx (substring rest (+ bracket-pos 1) (or close (string-length rest))))
+                    (idx (substring rest (+ bracket-pos 1)
+                                   (or close-pos (string-length rest))))
                     (val (env-array-get env name (expand-word-nosplit idx env))))
                (number->string (string-length val)))
              ;; ${#name} — string length (UTF-8 code points)
