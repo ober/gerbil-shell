@@ -209,6 +209,16 @@
 (def (string-downcase str)
   (list->string (map char-downcase (string->list str))))
 
+;; Check if a string contains control characters (chars < 0x20 or 0x7f)
+(def (string-has-control-chars? s)
+  (let ((len (string-length s)))
+    (let loop ((i 0))
+      (if (>= i len) #f
+        (let ((c (char->integer (string-ref s i))))
+          (if (or (< c #x20) (= c #x7f))
+            #t
+            (loop (+ i 1))))))))
+
 (def (hex-char? ch)
   (or (and (char>=? ch #\0) (char<=? ch #\9))
       (and (char>=? ch #\a) (char<=? ch #\f))

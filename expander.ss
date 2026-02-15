@@ -1090,36 +1090,59 @@
       ((< i start) (loop (cdr l) (+ i 1) result))
       (else (loop (cdr l) (+ i 1) (cons (car l) result))))))
 
-;; Shell-quote a value for ${var@Q} — always quotes, using single-quote style like bash
+;; Shell-quote a value for ${var@Q} — bash-compatible quoting
+;; Uses single-quote style for normal strings, $'...' for strings with control chars
 (def (shell-quote-for-at-q s)
   (if (string=? s "")
     "''"
-    ;; Use single-quote style: 'text' with ' escaped as '\''
-    (let ((buf (open-output-string)))
-      (display "'" buf)
-      (let loop ((i 0))
-        (when (< i (string-length s))
-          (let ((ch (string-ref s i)))
-            (if (char=? ch #\')
-              (display "'\\''" buf)
-              (display ch buf)))
-          (loop (+ i 1))))
-      (display "'" buf)
-      (get-output-string buf))))
+    (if (string-has-control-chars? s)
+      ;; Use $'...' notation for strings with control chars
+      (let ((buf (open-output-string)))
+        (display "$'" buf)
+        (let loop ((i 0))
+          (when (< i (string-length s))
+            (let* ((ch (string-ref s i))
+                   (code (char->integer ch)))
+              (cond
+                ((char=? ch #\newline) (display "\\n" buf))
+                ((char=? ch #\tab) (display "\\t" buf))
+                ((char=? ch #\return) (display "\\r" buf))
+                ((char=? ch #\\) (display "\\\\" buf))
+                ((char=? ch #\') (display "\\'" buf))
+                ((< code #x20)
+                 (display (format "\\x~a" (number->string code 16)) buf))
+                ((= code #x7f) (display "\\x7f" buf))
+                (else (display ch buf))))
+            (loop (+ i 1))))
+        (display "'" buf)
+        (get-output-string buf))
+      ;; Use single-quote style: 'text' with ' escaped as '\''
+      (let ((buf (open-output-string)))
+        (display "'" buf)
+        (let loop ((i 0))
+          (when (< i (string-length s))
+            (let ((ch (string-ref s i)))
+              (if (char=? ch #\')
+                (display "'\\''" buf)
+                (display ch buf)))
+            (loop (+ i 1))))
+        (display "'" buf)
+        (get-output-string buf)))))
 
 ;; Get variable attribute flags for ${var@a}
+;; Bash returns attributes in alphabetical order: A a i l n r u x
 (def (get-var-attributes name env)
   (let ((var (hash-get (shell-environment-vars env) name)))
     (if (not var) ""
       (string-append
-        (if (shell-var-array? var) "a" "")
         (if (shell-var-assoc? var) "A" "")
-        (if (shell-var-exported? var) "x" "")
-        (if (shell-var-readonly? var) "r" "")
+        (if (shell-var-array? var) "a" "")
         (if (shell-var-integer? var) "i" "")
-        (if (shell-var-uppercase? var) "u" "")
         (if (shell-var-lowercase? var) "l" "")
-        (if (shell-var-nameref? var) "n" "")))))
+        (if (shell-var-nameref? var) "n" "")
+        (if (shell-var-readonly? var) "r" "")
+        (if (shell-var-uppercase? var) "u" "")
+        (if (shell-var-exported? var) "x" "")))))
 
 ;; Expand ANSI-C escape sequences for ${var@E} — subset of $'...' escapes
 (def (expand-ansi-c-escapes s)

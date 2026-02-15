@@ -2072,6 +2072,7 @@
            ;; -p name: print declaration (return 1 if var not found)
            ;; -pg: look in global scope only
            ;; Also find declared-but-unset vars (env-get-var skips those)
+           ;; Note: bash ignores attribute flags when names are given with -p
            (let* ((lookup-env (if (hash-get flags 'global) (env-root env) env))
                   (var (or (env-get-var lookup-env name)
                            (env-get-raw-var lookup-env name))))
@@ -2272,8 +2273,6 @@
 
 ;; Quote a value for declare -p output (bash-compatible quoting)
 (def (declare-quote-value val)
-  ;; Simple values: no quoting needed. Complex: use single quotes.
-  ;; For now, just pass through — bash uses $'...' for control chars
   val)
 
 (def (display-declare-var name var)
