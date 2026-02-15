@@ -197,11 +197,29 @@
                (loop end (cons (cons expanded 'literal) segments))))
             ;; Dollar expansion — unquoted, subject to splitting
             ((char=? ch #\$)
-             (let-values (((expanded end) (expand-dollar word i env)))
-               (if (modifier-segments? expanded)
-                 ;; Modifier returned segments — splice them to preserve quoting
-                 (loop end (append (reverse (modifier-segments-list expanded)) segments))
-                 (loop end (cons (cons expanded 'expanded) segments)))))
+             ;; Check for unquoted $@ or $* — each positional param is a separate field
+             (if (and (< (+ i 1) len)
+                      (let ((next (string-ref word (+ i 1))))
+                        (or (char=? next #\@) (char=? next #\*))))
+               ;; Unquoted $@ or $* — produce word-break separated segments
+               (let ((params (env-positional-list env)))
+                 (if (null? params)
+                   (loop (+ i 2) segments)
+                   ;; Build: param1.expanded, word-break, param2.expanded, ...
+                   (let param-loop ((rest params) (segs segments) (first? #t))
+                     (if (null? rest)
+                       (loop (+ i 2) segs)
+                       (let ((new-segs (if first?
+                                         (cons (cons (car rest) 'expanded) segs)
+                                         (cons (cons (car rest) 'expanded)
+                                               (cons (cons "" 'word-break) segs)))))
+                         (param-loop (cdr rest) new-segs #f))))))
+               ;; Normal dollar expansion
+               (let-values (((expanded end) (expand-dollar word i env)))
+                 (if (modifier-segments? expanded)
+                   ;; Modifier returned segments — splice them to preserve quoting
+                   (loop end (append (reverse (modifier-segments-list expanded)) segments))
+                   (loop end (cons (cons expanded 'expanded) segments))))))
             ;; Backtick command substitution — unquoted
             ((char=? ch #\`)
              (let-values (((expanded end) (expand-backtick word i env)))
@@ -240,10 +258,31 @@
     [(cons "" #f)]
     (let ((ifs (or (env-get env "IFS") " \t\n")))
       (if (string=? ifs "")
-        ;; Empty IFS: no splitting at all, just concatenate
-        (let ((text (apply string-append (map car segments)))
-              (can-glob? (any (lambda (seg) (seg-globbable? (cdr seg))) segments)))
-          [(cons text can-glob?)])
+        ;; Empty IFS: no splitting, but respect word-break boundaries from $@/$*
+        (let ((has-breaks? (any (lambda (seg) (eq? (cdr seg) 'word-break)) segments)))
+          (if (not has-breaks?)
+            ;; No word-breaks: original behavior — just concatenate
+            (let ((text (apply string-append (map car segments)))
+                  (can-glob? (any (lambda (seg) (seg-globbable? (cdr seg))) segments)))
+              [(cons text can-glob?)])
+            ;; Has word-breaks: group segments between breaks into separate words
+            (let group ((segs segments) (cur-parts []) (result []))
+              (cond
+                ((null? segs)
+                 (if (null? cur-parts) (reverse result)
+                   (let* ((parts (reverse cur-parts))
+                          (text (apply string-append (map car parts)))
+                          (can-glob? (any (lambda (seg) (seg-globbable? (cdr seg))) parts)))
+                     (if (string=? text "") (reverse result)
+                       (reverse (cons (cons text can-glob?) result))))))
+                ((eq? (cdar segs) 'word-break)
+                 (if (null? cur-parts) (group (cdr segs) [] result)
+                   (let* ((parts (reverse cur-parts))
+                          (text (apply string-append (map car parts)))
+                          (can-glob? (any (lambda (seg) (seg-globbable? (cdr seg))) parts)))
+                     (if (string=? text "") (group (cdr segs) [] result)
+                       (group (cdr segs) [] (cons (cons text can-glob?) result))))))
+                (else (group (cdr segs) (cons (car segs) cur-parts) result))))))
         ;; Normal IFS splitting
         (let ((words [])      ;; completed words (reversed)
               (current (open-output-string))  ;; current word being built
@@ -263,12 +302,20 @@
               (let* ((seg (car segs))
                      (text (car seg))
                      (type (cdr seg)))
-                (if (not (seg-splittable? type))
-                  ;; Quoted segment: append directly to current word, never split
-                  (begin
-                    (display text current)
-                    (seg-loop (cdr segs) words current (or cur-can-glob? (seg-globbable? type))
-                              (or word-started? #t)))
+                (cond
+                  ((eq? type 'word-break)
+                   ;; Force word boundary — emit current word if non-empty
+                   (let ((w (get-output-string current)))
+                     (if (> (string-length w) 0)
+                       (seg-loop (cdr segs) (cons (cons w cur-can-glob?) words)
+                                 (open-output-string) #f #f)
+                       (seg-loop (cdr segs) words (open-output-string) #f #f))))
+                  ((not (seg-splittable? type))
+                   ;; Quoted segment: append directly to current word, never split
+                   (display text current)
+                   (seg-loop (cdr segs) words current (or cur-can-glob? (seg-globbable? type))
+                             (or word-started? #t)))
+                  (else
                   ;; Unquoted segment: apply IFS splitting
                   ;; If text ends with non-ws IFS delimiter and there are more segments,
                   ;; add trailing empty field to force word boundary
@@ -336,7 +383,7 @@
                                (seg-loop (cdr segs) words new-current #t #t))
                              ;; Middle split words: complete words
                              (inner-loop (cdr rest)
-                                         (cons (cons (car rest) #t) words)))))))))))))))))
+                                         (cons (cons (car rest) #t) words))))))))))))))))))
 
 ;; Expand a word without word splitting or globbing
 ;; Used for assignments, here-docs, etc.
