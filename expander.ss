@@ -1032,7 +1032,13 @@
                                             name modifier arg env))))))
           ;; ${name[idx]} — single element access
           (else
-           (let ((expanded-idx (expand-word-nosplit subscript env)))
+           (let ((expanded-idx
+                  ;; Evaluate subscript as arithmetic (supports side effects like b=2)
+                  ;; For associative arrays, use string expansion (key is a string)
+                  (let ((var (env-get-var env name)))
+                    (if (and var (shell-var-assoc? var))
+                      (expand-word-nosplit subscript env)
+                      (number->string (slice-arith-eval subscript env))))))
              (if (string=? after-bracket "")
                ;; Simple element access
                (env-array-get env name expanded-idx)
