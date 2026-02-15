@@ -305,16 +305,26 @@
 ;; Use env-unset-nameref! to unset the nameref itself.
 (def (env-unset! env name)
   (let ((resolved (resolve-nameref name env)))
-    (let ((var (hash-get (shell-environment-vars env) resolved)))
-      (when (and var (shell-var-readonly? var))
-        (error (format "~a: readonly variable" resolved)))
-      ;; Remove from OS environment if it was exported
-      (when (or (and var (shell-var-exported? var))
-                (getenv resolved #f))
-        (ffi-unsetenv resolved))
-      ;; Place sentinel to prevent fallback to parent scope or OS environment
-      (hash-put! (shell-environment-vars env) resolved
-                 (make-shell-var +unset-sentinel+ #f #f #f #f #f #f #f #f #f)))))
+    ;; Walk the scope chain to find the nearest scope that actually has this variable
+    ;; and remove it from THAT scope (bash dynamic-scope unset semantics)
+    (let scope-loop ((e env))
+      (if (not e)
+        ;; Variable not found in any scope — just unsetenv if in OS env
+        (when (getenv resolved #f)
+          (ffi-unsetenv resolved))
+        (let ((var (hash-get (shell-environment-vars e) resolved)))
+          (if var
+            (begin
+              (when (shell-var-readonly? var)
+                (error (format "~a: readonly variable" resolved)))
+              ;; Remove from OS environment if it was exported
+              (when (or (shell-var-exported? var)
+                        (getenv resolved #f))
+                (ffi-unsetenv resolved))
+              ;; Remove from this scope — lookup will now fall through to parent
+              (hash-remove! (shell-environment-vars e) resolved))
+            ;; Not in this scope, check parent
+            (scope-loop (shell-environment-parent e))))))))
 
 ;; Unset a nameref variable itself (not the target) — used by `unset -n`
 (def (env-unset-nameref! env name)
@@ -722,15 +732,34 @@
 ;; Unset an array element
 (def (env-array-unset-element! env name index)
   (let* ((name (resolve-nameref name env))
-         (var (find-var-in-chain env name)))
+         (var (find-var-in-chain-for-write env name)))
     (when (and var (shell-var-readonly? var))
       (error (format "~a: readonly variable" name)))
-    (when (and var (or (shell-var-array? var) (shell-var-assoc? var)))
-      (let ((tbl (shell-var-value var))
-            (key (if (shell-var-assoc? var)
-                   index
-                   (if (string? index) (or (string->number index) 0) index))))
-        (hash-remove! tbl key)))))
+    (cond
+      ((not var) (void))  ;; variable doesn't exist - no-op
+      ((or (shell-var-array? var) (shell-var-assoc? var))
+       ;; Unset array element
+       (let ((tbl (shell-var-value var))
+             (key (if (shell-var-assoc? var)
+                    index
+                    ;; Use arith-eval for indexed array subscripts
+                    (let ((idx-val (if (string? index)
+                                    (let ((n (string->number index)))
+                                      (if n n
+                                        ;; Try arithmetic evaluation for expressions like "i - 1"
+                                        (with-catch
+                                         (lambda (e) 0)
+                                         (lambda ()
+                                           (let ((arith-fn (*arith-eval-fn*)))
+                                             (if arith-fn
+                                               (arith-fn index)
+                                               0))))))
+                                    index)))
+                      idx-val))))
+         (hash-remove! tbl key)))
+      (else
+       ;; Variable exists but is not an array — error
+       (error (format "~a: not an array variable" name))))))
 
 ;; Set a compound array value: arr=(val1 val2 val3)
 ;; For indexed arrays, assigns val1 to [0], val2 to [1], etc.

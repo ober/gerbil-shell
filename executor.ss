@@ -97,6 +97,13 @@
 ;; Each binding is visible to subsequent bindings in the same prefix.
 ;; After the command returns, the bindings are discarded.
 (def (apply-temp-assignments assignments env)
+  ;; Reject array subscript assignments in env prefix position
+  (for-each
+   (lambda (asgn)
+     (let ((name (assignment-name asgn)))
+       (when (string-find-char* name #\[)
+         (error (format "~a: not a valid identifier" name)))))
+   assignments)
   (let ((child (env-push-scope env)))
     (for-each
      (lambda (asgn)

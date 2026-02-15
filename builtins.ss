@@ -2051,9 +2051,13 @@
                                        (make-shell-var tbl effective-export? readonly? #t
                                                       integer? #f #f nameref? #t #f)))))
                       ;; Regular scalar assignment
-                      (hash-put! (shell-environment-vars env) name
-                                 (make-shell-var value effective-export? readonly? #t
-                                                integer? #f #f nameref? array? assoc?))))
+                      ;; Check if the variable is already readonly in current scope
+                      (let ((existing (hash-get (shell-environment-vars env) name)))
+                        (when (and existing (shell-var-readonly? existing))
+                          (error (format "~a: readonly variable" name)))
+                        (hash-put! (shell-environment-vars env) name
+                                   (make-shell-var value effective-export? readonly? #t
+                                                  integer? #f #f nameref? array? assoc?)))))
                   ;; No value - just declare as local
                   ;; If already exists in this scope, keep it (second 'local foo' is no-op)
                   (let ((existing (hash-get (shell-environment-vars env) arg)))
@@ -2483,18 +2487,30 @@
 ;; Quote a value for declare -p output (bash-compatible quoting)
 ;; Wraps in double quotes, escaping $, `, \, " inside
 (def (declare-quote-value val)
-  (let ((s (if (string? val) val (format "~a" val))))
-    (let ((out (open-output-string)))
-      (write-char #\" out)
-      (let loop ((i 0))
-        (if (>= i (string-length s))
-          (begin (write-char #\" out)
-                 (get-output-string out))
-          (let ((c (string-ref s i)))
-            (when (or (char=? c #\\) (char=? c #\") (char=? c #\$) (char=? c #\`))
-              (write-char #\\ out))
-            (write-char c out)
-            (loop (+ i 1))))))))
+  (if (not val) "\"\""
+    (let ((s (if (string? val) val (format "~a" val))))
+      ;; Check for control characters that need $'...' quoting
+      (let ((has-control? (let loop ((i 0))
+                            (and (< i (string-length s))
+                                 (or (char<? (string-ref s i) #\space)
+                                     (char=? (string-ref s i) #\x7f)
+                                     (loop (+ i 1)))))))
+        (if has-control?
+          ;; Use $'...' for values with control characters
+          (shell-quote-value s)
+          ;; Use double-quoting (bash convention for declare -p)
+          (let ((out (open-output-string)))
+            (write-char #\" out)
+            (let loop ((i 0))
+              (if (>= i (string-length s))
+                (begin (write-char #\" out)
+                       (get-output-string out))
+                (let ((c (string-ref s i)))
+                  (when (or (char=? c #\\) (char=? c #\") (char=? c #\$)
+                            (char=? c #\`) (char=? c #\!))
+                    (write-char #\\ out))
+                  (write-char c out)
+                  (loop (+ i 1)))))))))))
 
 (def (display-declare-var name var)
   (let* ((flags (declare-var-flags var))
@@ -2511,21 +2527,21 @@
            (let* ((keys (sort! (hash-keys tbl) <))
                   (last-key (and (pair? keys) (last keys))))
              (if (array-dense? tbl)
-               ;; Dense array: (val1 val2 val3) — no indices
+               ;; Dense array: ("val1" "val2" "val3") — no indices, double-quoted
                (for-each
                 (lambda (k)
-                  (display (shell-quote-value (hash-get tbl k)))
+                  (display (declare-quote-value (hash-get tbl k)))
                   (unless (equal? k last-key) (display " ")))
                 keys)
-               ;; Sparse array: ([3]=val [5]=val) — with indices
+               ;; Sparse array: ([3]="val" [5]="val") — with indices, double-quoted
                (for-each
                 (lambda (k)
-                  (display (format "[~a]=~a" k (shell-quote-value (hash-get tbl k))))
+                  (display (format "[~a]=~a" k (declare-quote-value (hash-get tbl k))))
                   (unless (equal? k last-key) (display " ")))
                 keys))))
          (displayln ")")))
       ((shell-var-assoc? var)
-       ;; Assoc array: declare -A map=(['key1']=val1 ['key2']=val2)
+       ;; Assoc array: declare -A map=(['key1']="val1" ['key2']="val2")
        (let ((tbl (shell-var-value var)))
          (display (format "declare ~a ~a=(" flag-str name))
          (when (hash-table? tbl)
@@ -2535,13 +2551,13 @@
                   (last-key (and (pair? keys) (last keys))))
              (for-each
               (lambda (k)
-                (display (format "['~a']=~a" k (shell-quote-value (hash-get tbl k))))
+                (display (format "[~a]=~a" k (declare-quote-value (hash-get tbl k))))
                 (unless (string=? k last-key) (display " ")))
               keys)))
          (displayln ")")))
       (else
        (displayln (format "declare ~a ~a=~a" flag-str name
-                         (shell-quote-value (shell-var-scalar-value var))))))))
+                         (declare-quote-value (shell-var-scalar-value var))))))))
 
 ;; Continuation for early return from declare
 (def return-from-declare (make-parameter #f))
