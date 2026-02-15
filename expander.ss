@@ -320,31 +320,26 @@
                   ;; If text ends with non-ws IFS delimiter and there are more segments,
                   ;; add trailing empty field to force word boundary
                   (let* ((ifs (or (env-get env "IFS") " \t\n"))
-                         (trailing-nws-delim?
+                         ;; Check if text ends with ANY IFS delimiter and more segments follow
+                         ;; Non-ws IFS: creates empty trailing field (POSIX)
+                         ;; Ws IFS: creates word boundary with adjacent content
+                         (trailing-ifs-delim?
                            (and (> (string-length text) 0)
                                 (pair? (cdr segs))
                                 (not (string=? ifs ""))
-                                (let ((last-ch (string-ref text (- (string-length text) 1))))
-                                  (and (ifs-char? last-ch ifs)
-                                       (not (or (char=? last-ch #\space)
-                                                (char=? last-ch #\tab)
-                                                (char=? last-ch #\newline)))))))
-                         ;; Also check if text starts with non-ws IFS delimiter
-                         ;; and there's a preceding segment
-                         (leading-nws-delim?
+                                (ifs-char? (string-ref text (- (string-length text) 1)) ifs)))
+                         ;; Check if text starts with ANY IFS delimiter and word already started
+                         (leading-ifs-delim?
                            (and (> (string-length text) 0)
                                 word-started?
                                 (not (string=? ifs ""))
-                                (let ((first-ch (string-ref text 0)))
-                                  (and (ifs-char? first-ch ifs)
-                                       (not (or (char=? first-ch #\space)
-                                                (char=? first-ch #\tab)
-                                                (char=? first-ch #\newline)))))))
+                                (ifs-char? (string-ref text 0) ifs)))
                          (raw-split (word-split text env))
-                         (split-words (if trailing-nws-delim?
+                         ;; Only add boundary markers when split produced actual words
+                         (split-words (if (and trailing-ifs-delim? (pair? raw-split))
                                        (append raw-split [""])
                                        raw-split))
-                         (split-words (if (and leading-nws-delim?
+                         (split-words (if (and leading-ifs-delim?
                                               (pair? split-words)
                                               (not (string=? (car split-words) "")))
                                        (cons "" split-words)
