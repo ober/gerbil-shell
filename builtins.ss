@@ -449,7 +449,49 @@
               (if eq-pos
                 (let* ((name (substring arg 0 eq-pos))
                        (value (substring arg (+ eq-pos 1) (string-length arg))))
-                  (env-readonly! env name value))
+                  ;; Handle -a/-A with compound array assignment
+                  (if (and (or array? assoc?)
+                           (> (string-length value) 0)
+                           (char=? (string-ref value 0) #\())
+                    ;; Compound array: parse and assign
+                    (let* ((inner (if (and (> (string-length value) 1)
+                                          (char=? (string-ref value (- (string-length value) 1)) #\)))
+                                   (substring value 1 (- (string-length value) 1))
+                                   (substring value 1 (string-length value))))
+                           (tbl (make-hash-table))
+                           (existing (or (hash-get (shell-environment-vars env) name)
+                                         (let ((v (make-shell-var tbl #f #f #t #f #f #f #f array? assoc?)))
+                                           (hash-put! (shell-environment-vars env) name v) v))))
+                      (when (> (string-length inner) 0)
+                        (let ((elems (parse-array-compound-elements inner)))
+                          (if assoc?
+                            (for-each (lambda (elem)
+                              (let ((bracket-start (string-find-char* elem #\[)))
+                                (when bracket-start
+                                  (let* ((bracket-end (string-find-char-from elem #\] (+ bracket-start 1)))
+                                         (key (substring elem (+ bracket-start 1) (or bracket-end (string-length elem))))
+                                         (eq (string-find-char-from elem #\= (or bracket-end 0)))
+                                         (val (if eq (substring elem (+ eq 1) (string-length elem)) "")))
+                                    (hash-put! tbl key val)))))
+                              elems)
+                            (let loop ((es elems) (idx 0))
+                              (when (pair? es)
+                                (hash-put! tbl idx (car es))
+                                (loop (cdr es) (+ idx 1)))))))
+                      (set! (shell-var-value existing) tbl)
+                      (set! (shell-var-array? existing) (not assoc?))
+                      (set! (shell-var-assoc? existing) assoc?)
+                      (set! (shell-var-readonly? existing) #t))
+                    ;; Scalar value
+                    (begin
+                      (env-readonly! env name value)
+                      ;; If -a/-A flag, also set the array attribute
+                      (when (or array? assoc?)
+                        (let ((var (env-get-raw-var env name)))
+                          (when var
+                            (when array? (set! (shell-var-array? var) #t))
+                            (when assoc? (set! (shell-var-assoc? var) #t)
+                                         (set! (shell-var-array? var) #f))))))))
                 ;; No value — mark readonly, create array if -a/-A flag
                 (let ((existing (hash-get (shell-environment-vars env) arg)))
                   (if existing
@@ -677,10 +719,9 @@
                  ((char=? ch #\\) (display "\\\\" buf))
                  ((char=? ch #\') (display "\\'" buf))
                  ((or (char<? ch #\space) (char=? ch #\x7f))
-                  (display (string-append "\\x"
-                    (let ((h (number->string (char->integer ch) 16)))
-                      (if (< (string-length h) 2) (string-append "0" h) h)))
-                   buf))
+                  ;; Use octal \NNN (bash uses octal for control chars in $'...')
+                  (let ((oct (number->string (char->integer ch) 8)))
+                    (display (string-append "\\" (make-string (- 3 (string-length oct)) #\0) oct) buf)))
                  (else (display ch buf))))
              (loop (+ i 1))))
          (display "'" buf)
@@ -2181,10 +2222,25 @@
      (lambda (arg)
        (let* ((eq-pos (string-find-char* arg #\=))
               (name (if eq-pos (substring arg 0 eq-pos) arg))
+              ;; Strip array subscript for name validation: name[idx]=val
+              (base-name (let ((bracket (string-find-char* name #\[)))
+                           (if bracket (substring name 0 bracket) name)))
               ;; Args already expanded by expand-declaration-args (no re-expansion)
               (value (if eq-pos
                        (substring arg (+ eq-pos 1) (string-length arg))
                        #f)))
+         ;; Validate variable name (inline check: [a-zA-Z_][a-zA-Z0-9_]*)
+         (if (not (and (> (string-length base-name) 0)
+                       (let ((ch0 (string-ref base-name 0)))
+                         (or (char-alphabetic? ch0) (char=? ch0 #\_)))
+                       (let vloop ((vi 1))
+                         (or (>= vi (string-length base-name))
+                             (let ((ch (string-ref base-name vi)))
+                               (and (or (char-alphabetic? ch) (char-numeric? ch) (char=? ch #\_))
+                                    (vloop (+ vi 1))))))))
+           (begin
+             (fprintf (current-error-port) "declare: `~a': not a valid identifier~n" arg)
+             (set! status 1))
          (if print?
            ;; -p name: print declaration (return 1 if var not found)
            ;; -pg: look in global scope only
@@ -2314,7 +2370,7 @@
                (unless (shell-var-assoc? var)
                  (set! (shell-var-value var) (make-hash-table))
                  (set! (shell-var-assoc? var) #t)
-                 (set! (shell-var-array? var) #f)))))))
+                 (set! (shell-var-array? var) #f))))))))  ;; extra close for valid-shell-name? if
      (reverse names))
     status)))
 
@@ -2413,31 +2469,18 @@
       ((eq? (shell-var-value var) +unset-sentinel+)
        (displayln (format "declare ~a ~a" flag-str name)))
       ((shell-var-array? var)
-       ;; Indexed array
+       ;; Indexed array: always use [idx]=val format (matching bash)
        (let ((tbl (shell-var-value var)))
-         (if (and (hash-table? tbl) (> (hash-length tbl) 0) (array-dense? tbl))
-           ;; Dense array: declare -a arr=(val0 val1 val2)
-           (begin
-             (display (format "declare ~a ~a=(" flag-str name))
-             (let ((n (hash-length tbl)))
-               (let loop ((i 0))
-                 (when (< i n)
-                   (when (> i 0) (display " "))
-                   (display (declare-quote-value (hash-get tbl i)))
-                   (loop (+ i 1)))))
-             (displayln ")"))
-           ;; Sparse/empty: declare -a arr=([3]=foo)
-           (begin
-             (display (format "declare ~a ~a=(" flag-str name))
-             (when (hash-table? tbl)
-               (let* ((keys (sort! (hash-keys tbl) <))
-                      (last-key (and (pair? keys) (last keys))))
-                 (for-each
-                  (lambda (k)
-                    (display (format "[~a]=~a" k (declare-quote-value (hash-get tbl k))))
-                    (unless (equal? k last-key) (display " ")))
-                  keys)))
-             (displayln ")")))))
+         (display (format "declare ~a ~a=(" flag-str name))
+         (when (hash-table? tbl)
+           (let* ((keys (sort! (hash-keys tbl) <))
+                  (last-key (and (pair? keys) (last keys))))
+             (for-each
+              (lambda (k)
+                (display (format "[~a]=~a" k (declare-quote-value (hash-get tbl k))))
+                (unless (equal? k last-key) (display " ")))
+              keys)))
+         (displayln ")")))
       ((shell-var-assoc? var)
        ;; Assoc array: declare -A map=(['key1']=val1 ['key2']=val2)
        (let ((tbl (shell-var-value var)))
@@ -2449,7 +2492,7 @@
                   (last-key (and (pair? keys) (last keys))))
              (for-each
               (lambda (k)
-                (display (format "['~a']=~a" k (declare-quote-value (hash-get tbl k))))
+                (display (format "[~a]=~a" k (declare-quote-value (hash-get tbl k))))
                 (unless (string=? k last-key) (display " ")))
               keys)))
          (displayln ")")))
@@ -3725,37 +3768,32 @@
 ;; - No quoting for simple strings (alphanumeric, _, /, ., -, +, etc.)
 ;; - Single quotes for strings with spaces/shell metachars but no single quotes
 ;; - $'...' for strings with control chars or single quotes
+;; printf %q quoting: bash uses backslash-escaping for metacharacters
+;; and $'...' only for control characters
 (def (shell-quote-string s)
   (if (string=? s "")
     "''"
     ;; Check if string contains only safe chars (no quoting needed)
-    (let* ((needs-quoting?
+    (let* ((has-control?
+            (let loop ((i 0))
+              (if (>= i (string-length s)) #f
+                (let ((ch (string-ref s i)))
+                  (if (or (< (char->integer ch) 32) (char=? ch #\x7f))
+                    #t (loop (+ i 1)))))))
+           (needs-quoting?
             (let loop ((i 0))
               (if (>= i (string-length s)) #f
                 (let ((ch (string-ref s i)))
                   (if (or (char-alphabetic? ch) (char-numeric? ch)
                           (char=? ch #\_) (char=? ch #\/) (char=? ch #\.)
                           (char=? ch #\-) (char=? ch #\+) (char=? ch #\,)
-                          (char=? ch #\:) (char=? ch #\@))
+                          (char=? ch #\:) (char=? ch #\@) (char=? ch #\%))
                     (loop (+ i 1))
-                    #t)))))
-           ;; Check if single quotes work (no single quotes or control chars)
-           (can-single-quote?
-            (and needs-quoting?
-                 (let loop ((i 0))
-                   (if (>= i (string-length s)) #t
-                     (let ((ch (string-ref s i)))
-                       (cond
-                         ((char=? ch #\') #f)
-                         ((< (char->integer ch) 32) #f)
-                         (else (loop (+ i 1))))))))))
+                    #t))))))
       (cond
         ((not needs-quoting?) s)
-        (can-single-quote?
-         ;; Use single quotes: 'string with spaces'
-         (string-append "'" s "'"))
-        (else
-         ;; Use $'...' for strings with control chars or single quotes
+        (has-control?
+         ;; Use $'...' for strings with control chars
          (let ((buf (open-output-string)))
            (display "$'" buf)
            (let loop ((i 0))
@@ -3770,14 +3808,27 @@
                    ((char=? ch (integer->char 7)) (display "\\a" buf))
                    ((char=? ch (integer->char 8)) (display "\\b" buf))
                    ((char=? ch (integer->char 27)) (display "\\e" buf))
-                   ((< (char->integer ch) 32)
-                    ;; Other control chars: \xHH (zero-padded)
-                    (let ((h (number->string (char->integer ch) 16)))
-                      (display (format "\\x~a" (if (< (string-length h) 2)
-                                                 (string-append "0" h) h)) buf)))
+                   ((or (char=? ch #\x7f) (< (char->integer ch) 32))
+                    ;; Use octal \NNN (matching bash $'...' output)
+                    (let ((oct (number->string (char->integer ch) 8)))
+                      (display (string-append "\\" (make-string (- 3 (string-length oct)) #\0) oct) buf)))
                    (else (display ch buf))))
                (loop (+ i 1))))
            (display "'" buf)
+           (get-output-string buf)))
+        (else
+         ;; Backslash-escape shell metacharacters (bash %q style)
+         (let ((buf (open-output-string)))
+           (let loop ((i 0))
+             (when (< i (string-length s))
+               (let ((ch (string-ref s i)))
+                 (if (or (char-alphabetic? ch) (char-numeric? ch)
+                         (char=? ch #\_) (char=? ch #\/) (char=? ch #\.)
+                         (char=? ch #\-) (char=? ch #\+) (char=? ch #\,)
+                         (char=? ch #\:) (char=? ch #\@) (char=? ch #\%))
+                   (display ch buf)
+                   (begin (display #\\ buf) (display ch buf))))
+               (loop (+ i 1))))
            (get-output-string buf)))))))
 
 

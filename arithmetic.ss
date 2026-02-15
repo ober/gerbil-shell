@@ -103,10 +103,17 @@
                  (check (+ k 1))
                  (error (format "arithmetic: invalid octal constant: ~a"
                                 (substring expr i j))))
-               (let ((num (string->number (substring expr (+ i 1) j) 8)))
-                 (if num (values num j)
-                   (error (format "arithmetic: invalid octal constant: ~a"
-                                  (substring expr i j))))))))))
+               ;; Check for trailing # (invalid base-N with leading 0: 02#xxx)
+               (if (and (< j len) (char=? (string-ref expr j) #\#))
+                 (let ((end (let lp ((k (+ j 1)))
+                              (if (and (< k len) (arith-alnum? (string-ref expr k)))
+                                (lp (+ k 1)) k))))
+                   (error (format "arithmetic: invalid number: ~a"
+                                  (substring expr i end))))
+                 (let ((num (string->number (substring expr (+ i 1) j) 8)))
+                   (if num (values num j)
+                     (error (format "arithmetic: invalid octal constant: ~a"
+                                    (substring expr i j)))))))))))
       ;; Decimal — possibly followed by #val for base-N
       (else
        (let loop ((j i))
