@@ -82,8 +82,8 @@
          ;; The exec redirect inside the shell command handles the FIFO connection.
          (p (open-process
              [path: "/bin/sh"
-              arguments: ["-c" (string-append redir cmd-text)]
-              environment: (env-exported-alist env)
+              arguments: ["-c" (string->c-safe (string-append redir cmd-text))]
+              environment: (map string->c-safe (env-exported-alist env))
               directory: (current-directory)
               stdin-redirection: #f
               stdout-redirection: #f

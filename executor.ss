@@ -321,14 +321,18 @@
                      ;; Reassemble: name=("elem1" "elem2" ...)
                      (rebuilt (string-append "(" (string-join quoted-elems " ") ")")))
                 [(string-append name-part rebuilt)])
-              (let* ((expanded (expand-word-nosplit w env))
-                     (exp-eq-pos (string-find-char* expanded #\=)))
-                (if exp-eq-pos
-                  (let* ((name-part (substring expanded 0 (+ exp-eq-pos 1)))
-                         (val-part (substring expanded (+ exp-eq-pos 1) (string-length expanded)))
-                         (expanded-val (expand-assignment-value val-part env)))
-                    [(string-append name-part expanded-val)])
-                  [expanded])))))
+              ;; For literal assignments: split raw name=value BEFORE expansion,
+              ;; then expand name and value separately to avoid double quote removal.
+              ;; expand-word-nosplit on the whole thing would strip outer quotes,
+              ;; then expand-assignment-value would strip inner quotes (double expansion).
+              (let* ((raw-eq-pos (string-find-char* w #\=))
+                     (raw-name (and raw-eq-pos (substring w 0 (+ raw-eq-pos 1))))
+                     (raw-val (and raw-eq-pos (substring w (+ raw-eq-pos 1) (string-length w)))))
+                (if raw-eq-pos
+                  (let* ((expanded-name (expand-word-nosplit raw-name env))
+                         (expanded-val (expand-assignment-value raw-val env)))
+                    [(string-append expanded-name expanded-val)])
+                  [(expand-word-nosplit w env)])))))
          ;; Regular arg - normal expansion with splitting
          (else (expand-word w env)))))
    words))
@@ -374,9 +378,9 @@
            (force-output)
            (force-output (current-error-port))
            (let* ((proc (open-process
-                         [path: path
-                          arguments: args
-                          environment: (env-exported-alist env)
+                         [path: (string->c-safe path)
+                          arguments: (map string->c-safe args)
+                          environment: (map string->c-safe (env-exported-alist env))
                           stdin-redirection: #f
                           stdout-redirection: #f
                           stderr-redirection: #f]))
@@ -451,9 +455,9 @@
         ;; (A true exec would use ffi-execvp but Gambit doesn't let us)
         (let* ((env-alist (if clear-env? [] (env-exported-alist env)))
                (proc (open-process
-                      [path: path
-                       arguments: cmd-args
-                       environment: env-alist
+                      [path: (string->c-safe path)
+                       arguments: (map string->c-safe cmd-args)
+                       environment: (map string->c-safe env-alist)
                        stdin-redirection: #f
                        stdout-redirection: #f
                        stderr-redirection: #f]))
@@ -1006,9 +1010,9 @@
                              env))
                  (_flush (begin (force-output) (force-output (current-error-port))))
                  (proc (open-process
-                        [path: path
-                         arguments: actual-args
-                         environment: (env-exported-alist temp-env)
+                        [path: (string->c-safe path)
+                         arguments: (map string->c-safe actual-args)
+                         environment: (map string->c-safe (env-exported-alist temp-env))
                          stdin-redirection: #f
                          stdout-redirection: #f
                          stderr-redirection: #f]))

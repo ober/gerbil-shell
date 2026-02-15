@@ -11,6 +11,25 @@
         :std/error
         :gsh/ffi)
 
+;;; --- open-process string encoding ---
+
+;; Encode a Scheme string to C-safe Latin-1 for Gambit's open-process.
+;; Gambit can't convert chars > 127 to C char-strings.
+;; Converts unicode chars to their UTF-8 byte representation as Latin-1 chars.
+(def (string->c-safe s)
+  (let ((len (string-length s)))
+    (let check ((i 0))
+      (cond ((>= i len) s)
+            ((< (char->integer (string-ref s i)) 128) (check (+ i 1)))
+            (else
+             (let* ((u8 (string->bytes s))
+                    (u8len (u8vector-length u8))
+                    (out (make-string u8len)))
+               (let loop ((j 0))
+                 (if (>= j u8len) out
+                     (begin (string-set! out j (integer->char (u8vector-ref u8 j)))
+                            (loop (+ j 1)))))))))))
+
 ;;; --- waitpid status decoders (shell-level) ---
 
 ;; Decode raw waitpid status to a shell exit code (0-255)

@@ -159,9 +159,9 @@
                                  (lambda () (apply-redirections redirections env)))
                                 []))
                  (proc (open-process
-                        [path: path
-                         arguments: args
-                         environment: (env-exported-alist env)
+                        [path: (string->c-safe path)
+                         arguments: (map string->c-safe args)
+                         environment: (map string->c-safe (env-exported-alist env))
                          stdin-redirection: #f
                          stdout-redirection: #f
                          stderr-redirection: #f])))
