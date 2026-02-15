@@ -800,12 +800,22 @@
                     (val (env-array-get env name (expand-word-nosplit idx env))))
                (number->string (string-length val)))
              ;; ${#name} — string length (UTF-8 code points)
-             (let* ((val (env-get env rest))
-                    (val (or val (begin
-                                  (when (env-option? env "nounset")
-                                    (nounset-error! rest env))
-                                  ""))))
-               (number->string (utf8-string-length val)))))))
+             ;; Reject ${#name<modifier>} combinations like ${#x-default}
+             (begin
+               (when (let check ((j 0))
+                       (and (< j (string-length rest))
+                            (let ((ch (string-ref rest j)))
+                              (if (or (char-alphabetic? ch) (char-numeric? ch)
+                                      (char=? ch #\_))
+                                (check (+ j 1))
+                                #t))))  ;; found non-identifier char
+                 (error (format "bad substitution: ${#~a}" rest)))
+               (let* ((val (env-get env rest))
+                      (val (or val (begin
+                                    (when (env-option? env "nounset")
+                                      (nounset-error! rest env))
+                                    ""))))
+                 (number->string (utf8-string-length val))))))))
       ;; ${!name[@]} or ${!name[*]} — array keys/indices
       ;; Also handle ${!name} — indirect expansion
       ((and (> len 1)
@@ -1013,6 +1023,53 @@
       (char=? ch #\?) (char=? ch #\!)
       (char=? ch #\$) (char=? ch #\-)))
 
+;; Find the separator slash in str for patsub.
+;; Scans from pattern-start with quote awareness, skipping the first
+;; "unit" (character or quoted group) to ensure the pattern gets at least
+;; one char. Returns the index of the separator slash, or #f if not found.
+(def (find-patsub-separator str pattern-start)
+  (let ((len (string-length str)))
+    ;; First, skip one unit (char or quoted group) to consume the minimal pattern
+    (let ((past-first
+           (cond
+             ((>= pattern-start len) pattern-start)
+             ((char=? (string-ref str pattern-start) #\')
+              ;; Skip single-quoted group
+              (let inner ((j (+ pattern-start 1)))
+                (cond ((>= j len) j)
+                      ((char=? (string-ref str j) #\') (+ j 1))
+                      (else (inner (+ j 1))))))
+             ((char=? (string-ref str pattern-start) #\")
+              ;; Skip double-quoted group
+              (let inner ((j (+ pattern-start 1)))
+                (cond ((>= j len) j)
+                      ((char=? (string-ref str j) #\") (+ j 1))
+                      ((char=? (string-ref str j) #\\) (inner (+ j 2)))
+                      (else (inner (+ j 1))))))
+             ((char=? (string-ref str pattern-start) #\\)
+              ;; Skip escaped char
+              (+ pattern-start 2))
+             (else (+ pattern-start 1)))))
+      ;; Now search for unquoted slash from past-first onwards
+      (let loop ((i past-first))
+        (cond
+          ((>= i len) #f)
+          ((char=? (string-ref str i) #\')
+           (let inner ((j (+ i 1)))
+             (cond ((>= j len) #f)
+                   ((char=? (string-ref str j) #\') (loop (+ j 1)))
+                   (else (inner (+ j 1))))))
+          ((char=? (string-ref str i) #\")
+           (let inner ((j (+ i 1)))
+             (cond ((>= j len) #f)
+                   ((char=? (string-ref str j) #\") (loop (+ j 1)))
+                   ((char=? (string-ref str j) #\\) (inner (+ j 2)))
+                   (else (inner (+ j 1))))))
+          ((char=? (string-ref str i) #\\)
+           (loop (+ i 2)))
+          ((char=? (string-ref str i) #\/) i)
+          (else (loop (+ i 1))))))))
+
 ;; Parse modifier from a rest string starting after the name.
 ;; Returns (values modifier arg) or #f if no modifier found.
 (def (parse-modifier-from-rest rest)
@@ -1043,14 +1100,16 @@
              (values 'prefix-short (substring rest 1 rlen))))
           ((char=? mod-ch #\/)
            (if (and (> rlen 1) (char=? (string-ref rest 1) #\/))
-             ;; ${name//pattern/replacement}
-             (let ((sep (string-find-char-from rest #\/ 2)))
+             ;; ${name//pattern/replacement} — global replace
+             ;; Pattern starts at pos 2; find separator after first pattern unit
+             (let ((sep (find-patsub-separator rest 2)))
                (if sep
                  (values '// (cons (substring rest 2 sep)
                                    (substring rest (+ sep 1) rlen)))
                  (values '// (cons (substring rest 2 rlen) ""))))
-             ;; ${name/pattern/replacement}
-             (let ((sep (string-find-char-from rest #\/ 1)))
+             ;; ${name/pattern/replacement} — single replace
+             ;; Pattern starts at pos 1; find separator after first pattern unit
+             (let ((sep (find-patsub-separator rest 1)))
                (if sep
                  (values '/ (cons (substring rest 1 sep)
                                   (substring rest (+ sep 1) rlen)))
@@ -1120,16 +1179,18 @@
                         (substring content (+ i 1) len))))
              ((#\/)
               (if (and (< (+ i 1) len) (char=? (string-ref content (+ i 1)) #\/))
-                ;; ${name//pattern/replacement}
-                (let ((sep (string-find-char-from content #\/ (+ i 2))))
+                ;; ${name//pattern/replacement} — global replace
+                ;; Pattern starts at i+2; find separator after first pattern unit
+                (let ((sep (find-patsub-separator content (+ i 2))))
                   (if sep
                     (values (substring content 0 i) '//
                             (cons (substring content (+ i 2) sep)
                                   (substring content (+ sep 1) len)))
                     (values (substring content 0 i) '//
                             (cons (substring content (+ i 2) len) ""))))
-                ;; ${name/pattern/replacement}
-                (let ((sep (string-find-char-from content #\/ (+ i 1))))
+                ;; ${name/pattern/replacement} — single replace
+                ;; Pattern starts at i+1; find separator after first pattern unit
+                (let ((sep (find-patsub-separator content (+ i 1))))
                   (if sep
                     (values (substring content 0 i) '/
                             (cons (substring content (+ i 1) sep)
