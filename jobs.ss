@@ -6,7 +6,8 @@
         :std/iter
         :std/os/signal
         :gsh/ffi
-        :gsh/util)
+        :gsh/util
+        :gsh/signals)
 
 ;;; --- Job structures ---
 
@@ -230,7 +231,11 @@
                    ((WIFEXITED raw)
                     (set! (job-process-status proc) 'exited))
                    ((WIFSIGNALED raw)
-                    (set! (job-process-status proc) 'signaled))
+                    (set! (job-process-status proc) 'signaled)
+                    ;; Print signal description to stderr (like bash)
+                    (let ((desc (signal-description (WTERMSIG raw))))
+                      (when desc
+                        (fprintf (current-error-port) "~a~n" desc))))
                    (else
                     (set! (job-process-status proc) 'exited)))))))))
      (job-processes job))

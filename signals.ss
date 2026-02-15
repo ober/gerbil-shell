@@ -113,6 +113,24 @@
      *signal-names*)
     result))
 
+;; Human-readable signal descriptions (matching strsignal/bash output)
+(def *signal-descriptions*
+  (hash
+   ("HUP" "Hangup") ("INT" "Interrupt") ("QUIT" "Quit")
+   ("ILL" "Illegal instruction") ("TRAP" "Trace/breakpoint trap")
+   ("ABRT" "Aborted") ("FPE" "Floating point exception")
+   ("KILL" "Killed") ("SEGV" "Segmentation fault")
+   ("PIPE" "Broken pipe") ("ALRM" "Alarm clock") ("TERM" "Terminated")
+   ("USR1" "User defined signal 1") ("USR2" "User defined signal 2")
+   ("CHLD" "Child exited") ("CONT" "Continued") ("STOP" "Stopped (signal)")
+   ("TSTP" "Stopped") ("TTIN" "Stopped (tty input)")
+   ("TTOU" "Stopped (tty output)")))
+
+;; Get human-readable description for a signal number
+(def (signal-description signum)
+  (let ((name (signal-number->name signum)))
+    (and name (hash-get *signal-descriptions* name))))
+
 ;;; --- Trap operations ---
 
 ;; Set a trap for a signal
