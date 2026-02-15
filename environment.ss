@@ -288,9 +288,14 @@
   (let ((var (env-get-raw-var env name)))
     (if var
       (begin
-        (set! (shell-var-exported? var) #t)
-        (let ((v (shell-var-scalar-value var)))
-          (when v (setenv name v))))
+        ;; Arrays cannot be exported — silently ignore (bash behavior)
+        (when (or (shell-var-array? var) (shell-var-assoc? var))
+          (set! (shell-var-exported? var) #f)
+          (ffi-unsetenv name))
+        (unless (or (shell-var-array? var) (shell-var-assoc? var))
+          (set! (shell-var-exported? var) #t)
+          (let ((v (shell-var-scalar-value var)))
+            (when v (setenv name v)))))
       ;; No var exists anywhere — create exported in current scope
       (if value
         (begin

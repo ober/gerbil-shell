@@ -208,37 +208,36 @@
                           (if (string=? cmd-name "exec")
                             (execute-exec args redirections temp-env)
                             (let ((saved (apply-redirections redirections temp-env)))
-                              (let ((result
-                                     (cond
-                                       ;; Check for shell function
-                                       ((function-lookup env cmd-name)
-                                        => (lambda (func)
-                                             (let* ((func-redirs (shell-function-redirections func))
-                                                    (func-saved (if (pair? func-redirs)
-                                                                  (apply-redirections func-redirs temp-env)
-                                                                  []))
-                                                    (result (function-call func args temp-env execute-command)))
-                                               (when (pair? func-saved)
-                                                 (restore-redirections func-saved))
-                                               result)))
-                                       ;; Check for builtin
-                                       ((builtin-lookup cmd-name)
-                                        => (lambda (handler)
-                                             (handler args temp-env)))
-                                       ;; Reserved word used as command (e.g. from command sub)
-                                       ((member cmd-name '("if" "then" "elif" "else" "fi"
-                                                           "do" "done" "case" "esac"
-                                                           "while" "until" "for" "in"
-                                                           "select" "function" "{" "}"))
-                                        (fprintf (current-error-port)
-                                                 "gsh: syntax error near unexpected token `~a'~n" cmd-name)
-                                        2)
-                                       ;; External command
-                                       (else
-                                        (execute-external cmd-name args temp-env)))))
-                                ;; Restore redirections
-                                (restore-redirections saved)
-                                result)))))))
+                              (unwind-protect
+                               (cond
+                                 ;; Check for shell function
+                                 ((function-lookup env cmd-name)
+                                  => (lambda (func)
+                                       (let* ((func-redirs (shell-function-redirections func))
+                                              (func-saved (if (pair? func-redirs)
+                                                            (apply-redirections func-redirs temp-env)
+                                                            []))
+                                              (result (function-call func args temp-env execute-command)))
+                                         (when (pair? func-saved)
+                                           (restore-redirections func-saved))
+                                         result)))
+                                 ;; Check for builtin
+                                 ((builtin-lookup cmd-name)
+                                  => (lambda (handler)
+                                       (handler args temp-env)))
+                                 ;; Reserved word used as command (e.g. from command sub)
+                                 ((member cmd-name '("if" "then" "elif" "else" "fi"
+                                                     "do" "done" "case" "esac"
+                                                     "while" "until" "for" "in"
+                                                     "select" "function" "{" "}"))
+                                  (fprintf (current-error-port)
+                                           "gsh: syntax error near unexpected token `~a'~n" cmd-name)
+                                  2)
+                                 ;; External command
+                                 (else
+                                  (execute-external cmd-name args temp-env)))
+                               ;; Always restore redirections, even on exception
+                               (restore-redirections saved))))))))
                  ;; Set last status and PIPESTATUS
                  (env-set-last-status! env status)
                  (env-array-set-compound! env "PIPESTATUS"
