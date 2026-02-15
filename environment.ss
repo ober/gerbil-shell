@@ -292,10 +292,14 @@
         (let ((v (shell-var-scalar-value var)))
           (when v (setenv name v))))
       ;; No var exists anywhere — create exported in current scope
-      (when value
+      (if value
+        (begin
+          (hash-put! (shell-environment-vars env) name
+                     (make-shell-var value #t #f #f #f #f #f #f #f #f))
+          (setenv name value))
+        ;; export with no value: create unset-but-exported marker
         (hash-put! (shell-environment-vars env) name
-                   (make-shell-var value #t #f #f #f #f #f #f #f #f))
-        (setenv name value)))))
+                   (make-shell-var +unset-sentinel+ #t #f #f #f #f #f #f #f #f))))))
 
 ;; Unset a variable — resolves namerefs (unsets the target, not the ref)
 ;; Use env-unset-nameref! to unset the nameref itself.

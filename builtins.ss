@@ -339,24 +339,29 @@
          0)
         ;; Export/unexport variables (with or without -p; -p ignored when names given)
         (else
-         (for-each
-          (lambda (arg)
-            (let ((eq-pos (string-find-char* arg #\=)))
-              (if eq-pos
-                (let* ((name (substring arg 0 eq-pos))
-                       (value (substring arg (+ eq-pos 1) (string-length arg))))
+         (let ((status 0))
+           (for-each
+            (lambda (arg)
+              (let ((eq-pos (string-find-char* arg #\=)))
+                (if eq-pos
+                  (let* ((name (substring arg 0 eq-pos))
+                         (value (substring arg (+ eq-pos 1) (string-length arg))))
+                    (if remove?
+                      ;; export -n name=val: not allowed — report error
+                      (begin
+                        (fprintf (current-error-port)
+                                 "gsh: export: ~a: not a valid identifier~n" arg)
+                        (set! status 2))
+                      (env-export! env name value)))
                   (if remove?
-                    ;; export -n name=val: just remove export flag
-                    (let ((var (env-get-raw-var env name)))
-                      (when var (set! (shell-var-exported? var) #f)))
-                    (env-export! env name value)))
-                (if remove?
-                  ;; export -n name: remove export flag
-                  (let ((var (env-get-raw-var env arg)))
-                    (when var (set! (shell-var-exported? var) #f)))
-                  (env-export! env arg)))))
-          names)
-         0)))))
+                    ;; export -n name: remove export flag and unsetenv
+                    (let ((var (env-get-raw-var env arg)))
+                      (when var
+                        (set! (shell-var-exported? var) #f)
+                        (ffi-unsetenv arg)))
+                    (env-export! env arg)))))
+            names)
+           status))))))
 
 ;; unset [-fvn] name ...
 (builtin-register! "unset"
@@ -371,37 +376,44 @@
         ((string=? (car args) "-n")
          (loop (cdr args) #f #t))
         (else
-         (for-each
-          (lambda (name)
-            (cond
-              (unset-func?
-               (function-unset! env name))
-              (unset-nameref?
-               ;; unset -n: unset the nameref itself, not the target
-               (with-catch (lambda (e) #!void)
-                 (lambda () (env-unset-nameref! env name))))
-              (else
-               (with-catch (lambda (e) #!void)
-                 (lambda ()
-                   ;; Check for array element syntax: name[idx]
-                   (let ((bracket-pos (string-find-char* name #\[)))
-                     (if (and bracket-pos
-                              (> bracket-pos 0)
-                              (let ((close (string-find-char* name #\])))
-                                (and close (= close (- (string-length name) 1)))))
-                       ;; Unset array element
-                       (let ((var-name (substring name 0 bracket-pos))
-                             (index (substring name (+ bracket-pos 1)
-                                              (- (string-length name) 1))))
-                         (env-array-unset-element! env var-name index))
-                       ;; Unset whole variable (resolves namerefs)
-                       ;; If no variable exists, also try to unset function (POSIX)
-                       (let ((var (env-get-raw-var env name)))
-                         (if var
-                           (env-unset! env name)
-                           (function-unset! env name))))))))))
-          args)
-         0)))))
+         (let ((status 0))
+           (for-each
+            (lambda (name)
+              (cond
+                (unset-func?
+                 (function-unset! env name))
+                (unset-nameref?
+                 ;; unset -n: unset the nameref itself, not the target
+                 (with-catch
+                  (lambda (e)
+                    (fprintf (current-error-port) "gsh: unset: ~a: cannot unset~n" name)
+                    (set! status 1))
+                  (lambda () (env-unset-nameref! env name))))
+                (else
+                 (with-catch
+                  (lambda (e)
+                    (fprintf (current-error-port) "gsh: unset: ~a: cannot unset: readonly variable~n" name)
+                    (set! status 1))
+                  (lambda ()
+                    ;; Check for array element syntax: name[idx]
+                    (let ((bracket-pos (string-find-char* name #\[)))
+                      (if (and bracket-pos
+                               (> bracket-pos 0)
+                               (let ((close (string-find-char* name #\])))
+                                 (and close (= close (- (string-length name) 1)))))
+                        ;; Unset array element
+                        (let ((var-name (substring name 0 bracket-pos))
+                              (index (substring name (+ bracket-pos 1)
+                                               (- (string-length name) 1))))
+                          (env-array-unset-element! env var-name index))
+                        ;; Unset whole variable (resolves namerefs)
+                        ;; If no variable exists, also try to unset function (POSIX)
+                        (let ((var (env-get-raw-var env name)))
+                          (if var
+                            (env-unset! env name)
+                            (function-unset! env name))))))))))
+            args)
+           status))))))
 
 ;; readonly [-aAp] [name[=value] ...]
 (builtin-register! "readonly"
@@ -2042,11 +2054,24 @@
                       (hash-put! (shell-environment-vars env) name
                                  (make-shell-var value effective-export? readonly? #t
                                                 integer? #f #f nameref? array? assoc?))))
-                  ;; No value - just declare
-                  (hash-put! (shell-environment-vars env) arg
-                             (make-shell-var (if (or array? assoc?) (make-hash-table) +unset-sentinel+)
-                                            effective-export? readonly? #t
-                                            integer? #f #f nameref? array? assoc?)))))
+                  ;; No value - just declare as local
+                  ;; If already exists in this scope, keep it (second 'local foo' is no-op)
+                  (let ((existing (hash-get (shell-environment-vars env) arg)))
+                    (if existing
+                      ;; Already declared locally — apply any new flags but keep value
+                      (begin
+                        (when nameref? (set! (shell-var-nameref? existing) #t))
+                        (when integer? (set! (shell-var-integer? existing) #t))
+                        (when readonly? (set! (shell-var-readonly? existing) #t))
+                        (when effective-export? (set! (shell-var-exported? existing) #t))
+                        (when array? (set! (shell-var-array? existing) #t))
+                        (when assoc? (set! (shell-var-assoc? existing) #t))
+                        (set! (shell-var-local? existing) #t))
+                      ;; New local declaration
+                      (hash-put! (shell-environment-vars env) arg
+                                 (make-shell-var (if (or array? assoc?) (make-hash-table) +unset-sentinel+)
+                                                effective-export? readonly? #t
+                                                integer? #f #f nameref? array? assoc?)))))))
             args)
            0))))))))
 
