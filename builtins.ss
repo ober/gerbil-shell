@@ -375,48 +375,75 @@
           args)
          0)))))
 
-;; readonly [-p] [name[=value] ...]
+;; readonly [-aAp] [name[=value] ...]
 (builtin-register! "readonly"
   (lambda (args env)
-    (cond
-      ;; readonly -p: list all readonly vars in declare format
-      ((and (pair? args) (string=? (car args) "-p"))
-       (let* ((all-vars (collect-all-vars env))
-              (names (sort! (hash-keys all-vars) string<?)))
+    ;; Parse flags
+    (let ((print? #f) (array? #f) (assoc? #f) (names []))
+      (let loop ((args args))
+        (if (null? args)
+          (void)
+          (let ((arg (car args)))
+            (cond
+              ;; Flag arguments like -p, -a, -A, -pa etc.
+              ((and (> (string-length arg) 1)
+                    (char=? (string-ref arg 0) #\-))
+               (let floop ((i 1))
+                 (when (< i (string-length arg))
+                   (case (string-ref arg i)
+                     ((#\p) (set! print? #t))
+                     ((#\a) (set! array? #t))
+                     ((#\A) (set! assoc? #t))
+                     (else (void)))
+                   (floop (+ i 1))))
+               (loop (cdr args)))
+              (else
+               (set! names (append names (list arg)))
+               (loop (cdr args)))))))
+      (cond
+        ;; readonly -p (or with no args): list all readonly vars
+        ((or print? (null? names))
+         (let* ((all-vars (collect-all-vars env))
+                (sorted (sort! (hash-keys all-vars) string<?)))
+           (for-each
+            (lambda (name)
+              (let ((var (hash-get all-vars name)))
+                (when (and var (shell-var-readonly? var)
+                           (not (eq? (shell-var-value var) +unset-sentinel+)))
+                  (display-declare-var name var))))
+            sorted))
+         0)
+        ;; readonly with names
+        (else
          (for-each
-          (lambda (name)
-            (let ((var (hash-get all-vars name)))
-              (when (and var (shell-var-readonly? var)
-                         (not (eq? (shell-var-value var) +unset-sentinel+)))
-                (display-declare-var name var))))
-          names))
-       0)
-      ;; readonly with no args: list readonly vars in declare format
-      ((null? args)
-       (let* ((all-vars (collect-all-vars env))
-              (names (sort! (hash-keys all-vars) string<?)))
-         (for-each
-          (lambda (name)
-            (let ((var (hash-get all-vars name)))
-              (when (and var (shell-var-readonly? var)
-                         (not (eq? (shell-var-value var) +unset-sentinel+)))
-                (display-declare-var name var))))
-          names))
-       0)
-      ;; readonly name=value ...
-      (else
-       (for-each
-        (lambda (arg)
-          (let ((eq-pos (string-find-char* arg #\=)))
-            (if eq-pos
-              ;; Args are already expanded by expand-declaration-args
-              ;; Don't re-expand the value (would cause double tilde expansion etc.)
-              (let* ((name (substring arg 0 eq-pos))
-                     (value (substring arg (+ eq-pos 1) (string-length arg))))
-                (env-readonly! env name value))
-              (env-readonly! env arg))))
-        args)
-       0))))
+          (lambda (arg)
+            (let ((eq-pos (string-find-char* arg #\=)))
+              (if eq-pos
+                (let* ((name (substring arg 0 eq-pos))
+                       (value (substring arg (+ eq-pos 1) (string-length arg))))
+                  (env-readonly! env name value))
+                ;; No value — mark readonly, create array if -a/-A flag
+                (let ((existing (hash-get (shell-environment-vars env) arg)))
+                  (if existing
+                    (begin
+                      (set! (shell-var-readonly? existing) #t)
+                      (when (and array? (not (shell-var-array? existing))
+                                 (not (shell-var-assoc? existing)))
+                        (set! (shell-var-array? existing) #t)
+                        (when (eq? (shell-var-value existing) +unset-sentinel+)
+                          (set! (shell-var-value existing) (make-hash-table))))
+                      (when (and assoc? (not (shell-var-assoc? existing)))
+                        (set! (shell-var-assoc? existing) #t)
+                        (set! (shell-var-array? existing) #f)
+                        (when (eq? (shell-var-value existing) +unset-sentinel+)
+                          (set! (shell-var-value existing) (make-hash-table)))))
+                    ;; Create new var — array/assoc hash or unset sentinel
+                    (hash-put! (shell-environment-vars env) arg
+                               (make-shell-var
+                                (if (or array? assoc?) (make-hash-table) +unset-sentinel+)
+                                #f #t #t #f #f #f #f array? assoc?)))))))
+          names)
+         0)))))
 
 ;; exit [n]
 (builtin-register! "exit"
@@ -2301,16 +2328,17 @@
      names)))
 
 ;; Build flag string in bash canonical order: A a i l n r t u x
+;; Bash outputs flags in this order: A a i n r x l u t
 (def (declare-var-flags var)
   (string-append
    (if (shell-var-assoc? var) "A" "")
    (if (shell-var-array? var) "a" "")
    (if (shell-var-integer? var) "i" "")
-   (if (shell-var-lowercase? var) "l" "")
    (if (shell-var-nameref? var) "n" "")
    (if (shell-var-readonly? var) "r" "")
-   (if (shell-var-uppercase? var) "u" "")
-   (if (shell-var-exported? var) "x" "")))
+   (if (shell-var-exported? var) "x" "")
+   (if (shell-var-lowercase? var) "l" "")
+   (if (shell-var-uppercase? var) "u" "")))
 
 ;; Check if an indexed array is dense (keys are 0, 1, 2, ..., n-1)
 (def (array-dense? tbl)

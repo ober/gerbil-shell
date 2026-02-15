@@ -824,7 +824,18 @@
            ;; ${!name[@]} — array keys
            (let* ((name (substring rest 0 bracket-pos))
                   (keys (env-array-keys env name)))
-             (string-join-with " " keys))
+             ;; ${!arr[@]} — return keys as separate words
+             (if (null? keys)
+               ""
+               (make-modifier-segments
+                (let eloop ((rest keys) (segs []) (first? #t))
+                  (if (null? rest)
+                    (reverse segs)
+                    (let ((new-segs (if first?
+                                     (cons (cons (car rest) 'expanded) segs)
+                                     (cons (cons (car rest) 'expanded)
+                                           (cons (cons "" 'word-break) segs)))))
+                      (eloop (cdr rest) new-segs #f)))))))
            ;; Check for ${!prefix@} or ${!prefix*} — variable name matching
            (let* ((rlen (string-length rest))
                   (last-ch (and (> rlen 0) (string-ref rest (- rlen 1)))))
@@ -832,7 +843,25 @@
                ;; ${!prefix@} or ${!prefix*} — list variable names with matching prefix
                (let* ((prefix (substring rest 0 (- rlen 1)))
                       (names (env-matching-names env prefix)))
-                 (string-join-with " " names))
+                 ;; Return as separate words when @ suffix, or IFS-empty for *
+                 (if (null? names)
+                   ""
+                   (if (char=? last-ch #\@)
+                     (make-modifier-segments
+                      (let eloop ((rest names) (segs []) (first? #t))
+                        (if (null? rest)
+                          (reverse segs)
+                          (let ((new-segs (if first?
+                                           (cons (cons (car rest) 'expanded) segs)
+                                           (cons (cons (car rest) 'expanded)
+                                                 (cons (cons "" 'word-break) segs)))))
+                            (eloop (cdr rest) new-segs #f)))))
+                     ;; ${!prefix*} — join with first char of IFS
+                     (let* ((ifs (or (env-get env "IFS") " \t\n"))
+                            (sep (if (> (string-length ifs) 0)
+                                   (string (string-ref ifs 0))
+                                   "")))
+                       (string-join-with sep names)))))
                ;; ${!name} — indirect expansion, possibly with modifiers
                (let-values (((iname modifier arg) (parse-parameter-modifier rest)))
                  (let* ((ref-name (env-get env iname))
@@ -899,18 +928,40 @@
       (let* ((subscript (substring content (+ bracket-pos 1) close))
              (after-bracket (substring content (+ close 1) len)))
         (cond
-          ;; ${name[@]} — all elements (separate words in some contexts)
+          ;; ${name[@]} — all elements as separate words
           ((and (string=? subscript "@") (string=? after-bracket ""))
            (let ((vals (env-array-values env name)))
-             (string-join-with " " vals)))
-          ;; ${name[*]} — all elements (single word)
+             (if (null? vals)
+               ""
+               ;; Return modifier-segments with word-break between elements
+               (make-modifier-segments
+                (let eloop ((rest vals) (segs []) (first? #t))
+                  (if (null? rest)
+                    (reverse segs)
+                    (let ((new-segs (if first?
+                                     (cons (cons (car rest) 'expanded) segs)
+                                     (cons (cons (car rest) 'expanded)
+                                           (cons (cons "" 'word-break) segs)))))
+                      (eloop (cdr rest) new-segs #f))))))))
+          ;; ${name[*]} — all elements joined by first char of IFS
           ((and (string=? subscript "*") (string=? after-bracket ""))
            (let* ((vals (env-array-values env name))
                   (ifs (or (env-get env "IFS") " \t\n"))
                   (sep (if (> (string-length ifs) 0)
                          (string (string-ref ifs 0))
                          "")))
-             (string-join-with sep vals)))
+             ;; When IFS is empty, bash preserves element boundaries
+             (if (and (string=? sep "") (not (null? vals)))
+               (make-modifier-segments
+                (let eloop ((rest vals) (segs []) (first? #t))
+                  (if (null? rest)
+                    (reverse segs)
+                    (let ((new-segs (if first?
+                                     (cons (cons (car rest) 'expanded) segs)
+                                     (cons (cons (car rest) 'expanded)
+                                           (cons (cons "" 'word-break) segs)))))
+                      (eloop (cdr rest) new-segs #f)))))
+               (string-join-with sep vals))))
           ;; ${name[@]modifier} or ${name[*]modifier} — with modifier
           ((and (or (string=? subscript "@") (string=? subscript "*"))
                 (> (string-length after-bracket) 0))
