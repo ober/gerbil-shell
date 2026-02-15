@@ -1154,7 +1154,8 @@
       0
       ;; Try simple number first for speed
       (or (string->number trimmed)
-          (arith-eval (expand-arith-expr trimmed env)
+          (arith-eval (parameterize ((*in-dquote-context* #t))
+                        (expand-arith-expr trimmed env))
                       (arith-env-getter env)
                       (arith-env-setter env)
                       (env-option? env "nounset"))))))
@@ -1449,7 +1450,10 @@
   ;; Pre-expand $var, ${var}, $(cmd) inside the expression before arith-eval
   (let* ((close (find-arith-close str (+ i 3)))
          (raw-expr (substring str (+ i 3) close))
-         (expr (expand-arith-expr raw-expr env))
+         ;; Expand in dquote context — arithmetic doesn't do word splitting,
+         ;; so ${var:-default} must return strings, not modifier-segments
+         (expr (parameterize ((*in-dquote-context* #t))
+                 (expand-arith-expr raw-expr env)))
          (result (arith-eval expr
                             (arith-env-getter env)
                             (arith-env-setter env)

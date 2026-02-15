@@ -723,7 +723,9 @@
         1)))
    (lambda ()
      (let* ((raw-expr (arith-command-expression cmd))
-            (expr (expand-arith-expr raw-expr env))
+            ;; Expand in dquote context — arithmetic doesn't do word splitting
+            (expr (parameterize ((*in-dquote-context* #t))
+                    (expand-arith-expr raw-expr env)))
             (result (arith-eval expr
                                 (arith-env-getter env)
                                 (arith-env-setter env)
@@ -734,7 +736,11 @@
 (def (execute-arith-for cmd env exec-fn)
   (let ((getter (arith-env-getter env))
         (setter (arith-env-setter env))
-        (expand (lambda (expr) (if expr (expand-arith-expr expr env) expr))))
+        ;; Expand in dquote context — arithmetic doesn't do word splitting
+        (expand (lambda (expr) (if expr
+                                 (parameterize ((*in-dquote-context* #t))
+                                   (expand-arith-expr expr env))
+                                 expr))))
     ;; Execute init expression
     (let ((init-expr (arith-for-command-init cmd)))
       (when (and init-expr (> (string-length init-expr) 0))
