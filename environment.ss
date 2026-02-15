@@ -174,8 +174,8 @@
                  (number->string
                   (arith-fn value
                             (if env
-                              (lambda (name) (or (string->number (or (env-get env name) "0")) 0))
-                              (lambda (name) (or (string->number (or name "0")) 0)))
+                              (lambda (name) (or (env-get env name) "0"))
+                              (lambda (name) "0"))
                             (if env
                               (lambda (name val) (env-set! env name (number->string val)))
                               (lambda (name val) #!void))))
@@ -631,10 +631,15 @@
   (let* ((name (resolve-nameref name env))
          (var (find-var-in-chain env name)))
     (if (and var (or (shell-var-array? var) (shell-var-assoc? var)))
-      (let ((tbl (shell-var-value var))
-            (key (if (shell-var-assoc? var)
-                   index  ;; string key for assoc
-                   (if (string? index) (or (string->number index) 0) index))))
+      (let* ((tbl (shell-var-value var))
+             (raw-key (if (shell-var-assoc? var)
+                        index  ;; string key for assoc
+                        (if (string? index) (or (string->number index) 0) index)))
+             ;; Handle negative indexing for indexed arrays: -1 = last, -2 = second-to-last
+             (key (if (and (not (shell-var-assoc? var)) (number? raw-key) (< raw-key 0))
+                    (let ((max-key (hash-fold (lambda (k v mx) (if (> k mx) k mx)) -1 tbl)))
+                      (+ max-key 1 raw-key))
+                    raw-key)))
         (or (hash-get tbl key) ""))
       ;; Not an array — if index is 0, return scalar value
       (if (and var (or (equal? index "0") (equal? index 0)))
@@ -739,23 +744,29 @@
       ((not var) (void))  ;; variable doesn't exist - no-op
       ((or (shell-var-array? var) (shell-var-assoc? var))
        ;; Unset array element
-       (let ((tbl (shell-var-value var))
-             (key (if (shell-var-assoc? var)
-                    index
-                    ;; Use arith-eval for indexed array subscripts
-                    (let ((idx-val (if (string? index)
-                                    (let ((n (string->number index)))
-                                      (if n n
-                                        ;; Try arithmetic evaluation for expressions like "i - 1"
-                                        (with-catch
-                                         (lambda (e) 0)
-                                         (lambda ()
-                                           (let ((arith-fn (*arith-eval-fn*)))
-                                             (if arith-fn
-                                               (arith-fn index)
-                                               0))))))
-                                    index)))
-                      idx-val))))
+       (let* ((tbl (shell-var-value var))
+              (raw-key (if (shell-var-assoc? var)
+                         index
+                         ;; Use arith-eval for indexed array subscripts
+                         (if (string? index)
+                           (let ((n (string->number index)))
+                             (if n n
+                               ;; Try arithmetic evaluation for expressions like "i - 1"
+                               (with-catch
+                                (lambda (e) 0)
+                                (lambda ()
+                                  (let ((arith-fn (*arith-eval-fn*)))
+                                    (if arith-fn
+                                      (arith-fn index
+                                                (lambda (nm) (or (env-get env nm) "0"))
+                                                (lambda (nm val) (env-set! env nm (number->string val))))
+                                      0))))))
+                           index)))
+              ;; Handle negative indexing: -1 = last, -2 = second-to-last, etc.
+              (key (if (and (not (shell-var-assoc? var)) (number? raw-key) (< raw-key 0))
+                     (let ((max-key (hash-fold (lambda (k v mx) (if (> k mx) k mx)) -1 tbl)))
+                       (+ max-key 1 raw-key))
+                     raw-key)))
          (hash-remove! tbl key)))
       (else
        ;; Variable exists but is not an array — error

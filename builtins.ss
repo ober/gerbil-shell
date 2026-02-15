@@ -1543,33 +1543,35 @@
 
 ;; Non-raw IFS splitting with backslash processing
 (def (read-ifs-split-bs str start len ifs-ws ifs-nw max-fields)
-  ;; Helper to process remaining with backslash removal for last field
-  (define (process-rest-bs j buf)
+  ;; Strategy: keep backslashes in buffer during splitting, so that escaped chars
+  ;; don't get stripped by trailing-IFS removal. Do backslash removal AFTER stripping.
+  ;; Helper to append raw rest of string (with backslashes) to buf
+  (define (append-rest j buf)
     (let rloop ((j j))
-      (cond
-        ((>= j len) #!void)
-        ((and (char=? (string-ref str j) #\\) (< (+ j 1) len))
-         (display (string-ref str (+ j 1)) buf)
-         (rloop (+ j 2)))
-        (else
-         (display (string-ref str j) buf)
-         (rloop (+ j 1))))))
+      (when (< j len)
+        (display (string-ref str j) buf)
+        (rloop (+ j 1)))))
+  ;; Finalize a last-field: strip trailing IFS from raw content, then remove backslashes
+  (define (finalize-last-field raw-s)
+    (read-strip-backslashes (strip-trailing-ifs-for-read raw-s ifs-ws ifs-nw)))
+  ;; Finalize a non-last field: strip trailing IFS-ws, then remove backslashes
+  (define (finalize-field raw-s)
+    (read-strip-backslashes (strip-trailing-ifs-ws raw-s ifs-ws)))
   (let ((buf (open-output-string))
         (fields [])
         (field-count 1))
     (let loop ((i start))
       (cond
         ((>= i len)
-         ;; End of string: strip trailing IFS for last field
-         (let* ((s (get-output-string buf))
-                (s (strip-trailing-ifs-for-read s ifs-ws ifs-nw)))
+         ;; End of string: strip trailing IFS for last field, then remove backslashes
+         (let* ((raw-s (get-output-string buf))
+                (s (finalize-last-field raw-s)))
            (reverse (if (or (> (string-length s) 0) (pair? fields))
                       (cons s fields)
                       fields))))
-        ;; Backslash: escape next character (prevent IFS matching)
-        ;; But only process backslash specially if NOT at max-fields
-        ;; (at max-fields, backslash still escapes to prevent IFS matching)
+        ;; Backslash: keep in buffer (prevents IFS matching of next char)
         ((and (char=? (string-ref str i) #\\) (< (+ i 1) len))
+         (display #\\ buf)
          (display (string-ref str (+ i 1)) buf)
          (loop (+ i 2)))
         ;; Trailing backslash
@@ -1581,8 +1583,8 @@
          ;; Check if we're at max-fields — if so, include delimiter in current field
          (if (and (> max-fields 0) (>= field-count max-fields))
            (begin (display (string-ref str i) buf) (loop (+ i 1)))
-           (let ((s (get-output-string buf)))
-             (set! fields (cons (strip-trailing-ifs-ws s ifs-ws) fields))
+           (let ((raw-s (get-output-string buf)))
+             (set! fields (cons (finalize-field raw-s) fields))
              (set! buf (open-output-string))
              (set! field-count (+ field-count 1))
              ;; Skip IFS whitespace after non-whitespace delimiter
@@ -1591,31 +1593,28 @@
                         (not (char=? (string-ref str j) #\\))
                         (ifs-ws-member? (string-ref str j) ifs-ws))
                  (skip (+ j 1))
-                 ;; If NOW at max fields, process rest with backslash removal
+                 ;; If NOW at max fields, append rest and finalize
                  (if (and (> max-fields 0) (>= field-count max-fields))
                    (begin
-                     (process-rest-bs j buf)
-                     (let* ((s (get-output-string buf))
-                            (s (strip-trailing-ifs-for-read s ifs-ws ifs-nw)))
+                     (append-rest j buf)
+                     (let ((s (finalize-last-field (get-output-string buf))))
                        (reverse (cons s fields))))
                    (loop j)))))))
         ;; IFS whitespace
         ((ifs-ws-member? (string-ref str i) ifs-ws)
-         ;; Check if we're at max-fields AND buf has content — keep ws in current field
          ;; NOTE: get-output-string resets the port in Gambit, so save to var first
          (let ((buf-content (get-output-string buf)))
            (if (and (> max-fields 0) (>= field-count max-fields)
                     (> (string-length buf-content) 0))
-             ;; At max fields: include buffered content + rest of string with bs processing
+             ;; At max fields: include buffered content + rest of string, finalize
              (let ((new-buf (open-output-string)))
                (display buf-content new-buf)
-               (process-rest-bs i new-buf)
-               (let* ((s (get-output-string new-buf))
-                      (s (strip-trailing-ifs-for-read s ifs-ws ifs-nw)))
+               (append-rest i new-buf)
+               (let ((s (finalize-last-field (get-output-string new-buf))))
                  (reverse (cons s fields))))
              (begin
                (when (> (string-length buf-content) 0)
-                 (set! fields (cons buf-content fields))
+                 (set! fields (cons (read-strip-backslashes buf-content) fields))
                  (set! field-count (+ field-count 1)))
                (set! buf (open-output-string))
                ;; Skip consecutive IFS whitespace
@@ -1624,12 +1623,11 @@
                           (not (char=? (string-ref str j) #\\))
                           (ifs-ws-member? (string-ref str j) ifs-ws))
                    (skip (+ j 1))
-                   ;; If NOW at max fields, process rest with backslash removal
+                   ;; If NOW at max fields, append rest and finalize
                    (if (and (> max-fields 0) (>= field-count max-fields))
                      (begin
-                       (process-rest-bs j buf)
-                       (let* ((s (get-output-string buf))
-                              (s (strip-trailing-ifs-for-read s ifs-ws ifs-nw)))
+                       (append-rest j buf)
+                       (let ((s (finalize-last-field (get-output-string buf))))
                          (reverse (cons s fields))))
                      (loop j))))))))
         ;; Regular character
@@ -1638,23 +1636,29 @@
          (loop (+ i 1)))))))
 
 ;; Strip trailing IFS whitespace from a string
+;; Backslash-aware: stops stripping when a backslash precedes the char
 (def (strip-trailing-ifs-ws s ws)
   (if (= (string-length ws) 0)
     s
     (let loop ((end (string-length s)))
-      (if (and (> end 0) (ifs-ws-member? (string-ref s (- end 1)) ws))
+      (if (and (> end 0)
+               (ifs-ws-member? (string-ref s (- end 1)) ws)
+               ;; Don't strip if preceded by backslash (escaped char)
+               (not (and (> end 1) (char=? (string-ref s (- end 2)) #\\))))
         (loop (- end 1))
         (substring s 0 end)))))
 
 ;; Strip trailing IFS from the last field for read:
 ;; 1. Strip trailing IFS whitespace
-;; 2. If the last char is a non-ws IFS char AND it is NOT preceded by another non-ws IFS char,
+;; 2. If the last char is a non-ws IFS char AND it is NOT preceded by backslash,
 ;;    strip that one trailing non-ws IFS char (and any IFS whitespace before it)
 (def (strip-trailing-ifs-for-read s ifs-ws ifs-nw)
   (let* ((s1 (strip-trailing-ifs-ws s ifs-ws))
          (len (string-length s1)))
     (if (and (> len 0)
              (ifs-nw-member? (string-ref s1 (- len 1)) ifs-nw)
+             ;; Don't strip if preceded by backslash (escaped char)
+             (not (and (> len 1) (char=? (string-ref s1 (- len 2)) #\\)))
              ;; Only strip if NOT preceded by another non-ws IFS char
              (or (= len 1)
                  (not (ifs-nw-member? (string-ref s1 (- len 2)) ifs-nw))))
