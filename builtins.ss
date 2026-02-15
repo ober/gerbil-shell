@@ -2477,19 +2477,17 @@
            (displayln (format "~a=~a" name (shell-var-scalar-value var))))))
      names)))
 
-;; Build flag string in bash canonical order: A a i l n r t u x
-;; Bash outputs flags in this order: A a i n r x l u t
+;; Build flag string in bash canonical order: A/a i n r x l u t
 (def (declare-var-flags var)
-  ;; Bash flag order: a/A first, then i l n r u x
   (string-append
    (if (shell-var-assoc? var) "A" "")
    (if (shell-var-array? var) "a" "")
    (if (shell-var-integer? var) "i" "")
-   (if (shell-var-lowercase? var) "l" "")
    (if (shell-var-nameref? var) "n" "")
    (if (shell-var-readonly? var) "r" "")
-   (if (shell-var-uppercase? var) "u" "")
-   (if (shell-var-exported? var) "x" "")))
+   (if (shell-var-exported? var) "x" "")
+   (if (shell-var-lowercase? var) "l" "")
+   (if (shell-var-uppercase? var) "u" "")))
 
 ;; Check if an indexed array is dense (keys are 0, 1, 2, ..., n-1)
 (def (array-dense? tbl)
@@ -3428,10 +3426,13 @@
                        ;; %u - unsigned decimal integer
                        ((#\u)
                         (let* ((n (string->integer-safe arg))
+                               (neg? (< n 0))
                                ;; Two's complement for negative numbers (64-bit)
-                               (n (if (< n 0) (+ (expt 2 64) n) n))
-                               ;; Clamp to 64-bit unsigned range (matching bash)
-                               (n (if (> n 18446744073709551615) 18446744073709551615 n))
+                               (n (if neg? (+ (expt 2 64) n) n))
+                               ;; Clamp: if still <= 0 after wrap (overflow) or > max, use ULLONG_MAX
+                               (n (cond ((and neg? (<= n 0)) 18446744073709551615)
+                                        ((> n 18446744073709551615) 18446744073709551615)
+                                        (else n)))
                                (digits (number->string n))
                                (digits (if (and prec (> prec (string-length digits)))
                                          (string-append (make-string (- prec (string-length digits)) #\0)

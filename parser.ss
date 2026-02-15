@@ -27,14 +27,13 @@
     (let ((result (parse-list ps)))
       (when (lexer-needs-more? lex)
         (set! (parser-state-needs-more? ps) #t))
-      ;; If parse returned nothing but there are unconsumed tokens, syntax error
-      (when (not result)
-        (let ((tok (parser-peek ps)))
-          (when (and (token? tok) (not (eq? (token-type tok) 'NEWLINE)))
-            (error (string-append "parse error near `"
-                                  (if (token-value tok) (token-value tok)
-                                      (symbol->string (token-type tok)))
-                                  "'")))))
+      ;; Check for unconsumed tokens — syntax error if non-NEWLINE/EOF remain
+      (let ((tok (parser-peek ps)))
+        (when (and (token? tok) (not (eq? (token-type tok) 'NEWLINE)))
+          (error (string-append "parse error near `"
+                                (if (token-value tok) (token-value tok)
+                                    (symbol->string (token-type tok)))
+                                "'"))))
       result)))
 
 ;; Parse one "line" — semicolon-separated commands, stopping at newline.

@@ -878,10 +878,36 @@
                ;; ${!name} — indirect expansion, possibly with modifiers
                (let-values (((iname modifier arg) (parse-parameter-modifier rest)))
                  (let* ((ref-name (env-get env iname))
-                        (val (if ref-name (env-get env ref-name) #f)))
-                   (if modifier
-                     (apply-parameter-modifier val (or ref-name iname) modifier arg env)
-                     (or val "")))))))))
+                        ;; If ref-name contains [, it's an array subscript like a[0] or a[@]
+                        (bracket-pos (and ref-name (find-array-subscript-start ref-name)))
+                        (val (cond
+                               ((not ref-name) #f)
+                               (bracket-pos
+                                ;; Resolve indirect to array element/slice
+                                ;; Build the full content with any modifier appended
+                                (let* ((indirect-content
+                                        (if modifier
+                                          (string-append ref-name
+                                            (case modifier
+                                              ((-) (string-append "-" arg))
+                                              ((:-) (string-append ":-" arg))
+                                              ((+) (string-append "+" arg))
+                                              ((:+) (string-append ":+" arg))
+                                              ((=) (string-append "=" arg))
+                                              ((:=) (string-append ":=" arg))
+                                              ((?) (string-append "?" arg))
+                                              ((:?) (string-append ":?" arg))
+                                              (else "")))
+                                          ref-name))
+                                       (bp (find-array-subscript-start indirect-content)))
+                                  (expand-array-parameter indirect-content bp env)))
+                               (else (env-get env ref-name)))))
+                   (cond
+                     ;; Array path already handled modifiers
+                     (bracket-pos val)
+                     (modifier
+                      (apply-parameter-modifier val (or ref-name iname) modifier arg env))
+                     (else (or val ""))))))))))
       (else
        ;; Check for array subscript: name[idx] or name[@] or name[*]
        (let ((bracket-pos (find-array-subscript-start content)))
