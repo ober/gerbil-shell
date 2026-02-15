@@ -1186,6 +1186,13 @@
         (if (shell-var-uppercase? var) "u" "")
         (if (shell-var-exported? var) "x" "")))))
 
+;; Get declare prefix for ${var@A} — returns "declare " with flags, or just ""
+(def (get-var-declare-prefix name env)
+  (let ((attrs (get-var-attributes name env)))
+    (if (string=? attrs "")
+      "declare -- "
+      (string-append "declare -" attrs " "))))
+
 ;; Expand ANSI-C escape sequences for ${var@E} — subset of $'...' escapes
 (def (expand-ansi-c-escapes s)
   (let ((buf (open-output-string))
@@ -1388,8 +1395,8 @@
     ((at-op)
      (let ((op (if (> (string-length arg) 0) (string-ref arg 0) #f)))
        (case op
-         ;; ${var@Q} — shell-quoted value
-         ((#\Q) (if val (shell-quote-for-at-q val) "''"))
+         ;; ${var@Q} — shell-quoted value (undefined → empty, empty → '')
+         ((#\Q) (if val (shell-quote-for-at-q val) ""))
          ;; ${var@a} — attribute flags
          ((#\a) (get-var-attributes name env))
          ;; ${var@U} — uppercase all
@@ -1402,11 +1409,18 @@
          ;; ${var@L} — lowercase all
          ((#\L) (if val (string-downcase val) ""))
          ;; ${var@E} — expand backslash escapes (like $'...')
-         ((#\E) (if val (expand-ansi-c-escapes val) (or val "")))
+         ((#\E) (if val (expand-ansi-c-escapes val) ""))
          ;; ${var@P} — prompt expansion (stub: just return value)
          ((#\P) (or val ""))
-         ;; ${var@K} — display as key-value pairs (for assoc arrays)
-         ((#\K) (or val ""))
+         ;; ${var@K} and ${var@k} — quoted value (for scalars; key-value for arrays)
+         ((#\K #\k) (if val (shell-quote-for-at-q val) ""))
+         ;; ${var@A} — assignment form (declare only when attributes present)
+         ((#\A) (if val
+                  (let ((attrs (get-var-attributes name env)))
+                    (if (string=? attrs "")
+                      (string-append name "=" (shell-quote-for-at-q val))
+                      (string-append "declare -" attrs " " name "=" (shell-quote-for-at-q val))))
+                  ""))
          (else (or val "")))))
     ;; No modifier
     ((#f) (or val ""))
