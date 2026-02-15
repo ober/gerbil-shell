@@ -383,35 +383,45 @@
                 (unset-func?
                  (function-unset! env name))
                 (unset-nameref?
-                 ;; unset -n: unset the nameref itself, not the target
-                 (with-catch
-                  (lambda (e)
-                    (fprintf (current-error-port) "gsh: unset: ~a: cannot unset~n" name)
-                    (set! status 1))
-                  (lambda () (env-unset-nameref! env name))))
+                 ;; Validate variable name
+                 (if (not (valid-name? name))
+                   (begin
+                     (fprintf (current-error-port) "gsh: unset: `~a': not a valid identifier~n" name)
+                     (set! status 1))
+                   ;; unset -n: unset the nameref itself, not the target
+                   (with-catch
+                    (lambda (e)
+                      (fprintf (current-error-port) "gsh: unset: ~a: cannot unset~n" name)
+                      (set! status 1))
+                    (lambda () (env-unset-nameref! env name)))))
                 (else
-                 (with-catch
-                  (lambda (e)
-                    (fprintf (current-error-port) "gsh: unset: ~a: cannot unset: readonly variable~n" name)
-                    (set! status 1))
-                  (lambda ()
-                    ;; Check for array element syntax: name[idx]
-                    (let ((bracket-pos (string-find-char* name #\[)))
-                      (if (and bracket-pos
-                               (> bracket-pos 0)
-                               (let ((close (string-find-char* name #\])))
-                                 (and close (= close (- (string-length name) 1)))))
-                        ;; Unset array element
-                        (let ((var-name (substring name 0 bracket-pos))
-                              (index (substring name (+ bracket-pos 1)
-                                               (- (string-length name) 1))))
-                          (env-array-unset-element! env var-name index))
-                        ;; Unset whole variable (resolves namerefs)
-                        ;; If no variable exists, also try to unset function (POSIX)
-                        (let ((var (env-get-raw-var env name)))
-                          (if var
-                            (env-unset! env name)
-                            (function-unset! env name))))))))))
+                 ;; Validate variable name (extract base name before [ for arrays)
+                 (let* ((bracket-pos (string-find-char* name #\[))
+                        (base-name (if bracket-pos (substring name 0 bracket-pos) name)))
+                   (if (not (valid-name? base-name))
+                     (begin
+                       (fprintf (current-error-port) "gsh: unset: `~a': not a valid identifier~n" name)
+                       (set! status 1))
+                     (with-catch
+                      (lambda (e)
+                        (fprintf (current-error-port) "gsh: unset: ~a: cannot unset: readonly variable~n" name)
+                        (set! status 1))
+                      (lambda ()
+                        (if (and bracket-pos
+                                 (> bracket-pos 0)
+                                 (let ((close (string-find-char* name #\])))
+                                   (and close (= close (- (string-length name) 1)))))
+                          ;; Unset array element
+                          (let ((var-name (substring name 0 bracket-pos))
+                                (index (substring name (+ bracket-pos 1)
+                                                 (- (string-length name) 1))))
+                            (env-array-unset-element! env var-name index))
+                          ;; Unset whole variable (resolves namerefs)
+                          ;; If no variable exists, also try to unset function (POSIX)
+                          (let ((var (env-get-raw-var env name)))
+                            (if var
+                              (env-unset! env name)
+                              (function-unset! env name)))))))))))
             args)
            status))))))
 
