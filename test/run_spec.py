@@ -118,8 +118,8 @@ def parse_test_file(path):
                                 i += 1
                             current.setdefault('bash_stdout', ''.join(stdout_lines))
                             continue
-                # Check if this annotation has a STDOUT: block that needs skipping
-                if 'STDOUT:' in meta:
+                # Check if this annotation has a STDOUT: or STDERR: block that needs skipping
+                if 'STDOUT:' in meta or 'STDERR:' in meta:
                     i += 1
                     while i < len(lines) and not lines[i].startswith('## '):
                         i += 1

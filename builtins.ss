@@ -2242,15 +2242,24 @@
              (fprintf (current-error-port) "declare: `~a': not a valid identifier~n" arg)
              (set! status 1))
          (if print?
-           ;; -p name: print declaration (return 1 if var not found)
+           ;; -p name: print declaration, filtered by attribute flags
            ;; -pg: look in global scope only
-           ;; Also find declared-but-unset vars (env-get-var skips those)
-           ;; Note: bash ignores attribute flags when names are given with -p
            (let* ((lookup-env (if (hash-get flags 'global) (env-root env) env))
                   (var (or (env-get-var lookup-env name)
-                           (env-get-raw-var lookup-env name))))
+                           (env-get-raw-var lookup-env name)))
+                  (filter-export (hash-get flags 'export))
+                  (filter-readonly (hash-get flags 'readonly))
+                  (filter-nameref (hash-get flags 'nameref))
+                  (filter-array (hash-get flags 'array))
+                  (filter-assoc (hash-get flags 'assoc)))
              (if var
-               (display-declare-var name var)
+               ;; If attribute flags given, only print vars with matching flags
+               (when (and (or (not filter-export) (shell-var-exported? var))
+                          (or (not filter-readonly) (shell-var-readonly? var))
+                          (or (not filter-nameref) (shell-var-nameref? var))
+                          (or (not filter-array) (shell-var-array? var))
+                          (or (not filter-assoc) (shell-var-assoc? var)))
+                 (display-declare-var name var))
                (begin
                  (fprintf (current-error-port) "declare: ~a: not found~n" name)
                  (set! status 1))))
