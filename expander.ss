@@ -1019,7 +1019,15 @@
                  (let-values (((mname modifier arg)
                                (parse-parameter-modifier
                                 (string-append "x" after-bracket))))
-                   (apply-parameter-modifier val name modifier arg env)))))))))))
+                   ;; For = and := modifiers on array elements, use
+                   ;; env-array-set! instead of env-set! (which sets scalar)
+                   (if (and (memq modifier '(= :=))
+                            (or (not val)
+                                (and (eq? modifier ':=) val (string=? val ""))))
+                     (let ((default (expand-string arg env)))
+                       (env-array-set! env name expanded-idx default)
+                       default)
+                     (apply-parameter-modifier val name modifier arg env))))))))))))
 
 ;; Parse NAME and modifier from parameter content
 (def (special-param-char? ch)
