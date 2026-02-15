@@ -313,8 +313,12 @@
                               (substring raw-val 1 (string-length raw-val))))
                      ;; Parse raw elements preserving quoting structure
                      (raw-elems (parse-array-compound-raw inner))
+                     ;; Brace-expand each element (e.g. {1..9} → "1" "2" ... "9")
+                     (brace-elems (if (env-option? env "braceexpand")
+                                    (append-map brace-expand raw-elems)
+                                    raw-elems))
                      ;; Expand each element individually, re-quote for reassembly
-                     (expanded-elems (map (lambda (e) (expand-word-nosplit e env)) raw-elems))
+                     (expanded-elems (map (lambda (e) (expand-word-nosplit e env)) brace-elems))
                      ;; Re-quote each element with declare-quote-value so empty strings
                      ;; survive as "" and special chars are escaped
                      (quoted-elems (map declare-quote-value expanded-elems))

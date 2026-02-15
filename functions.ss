@@ -93,20 +93,16 @@
     (raise (make-break-exception levels))
     (begin
       (fprintf (current-error-port) "break: only meaningful in a `for', `while', or `until' loop~n")
-      ;; In a subshell, abort execution (break can't cross subshell boundary)
-      (if (*in-subshell*)
-        (raise (make-subshell-exit-exception 1))
-        0))))
+      ;; In bash, break/continue outside a loop just warns (doesn't abort subshell)
+      0)))
 
 (def (shell-continue! (levels 1))
   (if (> (*loop-depth*) 0)
     (raise (make-continue-exception levels))
     (begin
       (fprintf (current-error-port) "continue: only meaningful in a `for', `while', or `until' loop~n")
-      ;; In a subshell, abort execution (continue can't cross subshell boundary)
-      (if (*in-subshell*)
-        (raise (make-subshell-exit-exception 1))
-        0))))
+      ;; In bash, break/continue outside a loop just warns (doesn't abort subshell)
+      0)))
 
 ;;; --- Errexit exception ---
 ;; Raised when set -e is active and a command fails outside a condition context
