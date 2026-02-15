@@ -284,12 +284,14 @@
 ;; Mark variable as exported
 (def (env-export! env name (value #f))
   (when value (env-set! env name value))
-  (let ((var (hash-get (shell-environment-vars env) name)))
+  ;; Find the var wherever env-set! placed it (may be in parent/root scope)
+  (let ((var (env-get-raw-var env name)))
     (if var
       (begin
         (set! (shell-var-exported? var) #t)
-        (setenv name (shell-var-value var)))
-      ;; Create empty exported variable
+        (let ((v (shell-var-scalar-value var)))
+          (when v (setenv name v))))
+      ;; No var exists anywhere — create exported in current scope
       (when value
         (hash-put! (shell-environment-vars env) name
                    (make-shell-var value #t #f #f #f #f #f #f #f #f))
@@ -320,7 +322,8 @@
 ;; Mark variable as readonly
 (def (env-readonly! env name (value #f))
   (when value (env-set! env name value))
-  (let ((var (hash-get (shell-environment-vars env) name)))
+  ;; Find the var wherever env-set! placed it (may be in parent/root scope)
+  (let ((var (env-get-raw-var env name)))
     (when var
       (set! (shell-var-readonly? var) #t))))
 

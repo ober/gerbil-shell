@@ -302,33 +302,61 @@
 ;; export [name[=value] ...]
 (builtin-register! "export"
   (lambda (args env)
-    (cond
-      ;; export with no args or export -p: list exported vars
-      ((or (null? args)
-           (and (pair? args) (string=? (car args) "-p")))
-       (let* ((all-vars (collect-all-vars env))
-              (names (sort! (hash-keys all-vars) string<?)))
+    ;; Parse flags: -p, -n
+    (let ((print? #f) (remove? #f) (names []))
+      (let loop ((args args))
+        (when (pair? args)
+          (let ((arg (car args)))
+            (cond
+              ((and (> (string-length arg) 1)
+                    (char=? (string-ref arg 0) #\-)
+                    (not (string=? arg "--")))
+               (let floop ((i 1))
+                 (when (< i (string-length arg))
+                   (case (string-ref arg i)
+                     ((#\p) (set! print? #t))
+                     ((#\n) (set! remove? #t))
+                     (else (void)))
+                   (floop (+ i 1))))
+               (loop (cdr args)))
+              ((string=? arg "--")
+               (set! names (append names (cdr args))))
+              (else
+               (set! names (append names (list arg)))
+               (loop (cdr args)))))))
+      (cond
+        ;; export -p with no names (or no args at all): list all exported vars
+        ((null? names)
+         (let* ((all-vars (collect-all-vars env))
+                (sorted (sort! (hash-keys all-vars) string<?)))
+           (for-each
+            (lambda (name)
+              (let ((var (hash-get all-vars name)))
+                (when (and var (shell-var-exported? var)
+                           (not (eq? (shell-var-value var) +unset-sentinel+)))
+                  (display-declare-var name var))))
+            sorted))
+         0)
+        ;; Export/unexport variables (with or without -p; -p ignored when names given)
+        (else
          (for-each
-          (lambda (name)
-            (let ((var (hash-get all-vars name)))
-              (when (and var (shell-var-exported? var)
-                         (not (eq? (shell-var-value var) +unset-sentinel+)))
-                (display-declare-var name var))))
-          names))
-       0)
-      ;; Export variables
-      (else
-       (for-each
-        (lambda (arg)
-          (let ((eq-pos (string-find-char* arg #\=)))
-            (if eq-pos
-              ;; Args already expanded by expand-declaration-args (no re-expansion)
-              (let* ((name (substring arg 0 eq-pos))
-                     (value (substring arg (+ eq-pos 1) (string-length arg))))
-                (env-export! env name value))
-              (env-export! env arg))))
-        args)
-       0))))
+          (lambda (arg)
+            (let ((eq-pos (string-find-char* arg #\=)))
+              (if eq-pos
+                (let* ((name (substring arg 0 eq-pos))
+                       (value (substring arg (+ eq-pos 1) (string-length arg))))
+                  (if remove?
+                    ;; export -n name=val: just remove export flag
+                    (let ((var (env-get-raw-var env name)))
+                      (when var (set! (shell-var-exported? var) #f)))
+                    (env-export! env name value)))
+                (if remove?
+                  ;; export -n name: remove export flag
+                  (let ((var (env-get-raw-var env arg)))
+                    (when var (set! (shell-var-exported? var) #f)))
+                  (env-export! env arg)))))
+          names)
+         0)))))
 
 ;; unset [-fvn] name ...
 (builtin-register! "unset"
@@ -401,8 +429,8 @@
                (set! names (append names (list arg)))
                (loop (cdr args)))))))
       (cond
-        ;; readonly -p (or with no args): list all readonly vars
-        ((or print? (null? names))
+        ;; readonly -p with no names (or no args): list all readonly vars
+        ((null? names)
          (let* ((all-vars (collect-all-vars env))
                 (sorted (sort! (hash-keys all-vars) string<?)))
            (for-each
@@ -413,7 +441,7 @@
                   (display-declare-var name var))))
             sorted))
          0)
-        ;; readonly with names
+        ;; readonly with names (with or without -p; -p is ignored when names given)
         (else
          (for-each
           (lambda (arg)
@@ -618,38 +646,49 @@
            0))))))
 
 (def (shell-quote-value val)
-  ;; Check if value contains control characters that need $'...' quoting
-  (let ((needs-dollar-quote?
+  ;; Check if value needs any quoting at all
+  ;; Simple values (alphanumeric, _, -, ., /, :, =, +, @, %, ^, ~, ,) don't need quotes
+  (let* ((needs-dollar-quote? #f)
+         (needs-any-quote?
+          (if (= (string-length val) 0)
+            #t  ;; empty string needs ''
+            (let loop ((i 0))
+              (if (>= i (string-length val)) #f
+                (let ((ch (string-ref val i)))
+                  (cond
+                    ((or (char<? ch #\space) (char=? ch #\x7f))
+                     (set! needs-dollar-quote? #t) #t)
+                    ((or (char-alphabetic? ch) (char-numeric? ch)
+                         (memq ch '(#\_ #\- #\. #\/ #\: #\= #\+ #\@ #\% #\^ #\~ #\,)))
+                     (loop (+ i 1)))
+                    (else #t)))))))) ;; needs quoting
+    (cond
+      (needs-dollar-quote?
+       ;; Use $'...' quoting with escape sequences for control chars
+       (let ((buf (open-output-string)))
+         (display "$'" buf)
          (let loop ((i 0))
-           (if (>= i (string-length val)) #f
+           (when (< i (string-length val))
              (let ((ch (string-ref val i)))
-               (if (or (char<? ch #\space) (char=? ch #\x7f))
-                 #t
-                 (loop (+ i 1))))))))
-    (if needs-dollar-quote?
-      ;; Use $'...' quoting with escape sequences for control chars
-      (let ((buf (open-output-string)))
-        (display "$'" buf)
-        (let loop ((i 0))
-          (when (< i (string-length val))
-            (let ((ch (string-ref val i)))
-              (cond
-                ((char=? ch #\newline) (display "\\n" buf))
-                ((char=? ch #\tab) (display "\\t" buf))
-                ((char=? ch #\return) (display "\\r" buf))
-                ((char=? ch #\\) (display "\\\\" buf))
-                ((char=? ch #\') (display "\\'" buf))
-                ((or (char<? ch #\space) (char=? ch #\x7f))
-                 (display (string-append "\\x"
-                   (let ((h (number->string (char->integer ch) 16)))
-                     (if (< (string-length h) 2) (string-append "0" h) h)))
-                  buf))
-                (else (display ch buf))))
-            (loop (+ i 1))))
-        (display "'" buf)
-        (get-output-string buf))
-      ;; Normal single-quote wrapping
-      (string-append "'" (string-replace-all val "'" "'\\''") "'"))))
+               (cond
+                 ((char=? ch #\newline) (display "\\n" buf))
+                 ((char=? ch #\tab) (display "\\t" buf))
+                 ((char=? ch #\return) (display "\\r" buf))
+                 ((char=? ch #\\) (display "\\\\" buf))
+                 ((char=? ch #\') (display "\\'" buf))
+                 ((or (char<? ch #\space) (char=? ch #\x7f))
+                  (display (string-append "\\x"
+                    (let ((h (number->string (char->integer ch) 16)))
+                      (if (< (string-length h) 2) (string-append "0" h) h)))
+                   buf))
+                 (else (display ch buf))))
+             (loop (+ i 1))))
+         (display "'" buf)
+         (get-output-string buf)))
+      (needs-any-quote?
+       ;; Normal single-quote wrapping
+       (string-append "'" (string-replace-all val "'" "'\\''") "'"))
+      (else val))))
 
 ;; shift [n]
 (builtin-register! "shift"
