@@ -702,20 +702,22 @@
 (def (shell-quote-value val)
   ;; Check if value needs any quoting at all
   ;; Simple values (alphanumeric, _, -, ., /, :, =, +, @, %, ^, ~, ,) don't need quotes
+  ;; Must scan the ENTIRE string for control chars before choosing quoting strategy
   (let* ((needs-dollar-quote? #f)
          (needs-any-quote?
           (if (= (string-length val) 0)
             #t  ;; empty string needs ''
-            (let loop ((i 0))
-              (if (>= i (string-length val)) #f
+            (let loop ((i 0) (needs? #f))
+              (if (>= i (string-length val)) needs?
                 (let ((ch (string-ref val i)))
                   (cond
                     ((or (char<? ch #\space) (char=? ch #\x7f))
-                     (set! needs-dollar-quote? #t) #t)
+                     (set! needs-dollar-quote? #t)
+                     (loop (+ i 1) #t))
                     ((or (char-alphabetic? ch) (char-numeric? ch)
                          (memq ch '(#\_ #\- #\. #\/ #\: #\= #\+ #\@ #\% #\^ #\~ #\,)))
-                     (loop (+ i 1)))
-                    (else #t)))))))) ;; needs quoting
+                     (loop (+ i 1) needs?))
+                    (else (loop (+ i 1) #t))))))))) ;; needs quoting
     (cond
       (needs-dollar-quote?
        ;; Use $'...' quoting with escape sequences for control chars
@@ -1851,7 +1853,7 @@
                                          (fprintf (current-error-port) "wait: `~a': not a pid or valid job spec~n" arg)
                                          #f)))))))
                 (if (not valid?)
-                  1
+                  127
                   (let ((jobs (if (null? rest-args)
                                (job-table-list)
                                ;; Look up specific jobs
@@ -2468,15 +2470,16 @@
 ;; Build flag string in bash canonical order: A a i l n r t u x
 ;; Bash outputs flags in this order: A a i n r x l u t
 (def (declare-var-flags var)
+  ;; Bash flag order: a/A first, then i l n r u x
   (string-append
    (if (shell-var-assoc? var) "A" "")
    (if (shell-var-array? var) "a" "")
    (if (shell-var-integer? var) "i" "")
+   (if (shell-var-lowercase? var) "l" "")
    (if (shell-var-nameref? var) "n" "")
    (if (shell-var-readonly? var) "r" "")
-   (if (shell-var-exported? var) "x" "")
-   (if (shell-var-lowercase? var) "l" "")
-   (if (shell-var-uppercase? var) "u" "")))
+   (if (shell-var-uppercase? var) "u" "")
+   (if (shell-var-exported? var) "x" "")))
 
 ;; Check if an indexed array is dense (keys are 0, 1, 2, ..., n-1)
 (def (array-dense? tbl)

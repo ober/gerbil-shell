@@ -454,7 +454,13 @@
                        (parameterize ((*in-condition-context* #t))
                          (execute-pipeline commands env execute-command pipe-types))
                        (execute-pipeline commands env execute-command pipe-types)))
-         (status (if (pair? exit-codes) (last-elem exit-codes) 0)))
+         (last-status (if (pair? exit-codes) (last-elem exit-codes) 0))
+         ;; pipefail: use rightmost non-zero exit code from pipeline
+         (status (if (env-option? env "pipefail")
+                   (let loop ((codes exit-codes) (fail 0))
+                     (if (null? codes) (if (= fail 0) last-status fail)
+                       (loop (cdr codes) (if (not (= (car codes) 0)) (car codes) fail))))
+                   last-status)))
     ;; Set PIPESTATUS array
     (env-array-set-compound! env "PIPESTATUS"
                              (map number->string exit-codes) #f)
