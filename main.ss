@@ -238,8 +238,13 @@
        ((continue-exception? e) (raise e))
        ((return-exception? e) (raise e))
        (else
-        (fprintf (current-error-port) "gsh: ~a~n" (exception-message e))
-        1)))
+        (let ((msg (exception-message e)))
+          (fprintf (current-error-port) "gsh: ~a~n" msg)
+          ;; POSIX: syntax/substitution errors → exit code 2
+          (if (and (string? msg)
+                   (or (string-prefix? "bad substitution" msg)
+                       (string-prefix? "parse error" msg)))
+            2 1)))))
    (lambda ()
      (let ((cmd (with-catch
                  (lambda (e)
@@ -341,9 +346,13 @@
                              ((continue-exception? e) 0)
                              ((return-exception? e) (return-exception-status e))
                              (else
-                              (fprintf (current-error-port) "gsh: ~a~n"
-                                       (exception-message e))
-                              1)))
+                              (let ((msg (exception-message e)))
+                                (fprintf (current-error-port) "gsh: ~a~n" msg)
+                                ;; POSIX: syntax/substitution errors → exit code 2
+                                (if (and (string? msg)
+                                         (or (string-prefix? "bad substitution" msg)
+                                             (string-prefix? "parse error" msg)))
+                                  2 1)))))
                          (lambda ()
                            (if parse-ok?
                              (execute-input command env)
