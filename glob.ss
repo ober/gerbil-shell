@@ -38,6 +38,22 @@
   (let ((rx (glob-pattern->pregexp pattern path-mode? extglob?)))
     (and (pregexp-match rx string) #t)))
 
+;; Remove glob escape backslashes from a pattern (for no-match fallback)
+;; \[ → [, \* → *, \? → ?, \\ → \, etc.
+(def (glob-remove-escapes str)
+  (let ((len (string-length str)))
+    (if (not (string-index str #\\))
+      str  ;; fast path
+      (let ((buf (open-output-string)))
+        (let loop ((i 0))
+          (if (>= i len)
+            (get-output-string buf)
+            (let ((ch (string-ref str i)))
+              (if (and (char=? ch #\\) (< (+ i 1) len))
+                (begin (display (string-ref str (+ i 1)) buf)
+                       (loop (+ i 2)))
+                (begin (display ch buf)
+                       (loop (+ i 1)))))))))))
 ;; Expand a glob pattern to a sorted list of matching file paths
 ;; Returns the original pattern (as a list) if no matches (unless nullglob/failglob)
 ;; Options: dotglob? — include dotfiles, nullglob? — return empty on no match,

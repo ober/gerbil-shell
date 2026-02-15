@@ -875,9 +875,20 @@
            (dynamic-wind
              (lambda () #!void)
              (lambda ()
+               (if (and timeout (= timeout 0))
+                 ;; -t 0: check if input is available without reading
+                 ;; Use input-port-timeout with 0 and peek-char to test availability
+                 ;; -t 0: check if input is available without reading
+                 ;; Set 0 timeout, try peek-char: returns #t if data/eof available, #f on timeout
+                 (begin
+                   (input-port-timeout-set! in-port 0)
+                   (if (with-catch (lambda (e) #f)
+                         (lambda () (peek-char in-port) #t))
+                     0 1))
                ;; Set timeout if requested
-               (when timeout
-                 (input-port-timeout-set! in-port timeout))
+               (begin
+                 (when timeout
+                   (input-port-timeout-set! in-port timeout))
                (let* ((got-eof? #f)
                       (line (cond
                               ;; -N nchars: read exactly N bytes, ignore delimiters
@@ -1089,7 +1100,7 @@
                                (if got-eof? 1 0))
                               (else
                                (env-set! env (car names) (car fields))
-                               (field-loop (cdr names) (cdr fields))))))))))))
+                               (field-loop (cdr names) (cdr fields)))))))))))))) ;; close begin + if -t 0
              (lambda ()
                ;; Restore echo if we disabled it
                (when tty?
