@@ -27,6 +27,14 @@
     (let ((result (parse-list ps)))
       (when (lexer-needs-more? lex)
         (set! (parser-state-needs-more? ps) #t))
+      ;; If parse returned nothing but there are unconsumed tokens, syntax error
+      (when (not result)
+        (let ((tok (parser-peek ps)))
+          (when (and (token? tok) (not (eq? (token-type tok) 'NEWLINE)))
+            (error (string-append "parse error near `"
+                                  (if (token-value tok) (token-value tok)
+                                      (symbol->string (token-type tok)))
+                                  "'")))))
       result)))
 
 ;; Parse one "line" — semicolon-separated commands, stopping at newline.
@@ -40,6 +48,14 @@
         (begin
           (when (lexer-needs-more? lex)
             (set! (parser-state-needs-more? ps) #t))
+          ;; If there are unconsumed tokens (not newline/EOF), syntax error
+          (let ((tok (parser-peek ps)))
+            (when (and (token? tok)
+                       (not (eq? (token-type tok) 'NEWLINE)))
+              (error (string-append "parse error near `"
+                                    (if (token-value tok) (token-value tok)
+                                        (symbol->string (token-type tok)))
+                                    "'"))))
           #f)
         (let loop ((items [(cons 'sequential first)]))
           (cond

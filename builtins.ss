@@ -587,7 +587,7 @@
 (builtin-register! "break"
   (lambda (args env)
     (cond
-      ;; Too many arguments — special builtin error is fatal (bash aborts the script)
+      ;; Too many arguments — special builtin error is fatal (bash: exit 1)
       ((> (length args) 1)
        (fprintf (current-error-port) "gsh: break: too many arguments~n")
        (force-output (current-error-port))
@@ -613,7 +613,7 @@
 (builtin-register! "continue"
   (lambda (args env)
     (cond
-      ;; Too many arguments — special builtin error is fatal (bash aborts the script)
+      ;; Too many arguments — special builtin error is fatal (bash: exit 1)
       ((> (length args) 1)
        (fprintf (current-error-port) "gsh: continue: too many arguments~n")
        (force-output (current-error-port))
