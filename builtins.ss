@@ -3706,12 +3706,12 @@
          (if (>= (string-length s) 2)
            (char->integer (string-ref s 1))
            0))
-        ;; Reject base#value syntax (e.g. 64#a)
+        ;; Reject base#value syntax (e.g. 64#a) — return leading integer portion
         ((let loop ((i 0)) (and (< i (string-length s))
                                 (or (char=? (string-ref s i) #\#) (loop (+ i 1)))))
          (fprintf (current-error-port) "printf: ~a: invalid number~n" s)
          (*printf-conversion-error* #t)
-         0)
+         (parse-leading-integer s))
         (else
          ;; Handle optional sign prefix
          (let* ((neg? (and (> (string-length s) 0) (char=? (string-ref s 0) #\-)))
