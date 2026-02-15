@@ -144,8 +144,7 @@
                                                           failglob?: (env-shopt? env "failglob")
                                                           nocase?: (env-shopt? env "nocaseglob")
                                                           extglob?: (env-shopt? env "extglob")
-                                                          globskipdots?: (let ((v (env-shopt? env "globskipdots")))
-                                                                           (if (eq? v #f) #t v)))
+                                                          globskipdots?: (env-shopt? env "globskipdots"))
                                                         [s])))
                                                   split)))))
                                     ;; Apply GLOBIGNORE filtering

@@ -20,6 +20,10 @@
     (if (null? tokens)
       0
       (let ((result (parse-comma-expr state)))
+        ;; Validate all tokens were consumed
+        (when (< (arith-state-pos state) (length tokens))
+          (error (format "arithmetic: syntax error: unexpected token '~a'"
+                         (arith-token-value (list-ref tokens (arith-state-pos state))))))
         result))))
 
 ;;; --- Tokenizer ---

@@ -344,6 +344,10 @@
                 (saved-1 (and pipe-out (ffi-dup 1))))
            (when pipe-in (ffi-dup2 pipe-in 0))
            (when pipe-out (ffi-dup2 pipe-out 1))
+           ;; Flush buffered Scheme output before forking so child
+           ;; doesn't interleave with pending parent output
+           (force-output)
+           (force-output (current-error-port))
            (let* ((proc (open-process
                          [path: path
                           arguments: args
@@ -968,6 +972,7 @@
                                 assignments)
                                child)
                              env))
+                 (_flush (begin (force-output) (force-output (current-error-port))))
                  (proc (open-process
                         [path: path
                          arguments: actual-args

@@ -731,6 +731,7 @@
        (string-append "'" (string-replace-all val "'" "'\\''") "'"))
       (else val))))
 
+
 ;; shift [n]
 (builtin-register! "shift"
   (lambda (args env)
@@ -2609,7 +2610,7 @@
 
 (builtin-register! "ulimit"
   (lambda (args env)
-    (let ((soft? #t) (hard? #f) (show-all? #f)
+    (let ((soft? #f) (hard? #f) (show-all? #f)
           (resource-flag #f) (value #f) (explicit-sh? #f))
       ;; Parse args
       (let loop ((rest args) (seen-resource #f))
@@ -2628,7 +2629,7 @@
                            (block-size (cadddr entry)))
                       (if (not res-const)
                         (displayln (format "~a 8" desc))  ;; pipe size is always 8
-                        (let* ((raw (if hard?
+                        (let* ((raw (if (and hard? (not soft?))
                                       (ffi-getrlimit-hard res-const)
                                       (ffi-getrlimit-soft res-const)))
                                (display-val (cond
@@ -2650,7 +2651,7 @@
                     ;; Display current value
                     (if (not res-const)
                       (begin (displayln "8") 0)  ;; pipe size
-                      (let ((raw (if hard?
+                      (let ((raw (if (and hard? (not soft?))
                                    (ffi-getrlimit-hard res-const)
                                    (ffi-getrlimit-soft res-const))))
                         (cond
@@ -2688,10 +2689,10 @@
                                 1)))))))))))
           ;; Parse flags
           ((string=? (car rest) "-S")
-           (set! soft? #t) (set! hard? #f) (set! explicit-sh? #t)
+           (set! soft? #t) (set! explicit-sh? #t)
            (loop (cdr rest) seen-resource))
           ((string=? (car rest) "-H")
-           (set! hard? #t) (set! soft? #f) (set! explicit-sh? #t)
+           (set! hard? #t) (set! explicit-sh? #t)
            (loop (cdr rest) seen-resource))
           ((or (string=? (car rest) "-a") (string=? (car rest) "--all"))
            (if seen-resource
