@@ -3641,8 +3641,10 @@
                    ((char=? ch (integer->char 8)) (display "\\b" buf))
                    ((char=? ch (integer->char 27)) (display "\\e" buf))
                    ((< (char->integer ch) 32)
-                    ;; Other control chars: \xHH
-                    (display (format "\\x~a" (number->string (char->integer ch) 16)) buf))
+                    ;; Other control chars: \xHH (zero-padded)
+                    (let ((h (number->string (char->integer ch) 16)))
+                      (display (format "\\x~a" (if (< (string-length h) 2)
+                                                 (string-append "0" h) h)) buf)))
                    (else (display ch buf))))
                (loop (+ i 1))))
            (display "'" buf)
