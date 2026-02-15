@@ -2469,17 +2469,25 @@
       ((eq? (shell-var-value var) +unset-sentinel+)
        (displayln (format "declare ~a ~a" flag-str name)))
       ((shell-var-array? var)
-       ;; Indexed array: always use [idx]=val format (matching bash)
+       ;; Indexed array
        (let ((tbl (shell-var-value var)))
          (display (format "declare ~a ~a=(" flag-str name))
          (when (hash-table? tbl)
            (let* ((keys (sort! (hash-keys tbl) <))
                   (last-key (and (pair? keys) (last keys))))
-             (for-each
-              (lambda (k)
-                (display (format "[~a]=~a" k (declare-quote-value (hash-get tbl k))))
-                (unless (equal? k last-key) (display " ")))
-              keys)))
+             (if (array-dense? tbl)
+               ;; Dense array: (val1 val2 val3) — no indices
+               (for-each
+                (lambda (k)
+                  (display (shell-quote-value (hash-get tbl k)))
+                  (unless (equal? k last-key) (display " ")))
+                keys)
+               ;; Sparse array: ([3]=val [5]=val) — with indices
+               (for-each
+                (lambda (k)
+                  (display (format "[~a]=~a" k (shell-quote-value (hash-get tbl k))))
+                  (unless (equal? k last-key) (display " ")))
+                keys))))
          (displayln ")")))
       ((shell-var-assoc? var)
        ;; Assoc array: declare -A map=(['key1']=val1 ['key2']=val2)
@@ -2492,13 +2500,13 @@
                   (last-key (and (pair? keys) (last keys))))
              (for-each
               (lambda (k)
-                (display (format "[~a]=~a" k (declare-quote-value (hash-get tbl k))))
+                (display (format "['~a']=~a" k (shell-quote-value (hash-get tbl k))))
                 (unless (string=? k last-key) (display " ")))
               keys)))
          (displayln ")")))
       (else
        (displayln (format "declare ~a ~a=~a" flag-str name
-                         (declare-quote-value (shell-var-scalar-value var))))))))
+                         (shell-quote-value (shell-var-scalar-value var))))))))
 
 ;; Continuation for early return from declare
 (def return-from-declare (make-parameter #f))
