@@ -274,14 +274,36 @@
          ;; Literal assignment argument (contains =) - expand value with assignment
          ;; tilde rules (tilde at start and after colons)
          ((and (string? w) (has-equals-sign? w))
-          (let* ((expanded (expand-word-nosplit w env))
-                 (eq-pos (string-find-char* expanded #\=)))
-            (if eq-pos
-              (let* ((name-part (substring expanded 0 (+ eq-pos 1)))
-                     (val-part (substring expanded (+ eq-pos 1) (string-length expanded)))
-                     (expanded-val (expand-assignment-value val-part env)))
-                [(string-append name-part expanded-val)])
-              [expanded])))
+          (let* ((eq-pos (string-find-char* w #\=))
+                 (raw-val (and eq-pos (substring w (+ eq-pos 1) (string-length w)))))
+            ;; Compound array assignment (value starts with "(") — expand each element
+            ;; individually to preserve empty quoted strings like '' and ""
+            (if (and raw-val (> (string-length raw-val) 0)
+                     (char=? (string-ref raw-val 0) #\())
+              (let* ((name-part (expand-word-nosplit (substring w 0 (+ eq-pos 1)) env))
+                     ;; Strip outer parens
+                     (inner (if (and (> (string-length raw-val) 1)
+                                     (char=? (string-ref raw-val (- (string-length raw-val) 1)) #\)))
+                              (substring raw-val 1 (- (string-length raw-val) 1))
+                              (substring raw-val 1 (string-length raw-val))))
+                     ;; Parse raw elements preserving quoting structure
+                     (raw-elems (parse-array-compound-raw inner))
+                     ;; Expand each element individually, re-quote for reassembly
+                     (expanded-elems (map (lambda (e) (expand-word-nosplit e env)) raw-elems))
+                     ;; Re-quote each element with declare-quote-value so empty strings
+                     ;; survive as "" and special chars are escaped
+                     (quoted-elems (map declare-quote-value expanded-elems))
+                     ;; Reassemble: name=("elem1" "elem2" ...)
+                     (rebuilt (string-append "(" (string-join quoted-elems " ") ")")))
+                [(string-append name-part rebuilt)])
+              (let* ((expanded (expand-word-nosplit w env))
+                     (exp-eq-pos (string-find-char* expanded #\=)))
+                (if exp-eq-pos
+                  (let* ((name-part (substring expanded 0 (+ exp-eq-pos 1)))
+                         (val-part (substring expanded (+ exp-eq-pos 1) (string-length expanded)))
+                         (expanded-val (expand-assignment-value val-part env)))
+                    [(string-append name-part expanded-val)])
+                  [expanded])))))
          ;; Regular arg - normal expansion with splitting
          (else (expand-word w env)))))
    words))

@@ -1950,45 +1950,85 @@
   (let ((len (string-length inner))
         (elems [])
         (buf (open-output-string)))
-    (let loop ((i 0) (in-single? #f) (in-double? #f))
+    ;; in-elem? tracks whether we've started an element (via quotes or content)
+    (let loop ((i 0) (in-single? #f) (in-double? #f) (in-elem? #f))
       (cond
         ((>= i len)
          ;; Flush remaining content
          (let ((s (get-output-string buf)))
-           (reverse (if (> (string-length s) 0) (cons s elems) elems))))
+           (reverse (if (or in-elem? (> (string-length s) 0)) (cons s elems) elems))))
         (in-single?
          (if (char=? (string-ref inner i) #\')
-           (loop (+ i 1) #f in-double?)
-           (begin (display (string-ref inner i) buf) (loop (+ i 1) #t in-double?))))
+           (loop (+ i 1) #f in-double? #t)
+           (begin (display (string-ref inner i) buf) (loop (+ i 1) #t in-double? #t))))
         (in-double?
          (cond
            ((char=? (string-ref inner i) #\")
-            (loop (+ i 1) in-single? #f))
+            (loop (+ i 1) in-single? #f #t))
            ((and (char=? (string-ref inner i) #\\) (< (+ i 1) len))
             (display (string-ref inner (+ i 1)) buf)
-            (loop (+ i 2) in-single? #t))
-           (else (display (string-ref inner i) buf) (loop (+ i 1) in-single? #t))))
+            (loop (+ i 2) in-single? #t #t))
+           (else (display (string-ref inner i) buf) (loop (+ i 1) in-single? #t #t))))
         ((char=? (string-ref inner i) #\')
-         (loop (+ i 1) #t in-double?))
+         (loop (+ i 1) #t in-double? #t))
         ((char=? (string-ref inner i) #\")
-         (loop (+ i 1) in-single? #t))
+         (loop (+ i 1) in-single? #t #t))
         ((and (char=? (string-ref inner i) #\\) (< (+ i 1) len))
          (display (string-ref inner (+ i 1)) buf)
-         (loop (+ i 2) in-single? in-double?))
+         (loop (+ i 2) in-single? in-double? #t))
         ;; Whitespace separates elements
         ((or (char=? (string-ref inner i) #\space)
              (char=? (string-ref inner i) #\tab)
              (char=? (string-ref inner i) #\newline))
          (let ((s (get-output-string buf)))
-           (if (> (string-length s) 0)
+           (if (or in-elem? (> (string-length s) 0))
              (begin
                (set! elems (cons s elems))
                (set! buf (open-output-string))
-               (loop (+ i 1) #f #f))
-             (loop (+ i 1) #f #f))))
+               (loop (+ i 1) #f #f #f))
+             (loop (+ i 1) #f #f #f))))
         (else
          (display (string-ref inner i) buf)
-         (loop (+ i 1) in-single? in-double?))))))
+         (loop (+ i 1) in-single? in-double? #t))))))
+
+;; Split inner text of compound array value into raw token strings,
+;; preserving quote characters. Splits on unquoted whitespace.
+;; E.g., "'' x \"\" ''" → ("''" "x" "\"\"" "''")
+(def (parse-array-compound-raw inner)
+  (let ((len (string-length inner))
+        (tokens []))
+    (let loop ((i 0) (start #f) (in-single? #f) (in-double? #f))
+      (cond
+        ((>= i len)
+         (reverse (if start (cons (substring inner start i) tokens) tokens)))
+        (in-single?
+         (if (char=? (string-ref inner i) #\')
+           (loop (+ i 1) start #f in-double?)
+           (loop (+ i 1) start #t in-double?)))
+        (in-double?
+         (cond
+           ((char=? (string-ref inner i) #\")
+            (loop (+ i 1) start in-single? #f))
+           ((and (char=? (string-ref inner i) #\\) (< (+ i 1) len))
+            (loop (+ i 2) start in-single? #t))
+           (else (loop (+ i 1) start in-single? #t))))
+        ((char=? (string-ref inner i) #\')
+         (loop (+ i 1) (or start i) #t in-double?))
+        ((char=? (string-ref inner i) #\")
+         (loop (+ i 1) (or start i) in-single? #t))
+        ((and (char=? (string-ref inner i) #\\) (< (+ i 1) len))
+         (loop (+ i 2) (or start i) in-single? in-double?))
+        ;; Whitespace separates tokens
+        ((or (char=? (string-ref inner i) #\space)
+             (char=? (string-ref inner i) #\tab)
+             (char=? (string-ref inner i) #\newline))
+         (if start
+           (begin
+             (set! tokens (cons (substring inner start i) tokens))
+             (loop (+ i 1) #f #f #f))
+           (loop (+ i 1) #f #f #f)))
+        (else
+         (loop (+ i 1) (or start i) in-single? in-double?))))))
 
 (def (builtin-declare args env)
   (let ((flags (make-hash-table))
