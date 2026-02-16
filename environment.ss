@@ -19,6 +19,14 @@
 ;;; Set from main.ss at startup to arith-eval.
 (def *arith-eval-fn* (make-parameter #f))
 
+;;; --- Interactive shell flag ---
+;;; When #t, job notifications and other interactive-only output is enabled.
+(def *interactive-shell* (make-parameter #f))
+
+;;; --- Callback for processing pending signal traps between commands ---
+;;; Set from main.ss at startup.
+(def *process-traps-fn* (make-parameter #f))
+
 ;;; --- Condition context for errexit suppression ---
 ;;; When #t, errexit (set -e) does not trigger on command failure.
 ;;; Set to #t in: if-test, while/until-test, && / || LHS, ! prefix.
@@ -27,6 +35,12 @@
 ;;; --- Subshell context ---
 ;;; When #t, `exit` raises an exception instead of terminating the process.
 (def *in-subshell* (make-parameter #f))
+
+;;; --- Pipeline raw stdin fd ---
+;;; When non-#f, holds the raw fd for the pipeline read-end.
+;;; Used by builtins (read, mapfile) to read via fdread instead of
+;;; Gambit character port (which doesn't handle pipe EOF properly).
+(def *pipeline-stdin-fd* (make-parameter #f))
 
 ;;; --- Internal logical PWD ---
 ;;; Tracks the shell's logical working directory independently of $PWD.
@@ -363,7 +377,9 @@
   (hash-for-each
    (lambda (name var)
      (when (shell-var-exported? var)
-       (hash-put! target name (or (shell-var-scalar-value var) ""))))
+       (let ((v (shell-var-value var)))
+         (unless (eq? v +unset-sentinel+)
+           (hash-put! target name (or (shell-var-scalar-value var) ""))))))
    (shell-environment-vars env)))
 
 ;; Push a new scope (for function calls)

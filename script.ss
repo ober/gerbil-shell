@@ -77,7 +77,7 @@
 
 ;; Parse and execute a string of shell commands.
 ;; Used by both execute-script and source-file!
-(def (execute-string input env)
+(def (execute-string input env (interactive? #f))
   (let ((lexer (make-shell-lexer input (env-shopt? env "extglob"))))
     (let loop ((status 0))
       (let ((cmd (with-catch
@@ -97,7 +97,11 @@
                   (with-catch
                    (lambda (e)
                      (cond
-                       ((nounset-exception? e) (raise e))
+                       ((nounset-exception? e)
+                        ;; In interactive mode, nounset only aborts current line
+                        (if interactive?
+                          (nounset-exception-status e)
+                          (raise e)))
                        ((errexit-exception? e)
                         (errexit-exception-status e))
                        ((break-exception? e) (raise e))
@@ -108,10 +112,10 @@
                         ;; Catch-all: print error and continue
                         (let ((msg (exception-message e)))
                           (fprintf (current-error-port) "gsh: ~a~n" msg)
-                          ;; POSIX: syntax/substitution errors → exit code 2
+                          ;; POSIX: syntax errors / unclosed bad substitution → exit code 2
                           (if (and (string? msg)
-                                   (or (string-prefix? "bad substitution" msg)
-                                       (string-prefix? "parse error" msg)))
+                                   (or (string-prefix? "parse error" msg)
+                                       (string-prefix? "bad substitution: unclosed" msg)))
                             2 1)))))
                    (lambda ()
                      (execute-command cmd env)))))

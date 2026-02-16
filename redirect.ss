@@ -97,8 +97,26 @@
 
 (def (apply-single-redirect! redir env)
   (let* ((op (redir-op redir))
-         (fd (or (redir-fd redir) (default-fd-for-op op)))
-         (target-str (cond
+         (fd-var (redir-fd-var redir)))
+    ;; Named fd {varname}> handled separately (except {varname}>&- which is close)
+    (if (and fd-var
+             (not (and (memq op '(>& <&))
+                       (string=? (redir-target redir) "-"))))
+      (apply-named-fd-redirect! redir env)
+      ;; Normal redirect (or named fd close)
+      (let* ((fd (cond
+                   ;; Named fd close: {varname}>&- — resolve variable
+                   (fd-var
+                    (let ((val (env-get env fd-var)))
+                      (or (and val (string->number val))
+                          (begin
+                            (fprintf (current-error-port) "gsh: ~a: Bad file descriptor~n" fd-var)
+                            (error (string-append fd-var ": Bad file descriptor"))))))
+                   ;; Explicit numeric fd
+                   ((redir-fd redir) => values)
+                   ;; Default fd for the operator
+                   (else (default-fd-for-op op))))
+             (target-str (cond
                        ((memq op '(<< <<- <<< <<q <<-q))
                         ;; Heredocs/herestrings: expand but no word splitting validation
                         (cond
@@ -326,14 +344,65 @@
          save))
       (else
        (fprintf (current-error-port) "gsh: unsupported redirect operator ~a~n" op)
-       #f))))
+       #f))))))
+
+;; Apply named fd redirect: {varname}>file — auto-allocate fd >= 10
+(def (apply-named-fd-redirect! redir env)
+  (let* ((op (redir-op redir))
+         (fd-var (redir-fd-var redir))
+         (target-str (let ((words (expand-word (redir-target redir) env)))
+                       (cond
+                         ((or (null? words) (> (length words) 1))
+                          (error (string-append (redir-target redir) ": ambiguous redirect")))
+                         (else
+                          (let ((w (car words)))
+                            (when (string=? w "")
+                              (error ": No such file or directory"))
+                            w)))))
+         ;; Determine open flags based on operator
+         (flags (case op
+                  ((<) O_RDONLY)
+                  ((>) (bitwise-ior O_WRONLY O_CREAT O_TRUNC))
+                  ((>>) (bitwise-ior O_WRONLY O_CREAT O_APPEND))
+                  ((clobber) (bitwise-ior O_WRONLY O_CREAT O_TRUNC))
+                  ((<>) O_RDWR)
+                  (else (bitwise-ior O_WRONLY O_CREAT O_TRUNC))))
+         ;; Open the file to get a raw fd
+         (raw-fd (ffi-open-raw target-str flags #o666)))
+    (when (< raw-fd 0)
+      (fprintf (current-error-port) "gsh: ~a: No such file or directory~n" target-str)
+      (error "cannot open file" target-str))
+    ;; Allocate fd >= 10, skipping any Gambit-internal fds
+    ;; ffi-dup-above calls fcntl(F_DUPFD, min) which skips occupied fds
+    (let ((high-fd (ffi-dup-above raw-fd 10)))
+      (ffi-close-fd raw-fd)
+      ;; Store the fd number in the variable
+      (env-set! env fd-var (number->string high-fd))
+      ;; Named fds stay open after the command (bash behavior).
+      ;; They are only closed explicitly with {varname}>&-
+      ;; Return #f so apply-redirections doesn't track this for restore.
+      #f)))
 
 ;; Apply a single redirect permanently (for exec)
 ;; Same logic but no save/restore
 (def (apply-single-redirect-permanent! redir env)
   (let* ((op (redir-op redir))
-         (fd (or (redir-fd redir) (default-fd-for-op op)))
-         (target-str (cond
+         (fd-var (redir-fd-var redir)))
+    ;; Named fd {varname}> handled separately (except close)
+    (if (and fd-var
+             (not (and (memq op '(>& <&))
+                       (string=? (redir-target redir) "-"))))
+      (apply-named-fd-redirect-permanent! redir env)
+      (let* ((fd (cond
+                   (fd-var
+                    (let ((val (env-get env fd-var)))
+                      (or (and val (string->number val))
+                          (begin
+                            (fprintf (current-error-port) "gsh: ~a: Bad file descriptor~n" fd-var)
+                            (error (string-append fd-var ": Bad file descriptor"))))))
+                   ((redir-fd redir) => values)
+                   (else (default-fd-for-op op))))
+             (target-str (cond
                        ((memq op '(<< <<- <<< <<q <<-q))
                         (cond
                           ((memq op '(<<q <<-q)) (redir-target redir))
@@ -463,7 +532,35 @@
          (unless (= read-fd fd)
            (ffi-close-fd read-fd))
          (current-input-port (open-input-string (string-append target-str "\n")))))
-      (else (fprintf (current-error-port) "gsh: unsupported redirect operator ~a~n" op)))))
+      (else (fprintf (current-error-port) "gsh: unsupported redirect operator ~a~n" op)))))))
+
+;; Apply named fd redirect permanently: {varname}>file
+(def (apply-named-fd-redirect-permanent! redir env)
+  (let* ((op (redir-op redir))
+         (fd-var (redir-fd-var redir))
+         (target-str (let ((words (expand-word (redir-target redir) env)))
+                       (cond
+                         ((or (null? words) (> (length words) 1))
+                          (error (string-append (redir-target redir) ": ambiguous redirect")))
+                         (else
+                          (let ((w (car words)))
+                            (when (string=? w "")
+                              (error ": No such file or directory"))
+                            w)))))
+         (flags (case op
+                  ((<) O_RDONLY)
+                  ((>) (bitwise-ior O_WRONLY O_CREAT O_TRUNC))
+                  ((>>) (bitwise-ior O_WRONLY O_CREAT O_APPEND))
+                  ((clobber) (bitwise-ior O_WRONLY O_CREAT O_TRUNC))
+                  ((<>) O_RDWR)
+                  (else (bitwise-ior O_WRONLY O_CREAT O_TRUNC))))
+         (raw-fd (ffi-open-raw target-str flags #o666)))
+    (when (< raw-fd 0)
+      (fprintf (current-error-port) "gsh: ~a: No such file or directory~n" target-str)
+      (error "cannot open file" target-str))
+    (let ((high-fd (ffi-dup-above raw-fd 10)))
+      (ffi-close-fd raw-fd)
+      (env-set! env fd-var (number->string high-fd)))))
 
 ;;; --- Helpers ---
 
@@ -473,11 +570,15 @@
     ((> >> clobber >& &> &>>) 1)
     (else 0)))
 
+;; Minimum fd for save-fd — must be above any user-visible fd range
+;; Named fds start at 10, bash tests use up to ~100, Gambit internal ~255
+(def SAVE-FD-MIN 200)
+
 ;; Save the real fd + Gambit port for later restoration
 ;; Returns (fd saved-real-fd saved-port)
-;; Uses ffi-dup-above to save to fd >= 10, avoiding conflicts with user fds
+;; Uses ffi-dup-above to save to fd >= SAVE-FD-MIN
 (def (save-fd fd)
-  (let ((saved-real-fd (ffi-dup-above fd 10))
+  (let ((saved-real-fd (ffi-dup-above fd SAVE-FD-MIN))
         (saved-port (case fd
                       ((0) (current-input-port))
                       ((1) (current-output-port))

@@ -67,6 +67,7 @@
      (let ((s (execute-coproc cmd env)))
        (env-set-last-status! env s) s))
     ((function-def? cmd) (execute-function-def cmd env))
+    ((time-command? cmd) (execute-time-command cmd env))
     (else
      (fprintf (current-error-port) "gsh: unknown command type~n")
      1)))
@@ -174,13 +175,13 @@
                                (raise e)))
                            (lambda ()
                              ;; For declaration builtins, expand assignment args without splitting
-                             (let ((first-word (if (pair? raw-words)
-                                                 (expand-word-nosplit (car raw-words) env)
-                                                 #f)))
-                               (if (and first-word (declaration-builtin? first-word))
+                             ;; Only apply for LITERAL declaration keywords, not dynamic ($var)
+                             (if (and (pair? raw-words)
+                                      (literal-declaration-builtin? (car raw-words)))
+                               (let ((first-word (expand-word-nosplit (car raw-words) env)))
                                  (cons first-word
-                                       (expand-declaration-args (cdr raw-words) env))
-                                 (expand-words raw-words env))))))
+                                       (expand-declaration-args (cdr raw-words) env)))
+                               (expand-words raw-words env)))))
                 (cmd-name (if (and expanded (pair? expanded)) (car expanded) #f))
                 (args (if (and expanded (pair? expanded)) (cdr expanded) [])))
            (if (not expanded)
@@ -244,14 +245,6 @@
                                  ((builtin-lookup cmd-name)
                                   => (lambda (handler)
                                        (handler args temp-env)))
-                                 ;; Reserved word used as command (e.g. from command sub)
-                                 ((member cmd-name '("if" "then" "elif" "else" "fi"
-                                                     "do" "done" "case" "esac"
-                                                     "while" "until" "for" "in"
-                                                     "select" "function" "{" "}"))
-                                  (fprintf (current-error-port)
-                                           "gsh: syntax error near unexpected token `~a'~n" cmd-name)
-                                  2)
                                  ;; External command
                                  (else
                                   (execute-external cmd-name args temp-env)))
@@ -279,6 +272,14 @@
 ;; For these, assignment-like args (containing =) should not be word-split
 (def (declaration-builtin? name)
   (member name '("export" "declare" "typeset" "local" "readonly")))
+
+;; Check if a raw word (list of AST parts) is a LITERAL declaration builtin
+;; Dynamic command names ($myvar expanding to "typeset") should NOT suppress splitting
+(def (literal-declaration-builtin? raw-word-parts)
+  (and (pair? raw-word-parts) (null? (cdr raw-word-parts))
+       (word-literal? (car raw-word-parts))
+       (member (word-literal-text (car raw-word-parts))
+               '("export" "declare" "typeset" "local" "readonly"))))
 
 ;; Expand args for declaration builtins.
 ;; Flag args (starting with - or +) and assignment args (containing =)
@@ -358,7 +359,11 @@
 ;;; --- External command execution ---
 
 (def (execute-external cmd-name args env)
-  (let ((path (which cmd-name)))
+  (let* ((path (which cmd-name))
+         ;; Resolve relative paths to absolute for open-process (OS cwd may
+         ;; differ from Gambit's current-directory)
+         (exec-path (and path (if (string-contains? path "/")
+                               (path-expand path) path))))
     (if (not path)
       (begin
         (fprintf (current-error-port) "gsh: ~a: command not found~n" cmd-name)
@@ -382,7 +387,7 @@
            (force-output)
            (force-output (current-error-port))
            (let* ((proc (open-process
-                         [path: (string->c-safe path)
+                         [path: (string->c-safe exec-path)
                           arguments: (map string->c-safe args)
                           environment: (map string->c-safe (env-exported-alist env))
                           stdin-redirection: #f
@@ -457,9 +462,11 @@
         ;; Replace shell with external command
         ;; Use Gambit's open-process and then exit with its status
         ;; (A true exec would use ffi-execvp but Gambit doesn't let us)
-        (let* ((env-alist (if clear-env? [] (env-exported-alist env)))
+        (let* ((exec-path (if (string-contains? path "/")
+                            (path-expand path) path))
+               (env-alist (if clear-env? [] (env-exported-alist env)))
                (proc (open-process
-                      [path: (string->c-safe path)
+                      [path: (string->c-safe exec-path)
                        arguments: (map string->c-safe cmd-args)
                        environment: (map string->c-safe env-alist)
                        stdin-redirection: #f
@@ -542,6 +549,12 @@
           ((sequential)
            (let ((new-status (execute-command command env)))
              (env-set-last-status! env new-status)
+             ;; Yield to let Gambit's signal handler threads run
+             ;; and queue any pending signals to *pending-signals*
+             (thread-yield!)
+             ;; Process pending signals between commands (bash behavior)
+             (let ((trap-fn (*process-traps-fn*)))
+               (when trap-fn (trap-fn env)))
              (loop (cdr items) new-status)))
           ((background)
            ;; Launch command in background
@@ -550,8 +563,10 @@
              (let ((job (job-table-add! (cdr result)
                                         (or (ast->command-text command) "&")
                                         (car result))))
-               (fprintf (current-error-port) "[~a] ~a~n"
-                        (job-id job) (car result)))
+               ;; Only print job notifications in interactive mode
+               (when (*interactive-shell*)
+                 (fprintf (current-error-port) "[~a] ~a~n"
+                          (job-id job) (car result))))
              (loop (cdr items) 0)))
           (else
            (loop (cdr items) (execute-command command env))))))))
@@ -863,6 +878,59 @@
              (not (*in-condition-context*)))
     (raise (make-errexit-exception status))))
 
+;;; --- time command ---
+
+(def (execute-time-command cmd env)
+  (let* ((posix? (time-command-posix? cmd))
+         (pipeline (time-command-pipeline cmd))
+         (start-real (real-time))
+         (start-cpu (cpu-time))
+         (status (if pipeline
+                   (execute-command pipeline env)
+                   0))
+         (end-real (real-time))
+         (end-cpu (cpu-time))
+         (elapsed-real (fl- end-real start-real))
+         (elapsed-user (fl- end-cpu start-cpu))
+         ;; System time not available from Gambit, approximate as 0
+         (elapsed-sys 0.0))
+    (if posix?
+      ;; POSIX format: real/user/sys in seconds
+      (begin
+        (fprintf (current-error-port) "real ~a~n" (format-time-posix elapsed-real))
+        (fprintf (current-error-port) "user ~a~n" (format-time-posix elapsed-user))
+        (fprintf (current-error-port) "sys ~a~n" (format-time-posix elapsed-sys)))
+      ;; Default bash-like format
+      (begin
+        (fprintf (current-error-port) "~nreal\t~a~n" (format-time-bash elapsed-real))
+        (fprintf (current-error-port) "user\t~a~n" (format-time-bash elapsed-user))
+        (fprintf (current-error-port) "sys\t~a~n" (format-time-bash elapsed-sys))))
+    (env-set-last-status! env status)
+    status))
+
+(def (format-time-bash secs)
+  (let* ((mins (inexact->exact (floor (fl/ secs 60.0))))
+         (remaining (fl- secs (fl* (exact->inexact mins) 60.0))))
+    (format "~am~a.~as"
+            mins
+            (inexact->exact (floor remaining))
+            (let ((frac (fl- remaining (flfloor remaining))))
+              (let ((ms (inexact->exact (floor (fl* frac 1000.0)))))
+                (string-append
+                 (if (< ms 100) "0" "")
+                 (if (< ms 10) "0" "")
+                 (number->string ms)))))))
+
+(def (format-time-posix secs)
+  (let* ((mins (inexact->exact (floor (fl/ secs 60.0))))
+         (remaining (fl- secs (fl* (exact->inexact mins) 60.0))))
+    (format "~a.~a"
+            mins
+            (let ((cs (inexact->exact (floor (fl* remaining 100.0)))))
+              (string-append
+               (if (< cs 10) "0" "")
+               (number->string cs))))))
+
 ;;; --- Helpers ---
 
 (def (return-status env status)
@@ -948,8 +1016,9 @@
                                        (string-append "coproc " (or (ast->command-text body)
                                                                     name))
                                        pid)))
-              (fprintf (current-error-port) "[~a] ~a~n"
-                       (job-id job) pid))
+              (when (*interactive-shell*)
+                (fprintf (current-error-port) "[~a] ~a~n"
+                         (job-id job) pid)))
             0))))))
 
 ;;; --- Background execution ---
@@ -1012,9 +1081,11 @@
                                 assignments)
                                child)
                              env))
+                 (exec-path (if (string-contains? path "/")
+                              (path-expand path) path))
                  (_flush (begin (force-output) (force-output (current-error-port))))
                  (proc (open-process
-                        [path: (string->c-safe path)
+                        [path: (string->c-safe exec-path)
                          arguments: (map string->c-safe actual-args)
                          environment: (map string->c-safe (env-exported-alist temp-env))
                          stdin-redirection: #f
@@ -1063,4 +1134,6 @@
     ((coproc-command? cmd)
      (string-append "coproc " (coproc-command-name cmd) " "
                     (or (ast->command-text (coproc-command-command cmd)) "...")))
+    ((time-command? cmd)
+     (string-append "time " (or (ast->command-text (time-command-pipeline cmd)) "")))
     (else #f)))

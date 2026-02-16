@@ -7,6 +7,7 @@
         :std/sort
         :std/pregexp
         :std/os/signal
+        :std/os/fdio
         :gsh/ast
         :gsh/ffi
         :gsh/environment
@@ -39,6 +40,29 @@
 ;; Check if a name is a built-in
 (def (builtin? name)
   (and (builtin-lookup name) #t))
+
+;;; --- Pipeline-safe I/O helpers ---
+;;; Gambit character ports opened via /dev/fd/N don't properly detect EOF
+;;; on pipes (they block forever instead of returning #!eof). These helpers
+;;; use fdread on the raw pipeline fd when available.
+
+(def *fd-read-buf* (make-u8vector 1))
+
+;; Read a single character from the pipeline stdin fd using fdread.
+;; Returns a character or #!eof.
+(def (fd-read-char rfd)
+  (let ((n (fdread rfd *fd-read-buf* 0 1)))
+    (cond
+      ((= n 0) #!eof)
+      ((= n 1) (integer->char (u8vector-ref *fd-read-buf* 0)))
+      (else #!eof))))
+
+;; Smart read-char that uses fdread when in a pipeline, falling back
+;; to regular read-char on the Gambit port.
+(def (port-or-fd-read-char in-port pipe-fd)
+  (if pipe-fd
+    (fd-read-char pipe-fd)
+    (read-char in-port)))
 
 ;;; --- Built-in implementations ---
 ;;; Each handler: (lambda (args env) -> exit-status)
@@ -122,23 +146,28 @@
              (parameterize ((*printf-conversion-error* #f))
                (let ((output (shell-printf fmt fmt-args)))
                  (if var-name
-                   (let ((bracket (string-index var-name #\[)))
-                     (if bracket
-                       ;; Validate array subscript syntax: must end with ]
-                       (if (and (> (string-length var-name) (+ bracket 1))
-                                (char=? (string-ref var-name (- (string-length var-name) 1)) #\]))
-                         (let ((arr-name (substring var-name 0 bracket))
-                               (idx-str (substring var-name (+ bracket 1)
-                                                   (- (string-length var-name) 1))))
-                           (env-array-set! env arr-name idx-str output)
-                           (if (*printf-conversion-error*) 1 0))
+                   ;; -v: store as string in variable
+                   (let ((str-output (u8vector->string-lossy output)))
+                     (let ((bracket (string-index var-name #\[)))
+                       (if bracket
+                         ;; Validate array subscript syntax: must end with ]
+                         (if (and (> (string-length var-name) (+ bracket 1))
+                                  (char=? (string-ref var-name (- (string-length var-name) 1)) #\]))
+                           (let ((arr-name (substring var-name 0 bracket))
+                                 (idx-str (substring var-name (+ bracket 1)
+                                                     (- (string-length var-name) 1))))
+                             (env-array-set! env arr-name idx-str str-output)
+                             (if (*printf-conversion-error*) 1 0))
+                           (begin
+                             (fprintf (current-error-port) "printf: `~a': not a valid identifier~n" var-name)
+                             2))
                          (begin
-                           (fprintf (current-error-port) "printf: `~a': not a valid identifier~n" var-name)
-                           2))
-                       (begin
-                         (env-set! env var-name output)
-                         (if (*printf-conversion-error*) 1 0))))
-                   (begin (display output) (force-output)
+                           (env-set! env var-name str-output)
+                           (if (*printf-conversion-error*) 1 0)))))
+                   ;; Normal: write raw bytes to stdout
+                   (begin (write-subu8vector output 0 (u8vector-length output)
+                                             (current-output-port))
+                          (force-output)
                           (if (*printf-conversion-error*) 1 0))))))))))))
 
 ;; Helper: strip trailing slash (except for root /)
@@ -1000,6 +1029,8 @@
          (let* ((in-port (if fd
                            (open-input-file (string-append "/dev/fd/" (number->string fd)))
                            (current-input-port)))
+                ;; Use raw fd for pipeline reads (Gambit ports can't detect pipe EOF)
+                (pipe-fd (and (not fd) (*pipeline-stdin-fd*)))
                 ;; Disable echo for -s (only on tty)
                 (tty? (and silent? (not fd)
                            (with-catch (lambda (e) #f)
@@ -1029,7 +1060,7 @@
                                  (let rloop ((count 0))
                                    (if (>= count nchars)
                                      (get-output-string buf)
-                                     (let ((ch (read-char in-port)))
+                                     (let ((ch (port-or-fd-read-char in-port pipe-fd)))
                                        (if (eof-object? ch)
                                          (begin (set! got-eof? #t)
                                                 (let ((s (get-output-string buf)))
@@ -1050,7 +1081,7 @@
                                    (let rloop ((count 0))
                                      (if (>= count nchars)
                                        (get-output-string buf)
-                                       (let ((ch (read-char in-port)))
+                                       (let ((ch (port-or-fd-read-char in-port pipe-fd)))
                                          (cond
                                            ((eof-object? ch)
                                             (set! got-eof? #t)
@@ -1066,7 +1097,7 @@
                                    (let rloop ((count 0))
                                      (if (>= count nchars)
                                        (get-output-string buf)
-                                       (let ((ch (read-char in-port)))
+                                       (let ((ch (port-or-fd-read-char in-port pipe-fd)))
                                          (cond
                                            ((eof-object? ch)
                                             (set! got-eof? #t)
@@ -1075,7 +1106,7 @@
                                            ((char=? ch delim-ch)
                                             (get-output-string buf))
                                            ((char=? ch #\\)
-                                            (let ((next (read-char in-port)))
+                                            (let ((next (port-or-fd-read-char in-port pipe-fd)))
                                               (cond
                                                 ((eof-object? next)
                                                  (set! got-eof? #t)
@@ -1099,7 +1130,7 @@
                                  (if raw?
                                    ;; Raw mode: no backslash processing
                                    (let rloop ()
-                                     (let ((ch (read-char in-port)))
+                                     (let ((ch (port-or-fd-read-char in-port pipe-fd)))
                                        (cond
                                          ((eof-object? ch)
                                           (set! got-eof? #t)
@@ -1112,7 +1143,7 @@
                                           (rloop)))))
                                    ;; Non-raw mode: backslash-newline is continuation
                                    (let rloop ()
-                                     (let ((ch (read-char in-port)))
+                                     (let ((ch (port-or-fd-read-char in-port pipe-fd)))
                                        (cond
                                          ((eof-object? ch)
                                           (set! got-eof? #t)
@@ -1121,7 +1152,7 @@
                                          ((char=? ch delim-ch)
                                           (get-output-string buf))
                                          ((char=? ch #\\)
-                                          (let ((next (read-char in-port)))
+                                          (let ((next (port-or-fd-read-char in-port pipe-fd)))
                                             (cond
                                               ((eof-object? next)
                                                (set! got-eof? #t)
@@ -1142,7 +1173,7 @@
                                  ;; Raw mode: read char-by-char to detect no-newline
                                  (let ((buf (open-output-string)))
                                    (let rloop ()
-                                     (let ((ch (read-char in-port)))
+                                     (let ((ch (port-or-fd-read-char in-port pipe-fd)))
                                        (cond
                                          ((eof-object? ch)
                                           (set! got-eof? #t)
@@ -1157,7 +1188,7 @@
                                  ;; Read char-by-char to detect no-newline EOF
                                  (let ((buf (open-output-string)))
                                    (let rloop ()
-                                     (let ((ch (read-char in-port)))
+                                     (let ((ch (port-or-fd-read-char in-port pipe-fd)))
                                        (cond
                                          ((eof-object? ch)
                                           (set! got-eof? #t)
@@ -1166,7 +1197,7 @@
                                          ((char=? ch #\newline)
                                           (get-output-string buf))
                                          ((char=? ch #\\)
-                                          (let ((next (read-char in-port)))
+                                          (let ((next (port-or-fd-read-char in-port pipe-fd)))
                                             (cond
                                               ((eof-object? next)
                                                (set! got-eof? #t)
@@ -1494,10 +1525,15 @@
         ((>= i len)
          ;; End of string: strip trailing IFS for last field
          (let* ((s (get-output-string buf))
-                (s (strip-trailing-ifs-for-read s ifs-ws ifs-nw)))
-           (reverse (if (or (> (string-length s) 0) (pair? fields))
-                      (cons s fields)
-                      fields))))
+                (s (if (> max-fields 0)
+                     (strip-trailing-ifs-ws s ifs-ws)
+                     (strip-trailing-ifs-for-read s ifs-ws ifs-nw))))
+           (reverse (cond
+                      ((> (string-length s) 0) (cons s fields))
+                      ;; For max-split, keep trailing empty field; for unlimited, drop it
+                      ((pair? fields)
+                       (if (> max-fields 0) (cons s fields) fields))
+                      (else fields)))))
         ;; Non-whitespace IFS delimiter
         ((ifs-nw-member? (string-ref str i) ifs-nw)
          ;; Check if we're at max-fields — if so, include delimiter in current field
@@ -1522,17 +1558,16 @@
                    (loop j)))))))
         ;; IFS whitespace
         ((ifs-ws-member? (string-ref str i) ifs-ws)
-         ;; Check if we're at max-fields AND buf has content — if so, include ws in current field
          ;; NOTE: get-output-string resets the port in Gambit, so save to var first
          (let ((buf-content (get-output-string buf)))
            (if (and (> max-fields 0) (>= field-count max-fields)
                     (> (string-length buf-content) 0))
              ;; At max fields: include buffered content + rest of string
              (let* ((full (string-append buf-content (substring str i len)))
-                    (full (strip-trailing-ifs-for-read full ifs-ws ifs-nw)))
+                    (full (strip-trailing-ifs-ws full ifs-ws)))
                (reverse (cons full fields)))
-             (begin
-               (when (> (string-length buf-content) 0)
+             (let ((had-content? (> (string-length buf-content) 0)))
+               (when had-content?
                  (set! fields (cons buf-content fields))
                  (set! field-count (+ field-count 1)))
                (set! buf (open-output-string))
@@ -1540,14 +1575,23 @@
                (let skip ((j (+ i 1)))
                  (if (and (< j len) (ifs-ws-member? (string-ref str j) ifs-ws))
                    (skip (+ j 1))
-                   ;; If NOW at max fields, take rest as last field
-                   (if (and (> max-fields 0) (>= field-count max-fields))
-                     (begin
-                       (display (substring str j len) buf)
-                       (let* ((s (get-output-string buf))
-                              (s (strip-trailing-ifs-for-read s ifs-ws ifs-nw)))
-                         (reverse (cons s fields))))
-                     (loop j))))))))
+                   ;; POSIX: absorb adjacent non-ws IFS delimiter when ws was a field separator
+                   (let ((j (if (and had-content? (< j len)
+                                     (ifs-nw-member? (string-ref str j) ifs-nw))
+                              ;; Absorb non-ws delimiter + trailing whitespace
+                              (let skip2 ((k (+ j 1)))
+                                (if (and (< k len) (ifs-ws-member? (string-ref str k) ifs-ws))
+                                  (skip2 (+ k 1))
+                                  k))
+                              j)))
+                     ;; If NOW at max fields, take rest as last field
+                     (if (and (> max-fields 0) (>= field-count max-fields))
+                       (begin
+                         (display (substring str j len) buf)
+                         (let* ((s (get-output-string buf))
+                                (s (strip-trailing-ifs-for-read s ifs-ws ifs-nw)))
+                           (reverse (cons s fields))))
+                       (loop j)))))))))
         ;; Regular character
         (else
          (display (string-ref str i) buf)
@@ -1563,8 +1607,11 @@
       (when (< j len)
         (display (string-ref str j) buf)
         (rloop (+ j 1)))))
-  ;; Finalize a last-field: strip trailing IFS from raw content, then remove backslashes
+  ;; Finalize a last-field (unlimited split): strip trailing IFS (ws + nw), then backslashes
   (define (finalize-last-field raw-s)
+    (read-strip-backslashes (strip-trailing-ifs-for-read raw-s ifs-ws ifs-nw)))
+  ;; Finalize the last field in max-split mode: strip trailing IFS (ws + nw)
+  (define (finalize-max-last-field raw-s)
     (read-strip-backslashes (strip-trailing-ifs-for-read raw-s ifs-ws ifs-nw)))
   ;; Finalize a non-last field: strip trailing IFS-ws, then remove backslashes
   (define (finalize-field raw-s)
@@ -1577,10 +1624,16 @@
         ((>= i len)
          ;; End of string: strip trailing IFS for last field, then remove backslashes
          (let* ((raw-s (get-output-string buf))
-                (s (finalize-last-field raw-s)))
-           (reverse (if (or (> (string-length s) 0) (pair? fields))
-                      (cons s fields)
-                      fields))))
+                (s (if (> max-fields 0)
+                     (finalize-max-last-field raw-s)
+                     (finalize-last-field raw-s))))
+           (reverse (cond
+                      ((> (string-length s) 0) (cons s fields))
+                      ;; For max-split, keep trailing empty field (named vars need it)
+                      ;; For unlimited split, drop trailing empty fields
+                      ((pair? fields)
+                       (if (> max-fields 0) (cons s fields) fields))
+                      (else fields)))))
         ;; Backslash: keep in buffer (prevents IFS matching of next char)
         ((and (char=? (string-ref str i) #\\) (< (+ i 1) len))
          (display #\\ buf)
@@ -1609,7 +1662,7 @@
                  (if (and (> max-fields 0) (>= field-count max-fields))
                    (begin
                      (append-rest j buf)
-                     (let ((s (finalize-last-field (get-output-string buf))))
+                     (let ((s (finalize-max-last-field (get-output-string buf))))
                        (reverse (cons s fields))))
                    (loop j)))))))
         ;; IFS whitespace
@@ -1622,10 +1675,10 @@
              (let ((new-buf (open-output-string)))
                (display buf-content new-buf)
                (append-rest i new-buf)
-               (let ((s (finalize-last-field (get-output-string new-buf))))
+               (let ((s (finalize-max-last-field (get-output-string new-buf))))
                  (reverse (cons s fields))))
-             (begin
-               (when (> (string-length buf-content) 0)
+             (let ((had-content? (> (string-length buf-content) 0)))
+               (when had-content?
                  (set! fields (cons (read-strip-backslashes buf-content) fields))
                  (set! field-count (+ field-count 1)))
                (set! buf (open-output-string))
@@ -1635,13 +1688,25 @@
                           (not (char=? (string-ref str j) #\\))
                           (ifs-ws-member? (string-ref str j) ifs-ws))
                    (skip (+ j 1))
-                   ;; If NOW at max fields, append rest and finalize
-                   (if (and (> max-fields 0) (>= field-count max-fields))
-                     (begin
-                       (append-rest j buf)
-                       (let ((s (finalize-last-field (get-output-string buf))))
-                         (reverse (cons s fields))))
-                     (loop j))))))))
+                   ;; POSIX: absorb adjacent non-ws IFS delimiter when ws was a field separator
+                   (let ((j (if (and had-content? (< j len)
+                                     (not (char=? (string-ref str j) #\\))
+                                     (ifs-nw-member? (string-ref str j) ifs-nw))
+                              ;; Absorb non-ws delimiter + trailing whitespace
+                              (let skip2 ((k (+ j 1)))
+                                (if (and (< k len)
+                                         (not (char=? (string-ref str k) #\\))
+                                         (ifs-ws-member? (string-ref str k) ifs-ws))
+                                  (skip2 (+ k 1))
+                                  k))
+                              j)))
+                     ;; If NOW at max fields, append rest and finalize
+                     (if (and (> max-fields 0) (>= field-count max-fields))
+                       (begin
+                         (append-rest j buf)
+                         (let ((s (finalize-max-last-field (get-output-string buf))))
+                           (reverse (cons s fields))))
+                       (loop j)))))))))
         ;; Regular character
         (else
          (display (string-ref str i) buf)
@@ -1662,8 +1727,11 @@
 
 ;; Strip trailing IFS from the last field for read:
 ;; 1. Strip trailing IFS whitespace
-;; 2. If the last char is a non-ws IFS char AND it is NOT preceded by backslash,
-;;    strip that one trailing non-ws IFS char (and any IFS whitespace before it)
+;; 2. If the last char is a non-ws IFS char preceded by a non-IFS char
+;;    (not IFS-whitespace and not IFS-non-whitespace), strip that one
+;;    trailing non-ws IFS char and any IFS whitespace before it.
+;;    This matches bash behavior: trailing non-ws IFS delimiters are only
+;;    stripped when adjacent to real content, not when adjacent to other IFS chars.
 (def (strip-trailing-ifs-for-read s ifs-ws ifs-nw)
   (let* ((s1 (strip-trailing-ifs-ws s ifs-ws))
          (len (string-length s1)))
@@ -1671,9 +1739,11 @@
              (ifs-nw-member? (string-ref s1 (- len 1)) ifs-nw)
              ;; Don't strip if preceded by backslash (escaped char)
              (not (and (> len 1) (char=? (string-ref s1 (- len 2)) #\\)))
-             ;; Only strip if NOT preceded by another non-ws IFS char
+             ;; Only strip if preceded by a non-IFS character (or at position 0)
              (or (= len 1)
-                 (not (ifs-nw-member? (string-ref s1 (- len 2)) ifs-nw))))
+                 (let ((prev (string-ref s1 (- len 2))))
+                   (and (not (ifs-nw-member? prev ifs-nw))
+                        (not (ifs-ws-member? prev ifs-ws))))))
       ;; Strip the trailing non-ws IFS char
       (strip-trailing-ifs-ws (substring s1 0 (- len 1)) ifs-ws)
       s1)))
@@ -1871,8 +1941,7 @@
                                  (map (lambda (a) (job-table-get a)) rest-args)))))
                     (if (null? jobs)
                       127
-                      (let ((job (car jobs)))
-                        (job-wait job)))))))
+                      (job-wait-any jobs))))))
              ;; Wait for specific jobs
              (else
               (let loop ((args args) (status 0))
@@ -1913,21 +1982,29 @@
                               SIGTERM)))
              (loop (cdr args) sig-num)))
           (else
-           (for-each
-            (lambda (target)
-              (cond
-                ((char=? (string-ref target 0) #\%)
-                 (let ((job (job-table-get target)))
-                   (when job
-                     (for-each
-                      (lambda (proc)
-                        (kill (job-process-pid proc) sig))
-                      (job-processes job)))))
-                (else
-                 (let ((pid (string->number target)))
-                   (when pid (kill pid sig))))))
-            args)
-           0))))))
+           (let ((self-pid (ffi-getpid))
+                 (sent-to-self? #f))
+             (for-each
+              (lambda (target)
+                (cond
+                  ((char=? (string-ref target 0) #\%)
+                   (let ((job (job-table-get target)))
+                     (when job
+                       (for-each
+                        (lambda (proc)
+                          (kill (job-process-pid proc) sig))
+                        (job-processes job)))))
+                  (else
+                   (let ((pid (string->number target)))
+                     (when pid
+                       (when (= pid self-pid) (set! sent-to-self? #t))
+                       (kill pid sig))))))
+              args)
+             ;; When we sent a signal to ourselves, give Gambit's signal
+             ;; handler thread time to run so the trap can fire promptly
+             (when sent-to-self?
+               (thread-sleep! 0.001))
+             0)))))))
 
 ;; history [n]
 (builtin-register! "history"
@@ -2477,17 +2554,19 @@
            (displayln (format "~a=~a" name (shell-var-scalar-value var))))))
      names)))
 
-;; Build flag string in bash canonical order: A/a i n r x l u t
+;; Build flag string: modifier flags (alphabetical) then type flags (A/a)
+;; This matches the order bash uses in declare -p output: -ilnrux then -A/-a
+;; e.g. declare -ra arr=() for a readonly indexed array
 (def (declare-var-flags var)
   (string-append
-   (if (shell-var-assoc? var) "A" "")
-   (if (shell-var-array? var) "a" "")
    (if (shell-var-integer? var) "i" "")
+   (if (shell-var-lowercase? var) "l" "")
    (if (shell-var-nameref? var) "n" "")
    (if (shell-var-readonly? var) "r" "")
+   (if (shell-var-uppercase? var) "u" "")
    (if (shell-var-exported? var) "x" "")
-   (if (shell-var-lowercase? var) "l" "")
-   (if (shell-var-uppercase? var) "u" "")))
+   (if (shell-var-assoc? var) "A" "")
+   (if (shell-var-array? var) "a" "")))
 
 ;; Check if an indexed array is dense (keys are 0, 1, 2, ..., n-1)
 (def (array-dense? tbl)
@@ -2499,33 +2578,41 @@
                  (and (hash-key? tbl i)
                       (loop (+ i 1)))))))))
 
-;; Quote a value for declare -p output (bash-compatible quoting)
-;; Wraps in double quotes, escaping $, `, \, " inside
+;; Quote a value for declare -p array element output (bash-compatible quoting)
+;; Uses shell-quote-value which produces: bare for safe chars, 'single' for specials, $'...' for control
 (def (declare-quote-value val)
-  (if (not val) "\"\""
+  (if (not val) "''"
     (let ((s (if (string? val) val (format "~a" val))))
-      ;; Check for control characters that need $'...' quoting
-      (let ((has-control? (let loop ((i 0))
-                            (and (< i (string-length s))
-                                 (or (char<? (string-ref s i) #\space)
-                                     (char=? (string-ref s i) #\x7f)
-                                     (loop (+ i 1)))))))
-        (if has-control?
-          ;; Use $'...' for values with control characters
-          (shell-quote-value s)
-          ;; Use double-quoting (bash convention for declare -p)
-          (let ((out (open-output-string)))
-            (write-char #\" out)
-            (let loop ((i 0))
-              (if (>= i (string-length s))
-                (begin (write-char #\" out)
-                       (get-output-string out))
-                (let ((c (string-ref s i)))
-                  (when (or (char=? c #\\) (char=? c #\") (char=? c #\$)
-                            (char=? c #\`) (char=? c #\!))
-                    (write-char #\\ out))
-                  (write-char c out)
-                  (loop (+ i 1)))))))))))
+      (shell-quote-value s))))
+
+;; Quote a scalar value for declare -p output — always uses double-quote form like bash
+;; Escapes: $ ` " \ newline within double quotes
+(def (declare-quote-scalar val)
+  (let* ((s (if (string? val) val (format "~a" val)))
+         (len (string-length s))
+         (buf (open-output-string))
+         (has-control? (let loop ((i 0))
+                         (if (>= i len) #f
+                           (let ((ch (string-ref s i)))
+                             (if (or (char<? ch #\space) (char=? ch #\x7f))
+                               #t
+                               (loop (+ i 1))))))))
+    (if has-control?
+      ;; Use $'...' for control chars (bash uses this format)
+      (shell-quote-value s)
+      ;; Normal double-quote wrapping
+      (begin
+        (display "\"" buf)
+        (let loop ((i 0))
+          (when (< i len)
+            (let ((ch (string-ref s i)))
+              (case ch
+                ((#\$ #\` #\" #\\) (display "\\" buf) (display ch buf))
+                ((#\newline) (display "\\n" buf))
+                (else (display ch buf))))
+            (loop (+ i 1))))
+        (display "\"" buf)
+        (get-output-string buf)))))
 
 (def (display-declare-var name var)
   (let* ((flags (declare-var-flags var))
@@ -2542,13 +2629,13 @@
            (let* ((keys (sort! (hash-keys tbl) <))
                   (last-key (and (pair? keys) (last keys))))
              (if (array-dense? tbl)
-               ;; Dense array: ("val1" "val2" "val3") — no indices, double-quoted
+               ;; Dense array: (val1 'val 2' val3) — no indices
                (for-each
                 (lambda (k)
                   (display (declare-quote-value (hash-get tbl k)))
                   (unless (equal? k last-key) (display " ")))
                 keys)
-               ;; Sparse array: ([3]="val" [5]="val") — with indices, double-quoted
+               ;; Sparse array: ([3]=val [5]='val 2') — with indices
                (for-each
                 (lambda (k)
                   (display (format "[~a]=~a" k (declare-quote-value (hash-get tbl k))))
@@ -2556,7 +2643,7 @@
                 keys))))
          (displayln ")")))
       ((shell-var-assoc? var)
-       ;; Assoc array: declare -A map=(['key1']="val1" ['key2']="val2")
+       ;; Assoc array: declare -A map=(['key1']=val1 ['key2']='val 2')
        (let ((tbl (shell-var-value var)))
          (display (format "declare ~a ~a=(" flag-str name))
          (when (hash-table? tbl)
@@ -2566,13 +2653,23 @@
                   (last-key (and (pair? keys) (last keys))))
              (for-each
               (lambda (k)
-                (display (format "[~a]=~a" k (declare-quote-value (hash-get tbl k))))
+                ;; Keys always single-quoted in declare -p: ['key']=value
+                (let ((qk (let ((sv (shell-quote-value k)))
+                            ;; If shell-quote-value returns bare, wrap in single quotes
+                            (if (and (> (string-length sv) 0)
+                                     (not (char=? (string-ref sv 0) #\'))
+                                     (not (and (> (string-length sv) 1)
+                                               (char=? (string-ref sv 0) #\$)
+                                               (char=? (string-ref sv 1) #\'))))
+                              (string-append "'" sv "'")
+                              sv))))
+                  (display (format "[~a]=~a" qk (declare-quote-value (hash-get tbl k)))))
                 (unless (string=? k last-key) (display " ")))
               keys)))
          (displayln ")")))
       (else
        (displayln (format "declare ~a ~a=~a" flag-str name
-                         (declare-quote-value (shell-var-scalar-value var))))))))
+                         (declare-quote-scalar (shell-var-scalar-value var))))))))
 
 ;; Continuation for early return from declare
 (def return-from-declare (make-parameter #f))
@@ -3281,20 +3378,20 @@
 ;; Format a printf string with arguments
 ;; Supports argument recycling: if more args than format specifiers, repeat format
 (def (shell-printf fmt args)
-  (let ((buf (open-output-string)))
+  (let ((buf (open-output-u8vector (list char-encoding: 'UTF-8))))
     (parameterize ((*printf-stop* #f))
       (if (null? args)
         ;; No args: just process format escapes once
         (begin (printf-format-once fmt [] buf)
-               (get-output-string buf))
+               (get-output-u8vector buf))
         ;; With args: loop until all consumed (argument recycling)
         (let loop ((remaining args))
           (if (*printf-stop*)
-            (get-output-string buf)
+            (get-output-u8vector buf)
             (let ((leftover (printf-format-once fmt remaining buf)))
               (if (or (null? leftover)
                       (equal? leftover remaining)) ;; no args consumed → stop
-                (get-output-string buf)
+                (get-output-u8vector buf)
                 (loop leftover)))))))))
 
 ;; Process format string once, consuming args as needed
@@ -3480,10 +3577,19 @@
                                (pad-ch (if (and zero-pad? (not left-align?) (not prec)) #\0 #\space)))
                           (display (pad-string s (or width 0) left-align? pad-ch) buf)
                           (values (+ i 1) rest)))
-                       ;; %c - character (first char of arg)
+                       ;; %c - first byte of first char (bash outputs first byte, not full UTF-8)
                        ((#\c)
                         (when (and (string? arg) (> (string-length arg) 0))
-                          (display (string-ref arg 0) buf))
+                          (let* ((ch (string-ref arg 0))
+                                 (cp (char->integer ch)))
+                            (if (< cp 128)
+                              (write-u8 cp buf)
+                              ;; For multi-byte chars, output only the first byte of UTF-8 encoding
+                              (let ((tmp (open-output-u8vector (list char-encoding: 'UTF-8))))
+                                (display ch tmp)
+                                (let ((bytes (get-output-u8vector tmp)))
+                                  (when (> (u8vector-length bytes) 0)
+                                    (write-u8 (u8vector-ref bytes 0) buf)))))))
                         (values (+ i 1) rest))
                        ;; %b - interpret backslash escapes in argument
                        ((#\b)
@@ -3527,6 +3633,20 @@
                        #t)
             (values (if found? n #f) j args)))))))
 
+;; Convert u8vector to string, trying UTF-8 first, falling back to Latin-1 (byte-per-char)
+(def (u8vector->string-lossy vec)
+  (with-catch
+    (lambda (_)
+      ;; Fallback: each byte becomes its code-point character (Latin-1)
+      (list->string (map integer->char (u8vector->list vec))))
+    (lambda ()
+      (let ((p (open-input-u8vector (list init: vec char-encoding: 'UTF-8))))
+        (let loop ((chars '()))
+          (let ((ch (read-char p)))
+            (if (eof-object? ch)
+              (list->string (reverse chars))
+              (loop (cons ch chars)))))))))
+
 ;; Process a printf backslash escape
 ;; Helper: convert hex digit char to its integer value, or #f
 (def (hex-digit-value ch)
@@ -3567,10 +3687,10 @@
                (octal-loop (+ j 1)
                           (+ (* n 8) (- (char->integer (string-ref fmt j)) 48))
                           (+ count 1))
-               (begin (display (string (integer->char n)) buf) j))))
+               (begin (write-u8 (modulo n 256) buf) j))))
           ;; \e / \E - escape (0x1b)
           ((#\e #\E) (display (string (integer->char #x1b)) buf) (+ i 1))
-          ;; \xHH - hex byte
+          ;; \xHH - hex byte (raw byte output)
           ((#\x)
            (let hex-loop ((j (+ i 1)) (n 0) (count 0))
              (if (and (< j flen) (< count 2))
@@ -3582,8 +3702,8 @@
                     (hex-loop (+ j 1) (+ (* n 16) (- (char->integer hch) 87)) (+ count 1)))
                    ((and (char>=? hch #\A) (char<=? hch #\F))
                     (hex-loop (+ j 1) (+ (* n 16) (- (char->integer hch) 55)) (+ count 1)))
-                   (else (display (string (integer->char n)) buf) j)))
-               (begin (display (string (integer->char n)) buf) j))))
+                   (else (write-u8 n buf) j)))
+               (begin (write-u8 n buf) j))))
           ;; \uNNNN - unicode (4 hex digits)
           ((#\u)
            (let hex-loop ((j (+ i 1)) (n 0) (count 0))
@@ -3604,7 +3724,7 @@
                    (hex-loop (+ j 1) (+ (* n 16) hv) (+ count 1))
                    (begin (display-unicode-char n buf) j)))
                (begin (display-unicode-char n buf) j))))
-          ;; \nnn - octal without leading 0 (up to 3 digits)
+          ;; \nnn - octal without leading 0 (up to 3 digits, raw byte output)
           ((#\1 #\2 #\3 #\4 #\5 #\6 #\7)
            (let octal-loop ((j i) (n 0) (count 0))
              (if (and (< j flen) (< count 3)
@@ -3613,7 +3733,7 @@
                (octal-loop (+ j 1)
                           (+ (* n 8) (- (char->integer (string-ref fmt j)) 48))
                           (+ count 1))
-               (begin (display (string (integer->char (bitwise-and n #xFF))) buf) j))))
+               (begin (write-u8 (bitwise-and n #xFF) buf) j))))
           ;; \c - stop output (only used in %b context, but handle here too)
           ((#\c) (+ i 1))  ;; caller should check for this
           (else (display "\\" buf) (display (string ch) buf) (+ i 1)))))))
@@ -3636,7 +3756,7 @@
                 (cond
                   ;; \c - stop all output
                   ((char=? next-ch #\c) #t)
-                  ;; \0NNN - 4-digit octal (up to 3 after the 0)
+                  ;; \0NNN - 4-digit octal (up to 3 after the 0, raw byte output)
                   ((char=? next-ch #\0)
                    (let oloop ((j (+ i 2)) (val 0) (count 0))
                      (if (and (< j len) (< count 3)
@@ -3645,9 +3765,9 @@
                        (oloop (+ j 1)
                               (+ (* val 8) (- (char->integer (string-ref str j)) 48))
                               (+ count 1))
-                       (begin (display (string (integer->char (modulo val 256))) buf)
+                       (begin (write-u8 (modulo val 256) buf)
                               (loop j)))))
-                  ;; \NNN - 3-digit octal (without leading 0, 1-7 start)
+                  ;; \NNN - 3-digit octal (without leading 0, 1-7 start, raw byte output)
                   ((and (char>=? next-ch #\1) (char<=? next-ch #\7))
                    (let oloop ((j (+ i 1)) (val 0) (count 0))
                      (if (and (< j len) (< count 3)
@@ -3656,7 +3776,7 @@
                        (oloop (+ j 1)
                               (+ (* val 8) (- (char->integer (string-ref str j)) 48))
                               (+ count 1))
-                       (begin (display (string (integer->char (modulo val 256))) buf)
+                       (begin (write-u8 (modulo val 256) buf)
                               (loop j)))))
                   ;; All other escapes: delegate to printf-escape
                   (else

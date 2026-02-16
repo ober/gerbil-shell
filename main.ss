@@ -91,6 +91,8 @@
   (*arith-eval-fn* arith-eval)
   ;; Set the execute-external callback for 'command' builtin
   (*execute-external-fn* execute-external)
+  ;; Set the trap processing callback for between-command signal handling
+  (*process-traps-fn* (lambda (env) (process-traps! env)))
 
   ;; source / . — source a file into the current environment
   (let ((source-handler
@@ -240,10 +242,10 @@
        (else
         (let ((msg (exception-message e)))
           (fprintf (current-error-port) "gsh: ~a~n" msg)
-          ;; POSIX: syntax/substitution errors → exit code 2
+          ;; POSIX: syntax errors / unclosed bad substitution → exit code 2
           (if (and (string? msg)
-                   (or (string-prefix? "bad substitution" msg)
-                       (string-prefix? "parse error" msg)))
+                   (or (string-prefix? "parse error" msg)
+                       (string-prefix? "bad substitution: unclosed" msg)))
             2 1)))))
    (lambda ()
      (let ((cmd (with-catch
@@ -334,10 +336,14 @@
          ;; If parse fails, fall back to execute-string for line-by-line
          ;; execution so earlier commands run before later parse errors
          ;; (e.g. "trap 'echo bye' EXIT; for" — trap must execute).
-         (let* ((parse-ok? (with-catch (lambda (e) #f)
-                             (lambda ()
-                               (parse-complete-command command (env-shopt? env "extglob"))
-                               #t)))
+         (let* ((interactive? (hash-ref args-hash 'interactive?))
+                ;; Interactive -c: always use line-by-line execution so nounset
+                ;; errors only abort the current line (bash behavior)
+                (parse-ok? (and (not interactive?)
+                                (with-catch (lambda (e) #f)
+                                  (lambda ()
+                                    (parse-complete-command command (env-shopt? env "extglob"))
+                                    #t))))
                 (status (with-catch
                          (lambda (e)
                            (cond
@@ -348,15 +354,15 @@
                              (else
                               (let ((msg (exception-message e)))
                                 (fprintf (current-error-port) "gsh: ~a~n" msg)
-                                ;; POSIX: syntax/substitution errors → exit code 2
+                                ;; POSIX: syntax errors / unclosed bad substitution → exit code 2
                                 (if (and (string? msg)
-                                         (or (string-prefix? "bad substitution" msg)
-                                             (string-prefix? "parse error" msg)))
+                                         (or (string-prefix? "parse error" msg)
+                                             (string-prefix? "bad substitution: unclosed" msg)))
                                   2 1)))))
                          (lambda ()
                            (if parse-ok?
                              (execute-input command env)
-                             (execute-string command env))))))
+                             (execute-string command env interactive?))))))
            ;; Process any pending signals before exit
            (process-traps! env)
            (run-exit-trap! env)
@@ -382,6 +388,7 @@
          (if interactive?
            ;; Interactive REPL
            (begin
+             (*interactive-shell* #t)
              (repl env)
              ;; Run logout for login shells
              (when login?

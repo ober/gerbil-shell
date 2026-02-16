@@ -467,6 +467,30 @@
               (let ((ch (current-char (current-lexer))))
                 (or (char=? ch #\<) (char=? ch #\>))))
          (make-token 'IO_NUMBER word pos))
+        ;; IO_VARNAME: {varname} followed by < or >
+        ;; Bash named fd syntax: exec {fd}>file allocates fd and stores in $fd
+        ((and (> (string-length word) 2)
+              (char=? (string-ref word 0) #\{)
+              (char=? (string-ref word (- (string-length word) 1)) #\})
+              (let* ((name (substring word 1 (- (string-length word) 1)))
+                     (len (string-length name)))
+                (and (> len 0)
+                     ;; First char: letter or underscore
+                     (let ((c0 (string-ref name 0)))
+                       (or (char-alphabetic? c0) (char=? c0 #\_)))
+                     ;; Rest: alphanumeric or underscore
+                     (let check-name ((i 1))
+                       (if (>= i len) #t
+                         (let ((c (string-ref name i)))
+                           (and (or (char-alphabetic? c)
+                                    (char-numeric? c)
+                                    (char=? c #\_))
+                                (check-name (+ i 1))))))))
+              (not (at-end? (current-lexer)))
+              (let ((ch (current-char (current-lexer))))
+                (or (char=? ch #\<) (char=? ch #\>))))
+         ;; Extract the variable name (without braces)
+         (make-token 'IO_VARNAME (substring word 1 (- (string-length word) 1)) pos))
         ;; Assignment: NAME= or NAME+=
         ((assignment-word? word)
          (make-token 'ASSIGNMENT_WORD word pos))

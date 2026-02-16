@@ -130,7 +130,11 @@
                 (loop (+ i 1) #t))
                ;; Backslash escape inside brackets: \] stays in bracket, etc.
                ((and (char=? ch #\\) (< (+ i 1) (string-length pattern)))
-                (display (pregexp-quote-char (string-ref pattern (+ i 1))) rx)
+                (let ((esc-ch (string-ref pattern (+ i 1))))
+                  ;; Inside bracket, dash must be escaped or it forms a range
+                  (if (char=? esc-ch #\-)
+                    (display "\\-" rx)
+                    (display (pregexp-quote-char esc-ch) rx)))
                 (loop (+ i 2) #t))
                (else
                 (display (pregexp-quote-char ch) rx)
@@ -357,7 +361,7 @@
              (display (if path-mode? "[^/]" ".") rx)
              (loop (+ i 1)))
             ((char=? ch #\[)
-             ;; Pass through bracket expression
+             ;; Pass through bracket expression, handling backslash escapes
              (display "[" rx)
              (let bloop ((j (+ i 1)))
                (cond
@@ -365,6 +369,12 @@
                  ((char=? (string-ref pattern j) #\])
                   (display "]" rx)
                   (loop (+ j 1)))
+                 ;; Backslash escape inside brackets — pass through to regex
+                 ((and (char=? (string-ref pattern j) #\\)
+                       (< (+ j 1) len))
+                  (display "\\" rx)
+                  (display (string-ref pattern (+ j 1)) rx)
+                  (bloop (+ j 2)))
                  (else
                   (display (string-ref pattern j) rx)
                   (bloop (+ j 1))))))

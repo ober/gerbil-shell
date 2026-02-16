@@ -251,6 +251,63 @@
     ;; Return exit status
     last-exit-code))
 
+;; Wait for the next job from a list to complete.
+;; Returns the exit status of the first job that finishes.
+;; Polls all jobs with backoff to detect which finishes first.
+(def (job-wait-any jobs)
+  (if (null? jobs)
+    127  ;; no jobs
+    ;; Filter to only running jobs
+    (let ((running (filter (lambda (j) (eq? (job-status j) 'running)) jobs)))
+      (if (null? running)
+        ;; All done, return exit status of first done job
+        (let ((done-job (find (lambda (j) (memq (job-status j) '(done killed))) jobs)))
+          (if done-job (job-wait done-job) 127))
+        ;; Poll running jobs until one finishes
+        (let poll-loop ((delay 0.001))
+          (let jloop ((js running))
+            (cond
+              ((null? js)
+               ;; None finished yet — sleep and retry with backoff
+               (thread-sleep! delay)
+               (poll-loop (min (* delay 2) 0.05)))
+              (else
+               (let* ((job (car js))
+                      (procs (job-processes job))
+                      (finished? (job-check-finished? job)))
+                 (if finished?
+                   ;; This job finished — return its status
+                   (job-wait job)
+                   (jloop (cdr js))))))))))))
+
+;; Non-blocking check if a job's processes are all done.
+;; Returns #t if finished, #f if still running.
+;; Side-effects: updates process status for finished processes.
+(def (job-check-finished? job)
+  (let ((procs (job-processes job)))
+    (and (pair? procs)
+         (every
+          (lambda (proc)
+            (or (memq (job-process-status proc) '(exited signaled))
+                (let ((port (job-process-port proc)))
+                  (and port
+                       (if (thread? port)
+                         ;; Thread: check if terminated
+                         (let ((st (thread-state port)))
+                           (or (thread-state-normally-terminated? st)
+                               (thread-state-abnormally-terminated? st)))
+                         ;; External process: try non-blocking waitpid
+                         (let* ((pid (process-pid port))
+                                (result (ffi-waitpid-pid pid WNOHANG)))
+                           (cond
+                             ((> result 0)
+                              (let ((raw-status (ffi-waitpid-status)))
+                                (set! (job-process-status proc)
+                                  (if (WIFSIGNALED raw-status) 'signaled 'exited))
+                                #t))
+                             (else #f))))))))
+          procs))))
+
 ;; Bring a job to the foreground
 (def (job-foreground! job)
   ;; Send SIGCONT if stopped

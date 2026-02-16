@@ -293,12 +293,9 @@
                      ;; Plain variable name — resolve through variable chain
                      (resolve trimmed (+ depth 1))
                      ;; Contains operators — evaluate as arithmetic expression
-                     (with-catch
-                      (lambda (e) 0)
-                      (lambda ()
-                        (arith-eval trimmed
-                                    (arith-state-env-get state)
-                                    (arith-state-env-set state)))))))))))))))
+                     (arith-eval trimmed
+                                 (arith-state-env-get state)
+                                 (arith-state-env-set state)))))))))))))
 
 (def (string-trim s)
   (let* ((len (string-length s))

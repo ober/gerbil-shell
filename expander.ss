@@ -15,6 +15,29 @@
         :gsh/glob
         :gsh/arithmetic)
 
+;;; --- Latin-1 to UTF-8 re-decode ---
+;;; ffi-read-all-from-fd uses char-string which decodes bytes as Latin-1.
+;;; Re-interpret as UTF-8 when the bytes form valid UTF-8, so that multi-byte
+;;; characters (e.g. from printf \xE2\x98\xA0) are correctly decoded.
+(def (latin1->utf8 s)
+  ;; For ASCII-only strings, Latin-1 and UTF-8 are identical — fast path
+  (let ((len (string-length s)))
+    (let check ((i 0))
+      (if (>= i len) s  ;; all ASCII, return as-is
+          (if (< (char->integer (string-ref s i)) 128)
+            (check (+ i 1))
+            ;; Has non-ASCII: try UTF-8 re-decode
+            (with-catch
+              (lambda (_) s)  ;; If UTF-8 decode fails, keep Latin-1
+              (lambda ()
+                (let* ((bytes (list->u8vector (map char->integer (string->list s))))
+                       (p (open-input-u8vector (list init: bytes char-encoding: 'UTF-8))))
+                  (let loop ((chars '()))
+                    (let ((ch (read-char p)))
+                      (if (eof-object? ch)
+                        (list->string (reverse chars))
+                        (loop (cons ch chars)))))))))))))
+
 ;;; --- Nounset (set -u) error ---
 (def (nounset-error! name env)
   (fprintf (current-error-port) "gsh: ~a: unbound variable~n" name)
@@ -121,6 +144,23 @@
                           ;; Split segments: unquoted parts undergo IFS splitting,
                           ;; quoted parts are preserved
                           (split (split-expanded-segments segments env))
+                          ;; Build glob-safe text for single-word case where quoted
+                          ;; segments contain glob metacharacters that should be literal.
+                          ;; For multi-word (IFS split) results, use text as-is.
+                          (glob-text-for
+                            (lambda (display-text)
+                              (if any-quoted?
+                                ;; Rebuild from segments with quoted glob chars escaped
+                                (let ((gt (apply string-append
+                                            (map (lambda (seg)
+                                                   (if (eq? (cdr seg) 'quoted)
+                                                     (glob-escape-quoted (car seg))
+                                                     (car seg)))
+                                                 segments))))
+                                  ;; Only use glob-text if it could match the display-text
+                                  ;; (they differ only in glob-metachar escaping)
+                                  (if (= (length split) 1) gt display-text))
+                                display-text)))
                           ;; Glob expansion: only on words from unquoted context
                           ;; split returns (text . has-unquoted?) pairs
                           (globbed (let ((raw (with-catch
@@ -133,18 +173,26 @@
                                                (lambda ()
                                                  (append-map
                                                   (lambda (item)
-                                                    (let ((s (car item))
-                                                          (can-glob? (cdr item)))
+                                                    (let* ((s (car item))
+                                                           (can-glob? (cdr item))
+                                                           (gpat (if can-glob? (glob-text-for s) s)))
                                                       (if (and can-glob?
-                                                               (glob-pattern? s (env-shopt? env "extglob"))
+                                                               (glob-pattern? gpat (env-shopt? env "extglob"))
                                                                (not (env-option? env "noglob")))
-                                                        (glob-expand s
-                                                          dotglob?: (env-shopt? env "dotglob")
-                                                          nullglob?: (env-shopt? env "nullglob")
-                                                          failglob?: (env-shopt? env "failglob")
-                                                          nocase?: (env-shopt? env "nocaseglob")
-                                                          extglob?: (env-shopt? env "extglob")
-                                                          globskipdots?: (env-shopt? env "globskipdots"))
+                                                        (let ((matches (glob-expand gpat
+                                                                         dotglob?: (env-shopt? env "dotglob")
+                                                                         nullglob?: (env-shopt? env "nullglob")
+                                                                         failglob?: (env-shopt? env "failglob")
+                                                                         nocase?: (env-shopt? env "nocaseglob")
+                                                                         extglob?: (env-shopt? env "extglob")
+                                                                         globskipdots?: (env-shopt? env "globskipdots"))))
+                                                          ;; If no matches and glob text differs from display text,
+                                                          ;; return display text (not the escaped version)
+                                                          (if (and (= (length matches) 1)
+                                                                   (string=? (car matches) gpat)
+                                                                   (not (string=? gpat s)))
+                                                            [s]  ;; no match — use display text
+                                                            matches))
                                                         [s])))
                                                   split)))))
                                     ;; Apply GLOBIGNORE filtering
@@ -183,6 +231,19 @@
 (def (seg-splittable? type) (eq? type 'expanded))
 ;; Check if a segment type allows glob expansion
 (def (seg-globbable? type) (not (eq? type 'quoted)))
+;; Escape glob metacharacters in a string so the glob engine treats them as literal.
+;; Used for quoted segments mixed into a word that also has globbable parts.
+(def (glob-escape-quoted text)
+  (let ((len (string-length text))
+        (buf (open-output-string)))
+    (let loop ((i 0))
+      (if (>= i len)
+        (get-output-string buf)
+        (let ((ch (string-ref text i)))
+          (when (memq ch '(#\* #\? #\[ #\] #\-))
+            (display #\\ buf))
+          (display ch buf)
+          (loop (+ i 1)))))))
 (def (expand-string-segments word env)
   (let ((len (string-length word)))
     (let loop ((i 0) (segments []))
@@ -878,6 +939,15 @@
                ;; ${!name} — indirect expansion, possibly with modifiers
                (let-values (((iname modifier arg) (parse-parameter-modifier rest)))
                  (let* ((ref-name (env-get env iname))
+                        ;; Bash error: indirect expansion of unset variable
+                        (_ (when (not ref-name)
+                             (fprintf (current-error-port) "gsh: ~a: invalid indirect expansion~n" iname)
+                             (raise (make-nounset-exception 1))))
+                        ;; Validate ref-name is a valid variable name (or array ref)
+                        ;; Bad names like "bad var name" or "/" must raise error
+                        (_ (when (and ref-name
+                                      (not (valid-indirect-ref? ref-name)))
+                             (error (format "bad substitution: ${!~a}" iname))))
                         ;; If ref-name contains [, it's an array subscript like a[0] or a[@]
                         (bracket-pos (and ref-name (find-array-subscript-start ref-name)))
                         (val (cond
@@ -1018,18 +1088,37 @@
                      (apply-parameter-modifier
                        (if (and (memq modifier '(:- :+ := :?)) (null? vals)) #f val)
                        name modifier arg env))
-                   ;; Transform modifier: apply per-element
+                   ;; Transform modifier: apply per-element, return as separate words
                    (let ((modified-vals
                           (map (lambda (v)
                                  (apply-parameter-modifier v name modifier arg env))
                                vals)))
-                     (string-join-with " " modified-vals)))
-                 ;; For *, join first then apply
-                 (let* ((ifs (or (env-get env "IFS") " \t\n"))
-                        (sep (if (> (string-length ifs) 0) (string (string-ref ifs 0)) ""))
-                        (joined (string-join-with sep vals)))
-                   (apply-parameter-modifier (if (null? vals) #f joined)
-                                            name modifier arg env))))))
+                     (if (null? modified-vals)
+                       ""
+                       (make-modifier-segments
+                        (let eloop ((rest modified-vals) (segs []) (first? #t))
+                          (if (null? rest)
+                            (reverse segs)
+                            (let ((new-segs (if first?
+                                             (cons (cons (car rest) 'expanded) segs)
+                                             (cons (cons (car rest) 'expanded)
+                                                   (cons (cons "" 'word-break) segs)))))
+                              (eloop (cdr rest) new-segs #f))))))))
+                 ;; For *, transform per-element for at-op, otherwise join first then apply
+                 (if (eq? modifier 'at-op)
+                   ;; at-op (@Q, @a, @P etc): transform each element, then join
+                   (let* ((modified-vals
+                           (map (lambda (v)
+                                  (apply-parameter-modifier v name modifier arg env))
+                                vals))
+                          (ifs (or (env-get env "IFS") " \t\n"))
+                          (sep (if (> (string-length ifs) 0) (string (string-ref ifs 0)) "")))
+                     (string-join-with sep modified-vals))
+                   (let* ((ifs (or (env-get env "IFS") " \t\n"))
+                          (sep (if (> (string-length ifs) 0) (string (string-ref ifs 0)) ""))
+                          (joined (string-join-with sep vals)))
+                     (apply-parameter-modifier (if (null? vals) #f joined)
+                                              name modifier arg env)))))))
           ;; ${name[idx]} — single element access
           (else
            (let ((expanded-idx
@@ -1130,7 +1219,8 @@
                           (substring rest 2 rlen)))
                  (else
                   (values ': (substring rest 1 rlen)))))
-             (values #f "")))
+             ;; ${name:} — colon with nothing after is bad substitution
+             (error "bad substitution")))
           ((memq mod-ch '(#\- #\+ #\= #\?))
            (values (string->symbol (string mod-ch))
                    (substring rest 1 rlen)))
@@ -1208,7 +1298,8 @@
                      ;; ${name:offset} or ${name:offset:length}
                      (values (substring content 0 i) ':
                              (substring content (+ i 1) len)))))
-                (values content #f "")))
+                ;; ${name:} — colon at end with nothing after is bad substitution
+                (error (format "bad substitution: ${~a}" content))))
              ((#\%)
               (if (and (< (+ i 1) len) (char=? (string-ref content (+ i 1)) #\%))
                 (values (substring content 0 i) '%%
@@ -1268,6 +1359,13 @@
          (values (substring content 0 i)
                  (string->symbol (string (string-ref content i)))
                  (substring content (+ i 1) len)))
+        ;; If character is not a valid name char and not a known operator,
+        ;; this is a bad substitution (e.g. ${a&})
+        ((not (let ((ch (string-ref content i)))
+                (or (char-alphabetic? ch) (char-numeric? ch)
+                    (char=? ch #\_) (char=? ch #\[) (char=? ch #\])
+                    (char=? ch #\!) (char=? ch #\*))))
+         (error (format "~a: bad substitution" (string-append "${" content "}"))))
         (else (loop (+ i 1))))))))
 
 ;; Pattern substitution helpers for ${var/pattern/repl} and ${var//pattern/repl}
@@ -1353,47 +1451,50 @@
       (else (loop (cdr l) (+ i 1) (cons (car l) result))))))
 
 ;; Shell-quote a value for ${var@Q} — bash-compatible quoting
-;; Uses single-quote style for normal strings, $'...' for strings with control chars
+;; Bash ALWAYS quotes: empty → '', control chars → $'...' notation,
+;; otherwise single-quote style: 'text' with ' escaped as '\''.
 (def (shell-quote-for-at-q s)
   (if (string=? s "")
     "''"
-    (if (string-has-control-chars? s)
-      ;; Use $'...' notation for strings with control chars
-      (let ((buf (open-output-string)))
-        (display "$'" buf)
-        (let loop ((i 0))
-          (when (< i (string-length s))
-            (let* ((ch (string-ref s i))
-                   (code (char->integer ch)))
-              (cond
-                ((char=? ch #\newline) (display "\\n" buf))
-                ((char=? ch #\tab) (display "\\t" buf))
-                ((char=? ch #\return) (display "\\r" buf))
-                ((char=? ch #\\) (display "\\\\" buf))
-                ((char=? ch #\') (display "\\'" buf))
-                ((or (< code #x20) (= code #x7f))
-                 ;; Use octal \NNN (matching bash $'...' output)
-                 (let ((oct (number->string code 8)))
-                   (display (string-append "\\" (make-string (- 3 (string-length oct)) #\0) oct) buf)))
-                (else (display ch buf))))
-            (loop (+ i 1))))
-        (display "'" buf)
-        (get-output-string buf))
-      ;; Use single-quote style: 'text' with ' escaped as '\''
-      (let ((buf (open-output-string)))
-        (display "'" buf)
-        (let loop ((i 0))
-          (when (< i (string-length s))
-            (let ((ch (string-ref s i)))
-              (if (char=? ch #\')
-                (display "'\\''" buf)
-                (display ch buf)))
-            (loop (+ i 1))))
-        (display "'" buf)
-        (get-output-string buf)))))
+    (let ((len (string-length s)))
+      (if (string-has-control-chars? s)
+        ;; Use $'...' notation for strings with control chars
+        (let ((buf (open-output-string)))
+          (display "$'" buf)
+          (let loop ((i 0))
+            (when (< i len)
+              (let* ((ch (string-ref s i))
+                     (code (char->integer ch)))
+                (cond
+                  ((char=? ch #\newline) (display "\\n" buf))
+                  ((char=? ch #\tab) (display "\\t" buf))
+                  ((char=? ch #\return) (display "\\r" buf))
+                  ((char=? ch #\\) (display "\\\\" buf))
+                  ((char=? ch #\') (display "\\'" buf))
+                  ((or (< code #x20) (= code #x7f))
+                   ;; Use octal \NNN (matching bash $'...' output)
+                   (let ((oct (number->string code 8)))
+                     (display (string-append "\\" (make-string (- 3 (string-length oct)) #\0) oct) buf)))
+                  (else (display ch buf))))
+              (loop (+ i 1))))
+          (display "'" buf)
+          (get-output-string buf))
+        ;; Use single-quote style: 'text' with ' escaped as '\''
+        (let ((buf (open-output-string)))
+          (display "'" buf)
+          (let loop ((i 0))
+            (when (< i len)
+              (let ((ch (string-ref s i)))
+                (if (char=? ch #\')
+                  (display "'\\''" buf)
+                  (display ch buf)))
+              (loop (+ i 1))))
+          (display "'" buf)
+          (get-output-string buf))))))
+
 
 ;; Get variable attribute flags for ${var@a}
-;; Bash returns attributes in alphabetical order: A a i l n r u x
+;; Alphabetical order matching bash: A a i l n r u x
 (def (get-var-attributes name env)
   (let ((var (hash-get (shell-environment-vars env) name)))
     (if (not var) ""
@@ -1453,35 +1554,114 @@
                       (arith-env-setter env)
                       (env-option? env "nounset"))))))
 
-(def (apply-parameter-modifier val name modifier arg env)
+;; Validate an indirect expansion target is a valid variable name, special
+;; parameter, or array reference like "name[idx]".
+;; Returns #t if valid, #f if invalid (e.g. "bad var name", "/").
+(def (valid-indirect-ref? s)
+  (let ((len (string-length s)))
+    (and (> len 0)
+         (let ((ch0 (string-ref s 0)))
+           (cond
+             ;; Special single-char parameters: ?, #, @, *, $, !, -, _
+             ((and (= len 1)
+                   (or (char=? ch0 #\?) (char=? ch0 #\#) (char=? ch0 #\@)
+                       (char=? ch0 #\*) (char=? ch0 #\$) (char=? ch0 #\!)
+                       (char=? ch0 #\-) (char=? ch0 #\_)))
+              #t)
+             ;; Positional parameters: 0-9, or multi-digit
+             ((char-numeric? ch0)
+              (let loop ((i 1))
+                (or (>= i len)
+                    (and (char-numeric? (string-ref s i))
+                         (loop (+ i 1))))))
+             ;; Regular variable name: starts with letter or underscore
+             ;; Optionally followed by [subscript]
+             ((or (char-alphabetic? ch0) (char=? ch0 #\_))
+              (let loop ((i 1))
+                (if (>= i len) #t
+                  (let ((ch (string-ref s i)))
+                    (cond
+                      ((or (char-alphabetic? ch) (char-numeric? ch) (char=? ch #\_))
+                       (loop (+ i 1)))
+                      ;; [ starts array subscript — rest is valid
+                      ((char=? ch #\[) #t)
+                      (else #f))))))
+             (else #f))))))
+
+;; Unescape \} → } in parameter expansion word.
+;; The lexer stores \} inside ${...} to prevent premature brace close,
+;; but by the time we expand the word, it should be a literal }.
+(def (unescape-brace arg)
+  ;; arg can be a string, cons pair (for // and / ops), or other types
+  (if (not (string? arg))
+    arg  ;; non-string args (cons pairs, etc.) pass through
+    (let ((len (string-length arg)))
+      (if (not (string-index arg #\\))
+        arg  ;; fast path: no backslashes
+        (let ((buf (open-output-string)))
+          (let loop ((i 0))
+            (if (>= i len)
+              (get-output-string buf)
+              (let ((ch (string-ref arg i)))
+                (cond
+                  ((and (char=? ch #\\) (< (+ i 1) len)
+                        (char=? (string-ref arg (+ i 1)) #\}))
+                   (display #\} buf)
+                   (loop (+ i 2)))
+                  (else
+                   (display ch buf)
+                   (loop (+ i 1))))))))))))
+
+;; Pre-expand tildes in default/assign values (like assignment context: ~ at start and after :)
+(def (tilde-expand-default arg env)
+  (let ((segments (split-assignment-on-colon arg)))
+    (string-join
+     (map (lambda (seg)
+            (if (and (> (string-length seg) 0)
+                     (char=? (string-ref seg 0) #\~))
+              (let-values (((expanded end) (expand-tilde-in seg 0 env)))
+                (string-append expanded (substring seg end (string-length seg))))
+              seg))
+          segments)
+     ":")))
+
+(def (apply-parameter-modifier val name modifier arg0 env)
+  ;; Inside ${...}, the lexer preserved \} to prevent premature brace close.
+  ;; Now that we have the complete arg, unescape \} → } since } is not a
+  ;; real backslash-escape target in double-quote context.
+  (let ((arg (unescape-brace arg0)))
   (case modifier
     ;; ${name:-word} — default if unset or null
     ((:-) (if (or (not val) (string=? val ""))
-            (if (*in-dquote-context*)
-              (expand-string arg env)
-              (make-modifier-segments (segments-literals-splittable (expand-string-segments arg env))))
+            (let ((earg (if (*in-dquote-context*) arg (tilde-expand-default arg env))))
+              (if (*in-dquote-context*)
+                (expand-string earg env)
+                (make-modifier-segments (segments-literals-splittable (expand-string-segments earg env)))))
             val))
     ;; ${name-word} — default if unset
     ((-) (if (not val)
-           (if (*in-dquote-context*)
-             (expand-string arg env)
-             (make-modifier-segments (segments-literals-splittable (expand-string-segments arg env))))
+           (let ((earg (if (*in-dquote-context*) arg (tilde-expand-default arg env))))
+             (if (*in-dquote-context*)
+               (expand-string earg env)
+               (make-modifier-segments (segments-literals-splittable (expand-string-segments earg env)))))
            val))
     ;; ${name:=word} — assign default if unset or null
     ((:=) (if (or (not val) (string=? val ""))
-            (let ((default (expand-string arg env)))
+            (let* ((earg (if (*in-dquote-context*) arg (tilde-expand-default arg env)))
+                   (default (expand-string earg env)))
               (env-set! env name default)
               (if (*in-dquote-context*)
                 default
-                (make-modifier-segments (segments-literals-splittable (expand-string-segments arg env)))))
+                (make-modifier-segments (segments-literals-splittable (expand-string-segments earg env)))))
             val))
     ;; ${name=word} — assign default if unset
     ((=) (if (not val)
-           (let ((default (expand-string arg env)))
+           (let* ((earg (if (*in-dquote-context*) arg (tilde-expand-default arg env)))
+                  (default (expand-string earg env)))
              (env-set! env name default)
              (if (*in-dquote-context*)
                default
-               (make-modifier-segments (segments-literals-splittable (expand-string-segments arg env)))))
+               (make-modifier-segments (segments-literals-splittable (expand-string-segments earg env)))))
            val))
     ;; ${name:?word} — error if unset or null
     ((:?) (if (or (not val) (string=? val ""))
@@ -1493,15 +1673,17 @@
            val))
     ;; ${name:+word} — alternate if set and non-null
     ((:+) (if (and val (not (string=? val "")))
-            (if (*in-dquote-context*)
-              (expand-string arg env)
-              (make-modifier-segments (segments-literals-splittable (expand-string-segments arg env))))
+            (let ((earg (if (*in-dquote-context*) arg (tilde-expand-default arg env))))
+              (if (*in-dquote-context*)
+                (expand-string earg env)
+                (make-modifier-segments (segments-literals-splittable (expand-string-segments earg env)))))
             ""))
     ;; ${name+word} — alternate if set
     ((+) (if val
-           (if (*in-dquote-context*)
-             (expand-string arg env)
-             (make-modifier-segments (segments-literals-splittable (expand-string-segments arg env))))
+           (let ((earg (if (*in-dquote-context*) arg (tilde-expand-default arg env))))
+             (if (*in-dquote-context*)
+               (expand-string earg env)
+               (make-modifier-segments (segments-literals-splittable (expand-string-segments earg env)))))
            ""))
     ;; ${name%pattern} — remove shortest suffix
     ((%) (if val (remove-suffix val (expand-pattern arg env) #f (env-shopt? env "extglob")) ""))
@@ -1645,7 +1827,7 @@
          (else (or val "")))))
     ;; No modifier
     ((#f) (or val ""))
-    (else (or val ""))))
+    (else (or val "")))))
 
 ;;; --- Command substitution ---
 
@@ -1728,7 +1910,9 @@
              (current-output-port saved-port)
              ;; Read the output from the pipe read end using raw read()
              ;; (open-input-file "/dev/fd/N" blocks on empty pipes in Gambit)
-             (let ((output (ffi-read-all-from-fd read-fd)))
+             ;; Note: ffi-read-all-from-fd returns Latin-1 decoded string;
+             ;; re-decode as UTF-8 for correct multi-byte character handling
+             (let ((output (latin1->utf8 (ffi-read-all-from-fd read-fd))))
                (ffi-close-fd read-fd)
                (string-trim-trailing-newlines output))))))
       ;; Fallback: use /bin/sh if executor not initialized
@@ -2024,31 +2208,47 @@
                        (< (+ i 2) len)
                        (char=? (string-ref word (+ i 2)) #\@))
                   #t)
-                 ;; ${name[@]} inside double quotes at top-level brace — MATCH
+                 ;; ${name[@]} or ${!prefix@} or ${\!prefix@} inside double quotes — MATCH
                  ((and in-dq (= depth 0) (= brace-depth 0))
-                  ;; Scan for name[@]} pattern
-                  (let scan ((j (+ i 2)))
-                    (cond
-                      ((>= j len)
-                       ;; No match — still enter the brace
-                       (loop (+ i 2) in-dq depth (+ brace-depth 1)))
-                      ;; Found [@]} — match!
-                      ((and (char=? (string-ref word j) #\[)
-                            (< (+ j 2) len)
-                            (char=? (string-ref word (+ j 1)) #\@)
-                            (char=? (string-ref word (+ j 2)) #\]))
-                       (let ((k (+ j 3)))
-                         (if (and (< k len) (char=? (string-ref word k) #\}))
-                           #t
-                           ;; Not a simple ${name[@]} — enter brace
-                           (loop (+ i 2) in-dq depth (+ brace-depth 1)))))
-                      ;; Valid identifier chars — keep scanning
-                      ((or (char-alphabetic? (string-ref word j))
-                           (char-numeric? (string-ref word j))
-                           (char=? (string-ref word j) #\_))
-                       (scan (+ j 1)))
-                      ;; Not a simple name — enter brace
-                      (else (loop (+ i 2) in-dq depth (+ brace-depth 1))))))
+                  (let* ((start (+ i 2))
+                         ;; Check for ! or \! (lexer escapes ! as \!)
+                         (has-bang? (or (and (< start len) (char=? (string-ref word start) #\!))
+                                       (and (< (+ start 1) len)
+                                            (char=? (string-ref word start) #\\)
+                                            (char=? (string-ref word (+ start 1)) #\!))))
+                         (name-start (cond
+                                       ((not has-bang?) start)
+                                       ((char=? (string-ref word start) #\!) (+ start 1))
+                                       (else (+ start 2)))))  ;; skip \!
+                    ;; Scan for name[@]} or prefix@} pattern
+                    (let scan ((j name-start))
+                      (cond
+                        ((>= j len)
+                         ;; No match — still enter the brace
+                         (loop (+ i 2) in-dq depth (+ brace-depth 1)))
+                        ;; Found [@] — match for array! (also match [@]body} for modifiers)
+                        ((and (not has-bang?) (char=? (string-ref word j) #\[)
+                              (< (+ j 2) len)
+                              (char=? (string-ref word (+ j 1)) #\@)
+                              (char=? (string-ref word (+ j 2)) #\]))
+                         ;; Check for } or modifier body after ]
+                         (let find-close ((k (+ j 3)) (bd 1))
+                           (cond
+                             ((>= k len) (loop (+ i 2) in-dq depth (+ brace-depth 1)))
+                             ((char=? (string-ref word k) #\}) #t)
+                             (else (find-close (+ k 1) bd)))))
+                        ;; Found @} — match for ${!prefix@}!
+                        ((and has-bang? (char=? (string-ref word j) #\@)
+                              (< (+ j 1) len)
+                              (char=? (string-ref word (+ j 1)) #\}))
+                         #t)
+                        ;; Valid identifier chars — keep scanning
+                        ((or (char-alphabetic? (string-ref word j))
+                             (char-numeric? (string-ref word j))
+                             (char=? (string-ref word j) #\_))
+                         (scan (+ j 1)))
+                        ;; Not a simple name — enter brace
+                        (else (loop (+ i 2) in-dq depth (+ brace-depth 1)))))))
                  ;; Not in matching context — just enter the brace
                  (else (loop (+ i 2) in-dq depth (+ brace-depth 1)))))
               ;; } at brace-depth > 0 — decrease brace depth
@@ -2128,26 +2328,59 @@
                                #f at-body))
                      (find-close (+ j 1) (- bd 1))))
                   (else (find-close (+ j 1) bd))))))
-           ;; ${name[@]} inside double quotes at top-level brace
+           ;; ${name[@]} or ${!prefix@} or ${\!prefix@} inside double quotes
            ((and in-dq (= depth 0) (= brace-depth 0))
-            (let scan ((j (+ i 2)))
-              (cond
-                ((>= j len) (loop (+ i 2) in-dq depth (+ brace-depth 1)))
-                ((and (char=? (string-ref word j) #\[)
-                      (< (+ j 3) len)
-                      (char=? (string-ref word (+ j 1)) #\@)
-                      (char=? (string-ref word (+ j 2)) #\])
-                      (char=? (string-ref word (+ j 3)) #\}))
-                 (let ((arr-name (substring word (+ i 2) j))
-                       (end-pos (+ j 4)))
-                   (values (string-append (substring word 0 i) "\"")
-                           (string-append "\"" (substring word end-pos len))
-                           arr-name #f)))
-                ((or (char-alphabetic? (string-ref word j))
-                     (char-numeric? (string-ref word j))
-                     (char=? (string-ref word j) #\_))
-                 (scan (+ j 1)))
-                (else (loop (+ i 2) in-dq depth (+ brace-depth 1))))))
+            (let* ((start (+ i 2))
+                   ;; Check for ! or \! (lexer escapes ! as \!)
+                   (has-bang? (or (and (< start len) (char=? (string-ref word start) #\!))
+                                 (and (< (+ start 1) len)
+                                      (char=? (string-ref word start) #\\)
+                                      (char=? (string-ref word (+ start 1)) #\!))))
+                   (name-start (cond
+                                 ((not has-bang?) start)
+                                 ((char=? (string-ref word start) #\!) (+ start 1))
+                                 (else (+ start 2)))))  ;; skip \!
+              (let scan ((j name-start))
+                (cond
+                  ((>= j len) (loop (+ i 2) in-dq depth (+ brace-depth 1)))
+                  ;; Found [@] for array
+                  ((and (not has-bang?) (char=? (string-ref word j) #\[)
+                        (< (+ j 2) len)
+                        (char=? (string-ref word (+ j 1)) #\@)
+                        (char=? (string-ref word (+ j 2)) #\]))
+                   (let ((arr-name (substring word name-start j))
+                         (after-bracket (+ j 3)))
+                     (if (and (< after-bracket len)
+                              (char=? (string-ref word after-bracket) #\}))
+                       ;; Simple ${name[@]}
+                       (values (string-append (substring word 0 i) "\"")
+                               (string-append "\"" (substring word (+ after-bracket 1) len))
+                               arr-name #f)
+                       ;; ${name[@]body} — find closing } for modifier
+                       (let find-close ((k after-bracket) (bd 1))
+                         (cond
+                           ((>= k len) (loop (+ i 2) in-dq depth (+ brace-depth 1)))
+                           ((char=? (string-ref word k) #\})
+                            (let ((at-body (substring word after-bracket k))
+                                  (end-pos (+ k 1)))
+                              (values (string-append (substring word 0 i) "\"")
+                                      (string-append "\"" (substring word end-pos len))
+                                      arr-name at-body)))
+                           (else (find-close (+ k 1) bd)))))))
+                  ;; Found @} for ${!prefix@}
+                  ((and has-bang? (char=? (string-ref word j) #\@)
+                        (< (+ j 1) len)
+                        (char=? (string-ref word (+ j 1)) #\}))
+                   (let ((prefix-name (string-append "!" (substring word name-start j)))
+                         (end-pos (+ j 2)))
+                     (values (string-append (substring word 0 i) "\"")
+                             (string-append "\"" (substring word end-pos len))
+                             prefix-name #f)))
+                  ((or (char-alphabetic? (string-ref word j))
+                       (char-numeric? (string-ref word j))
+                       (char=? (string-ref word j) #\_))
+                   (scan (+ j 1)))
+                  (else (loop (+ i 2) in-dq depth (+ brace-depth 1)))))))
            ;; Not in matching context — enter brace
            (else (loop (+ i 2) in-dq depth (+ brace-depth 1)))))
         ;; } at brace-depth > 0
@@ -2172,15 +2405,23 @@
 
 (def (expand-word-with-at word env)
   (let-values (((prefix-raw suffix-raw array-name at-body) (split-word-at-quoted-at word)))
-    (let* ((all-elements (if array-name
-                           (env-array-values env array-name)
-                           (env-positional-list env)))
+    (let* ((all-elements (cond
+                           ;; ${!prefix@} — matching variable names
+                           ((and array-name (> (string-length array-name) 0)
+                                 (char=? (string-ref array-name 0) #\!))
+                            (env-matching-names env (substring array-name 1 (string-length array-name))))
+                           ;; ${name[@]} — array values
+                           (array-name (env-array-values env array-name))
+                           ;; $@ — positional params
+                           (else (env-positional-list env))))
            ;; Apply at-body modifier/slice if present
            (elements
             (cond
               ((not at-body) all-elements)
-              ;; Slice: starts with : (e.g. ":1:3", ":2")
-              ((char=? (string-ref at-body 0) #\:)
+              ;; Slice: starts with : but NOT :- :+ := :? (those are modifiers)
+              ((and (char=? (string-ref at-body 0) #\:)
+                    (or (<= (string-length at-body) 1)
+                        (not (memv (string-ref at-body 1) '(#\- #\+ #\= #\?)))))
                (let* ((spec (substring at-body 1 (string-length at-body)))
                       (colon-pos (string-find-char-from spec #\: 0))
                       (offset-str (if colon-pos
@@ -2209,11 +2450,37 @@
                    (take-sublist full-list start slen))))
               ;; Other modifier: //pat/rep, %pat, %%pat, #pat, ##pat, ^, ^^, ,, etc.
               (else
-               (let-values (((name modifier arg) (parse-parameter-modifier
-                                                   (string-append "@" at-body))))
+               (let-values (((mname modifier arg) (parse-parameter-modifier
+                                                    (string-append "@" at-body))))
                  (if modifier
-                   (map (lambda (p) (apply-parameter-modifier p "@" modifier arg env))
-                        all-elements)
+                   ;; Conditional modifiers on arrays: handle empty array case
+                   (if (memq modifier '(- :- + :+ = := ? :?))
+                     ;; For [@] inside "...", return array elements or modifier result
+                     (let ((is-empty (null? all-elements)))
+                       (case modifier
+                         ;; ${arr[@]-word}: use default only if array is unset/empty
+                         ;; ${arr[@]:-word}: same for arrays (empty array = unset)
+                         ((- :-)
+                          (if is-empty
+                            (list (parameterize ((*in-dquote-context* #t))
+                                    (expand-string arg env)))
+                            all-elements))
+                         ;; ${arr[@]+word}: use alternate if array has elements
+                         ;; ${arr[@]:+word}: same for arrays
+                         ((+ :+)
+                          (if is-empty '()
+                            (list (parameterize ((*in-dquote-context* #t))
+                                    (expand-string arg env)))))
+                         ;; Other conditionals: delegate
+                         (else
+                          (let* ((val (if is-empty #f (string-join-with " " all-elements)))
+                                 (result (parameterize ((*in-dquote-context* #t))
+                                           (apply-parameter-modifier val (or array-name "@") modifier arg env))))
+                            (if result (list result) '())))))
+                     ;; Transform modifiers: apply per-element
+                     (let ((attr-name (or array-name "@")))
+                       (map (lambda (p) (apply-parameter-modifier p attr-name modifier arg env))
+                            all-elements)))
                    all-elements)))))
            (expanded-prefix (expand-string prefix-raw env))
            (expanded-suffix (expand-string suffix-raw env)))

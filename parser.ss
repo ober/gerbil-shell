@@ -69,14 +69,23 @@
             ;; Ampersand — background (always wrap in command-list to preserve mode)
             ((parser-check? ps 'AMP)
              (parser-consume! ps)
+             ;; Consume any pending heredoc bodies before returning
+             (when (pair? (parser-state-heredoc-queue ps))
+               (consume-heredoc-bodies! ps))
              (let ((updated (cons (cons 'background (cdar items)) (cdr items))))
                (make-command-list (reverse updated))))
             ;; Newline — stop, let caller execute before parsing next line
             ((parser-check? ps 'NEWLINE)
              (parser-consume! ps)
+             ;; Consume any pending heredoc bodies before returning
+             (when (pair? (parser-state-heredoc-queue ps))
+               (consume-heredoc-bodies! ps))
              (if (= (length items) 1) (cdar items)
                  (make-command-list (reverse items))))
             (else
+             ;; Consume any pending heredoc bodies before returning
+             (when (pair? (parser-state-heredoc-queue ps))
+               (consume-heredoc-bodies! ps))
              (when (lexer-needs-more? lex)
                (set! (parser-state-needs-more? ps) #t))
              (if (= (length items) 1) (cdar items)
@@ -224,14 +233,24 @@
              first
              (make-and-or-list first (reverse rest)))))))))
 
-;; pipeline : ['!'] command ('|' newline* command)*
+;; pipeline : ['time' ['-p']] ['!'] command ('|' newline* command)*
 (def (parse-pipeline ps)
-  (let* ((bang? (and (or (parser-check-word? ps "!")
+  ;; Check for 'time' keyword before the pipeline
+  (let* ((time? (and (parser-check-word? ps "time")
+                     (begin (parser-consume! ps) #t)))
+         (posix-time? (and time?
+                           (parser-check-word? ps "-p")
+                           (begin (parser-consume! ps) #t)))
+         (bang? (and (or (parser-check-word? ps "!")
                          (parser-check? ps 'BANG))
                      (begin (parser-consume! ps) #t)))
          (first (parse-command ps)))
     (if (not first)
-      (if bang? (error "parse error: expected command after !") #f)
+      (cond
+        (bang? (error "parse error: expected command after !"))
+        ;; Bare 'time' with no command — return time-command with #f pipeline
+        (time? (make-time-command posix-time? #f))
+        (else #f))
       (let loop ((cmds [first]) (ptypes []))
         (cond
           ((or (parser-check? ps 'PIPE) (parser-check? ps 'PIPEAMP))
@@ -242,11 +261,14 @@
                  (loop (cons next cmds) (cons pipe-type ptypes))
                  (error "parse error: expected command after |")))))
           (else
-           (let ((commands (reverse cmds))
-                 (pipe-types (reverse ptypes)))
-             (if (and (= (length commands) 1) (not bang?))
-               (car commands)
-               (make-ast-pipeline commands bang? pipe-types)))))))))
+           (let* ((commands (reverse cmds))
+                  (pipe-types (reverse ptypes))
+                  (pipeline (if (and (= (length commands) 1) (not bang?))
+                              (car commands)
+                              (make-ast-pipeline commands bang? pipe-types))))
+             (if time?
+               (make-time-command posix-time? pipeline)
+               pipeline))))))))
 
 ;; command : compound_command redirect*
 ;;         | function_def
@@ -349,24 +371,31 @@
                  (or (eq? (token-type tok) 'WORD)
                      (eq? (token-type tok) 'IO_NUMBER)))
         ;; Check for function definition: name ( )
+        ;; When prefix assignments exist, reserved words lose their special
+        ;; meaning and become regular command words (bash behavior).
+        ;; e.g. FOO=bar for → tries to run "for" as command (127)
         (when (and (eq? (token-type tok) 'WORD)
-                   (not (reserved-word? (token-value tok))))
+                   (or (pair? assignments)
+                       (not (reserved-word? (token-value tok)))))
           (let ((word-tok (parser-next! ps)))
             (set! words (cons (token-value word-tok) words))
             ;; Check for function def
             (when (parser-check? ps 'LPAREN)
               (parser-consume! ps)  ;; (
-              (when (parser-check? ps 'RPAREN)
-                (parser-consume! ps)  ;; )
-                ;; This is a function definition
-                (skip-newlines! ps)
-                (let ((body (parse-command ps))
-                      (redirs (parse-redirect-list ps)))
-                  (return
-                   (make-function-def
-                    (token-value word-tok)
-                    body
-                    redirs)))))
+              (if (parser-check? ps 'RPAREN)
+                (begin
+                  (parser-consume! ps)  ;; )
+                  ;; This is a function definition
+                  (skip-newlines! ps)
+                  (let ((body (parse-command ps))
+                        (redirs (parse-redirect-list ps)))
+                    (return
+                     (make-function-def
+                      (token-value word-tok)
+                      body
+                      redirs))))
+                ;; Bare ( after command word is a syntax error (bash behavior)
+                (error (string-append "parse error near unexpected token `('"))))
             ;; Parse suffix: more words and redirections
             (let suffix-loop ()
               (let ((tok (parser-peek ps)))
@@ -530,16 +559,21 @@
        (memq (token-type tok)
              '(LESS GREAT DGREAT DLESS DLESSDASH TLESS
                LESSAND GREATAND LESSGREAT CLOBBER
-               AMPGREAT AMPGREAT_GREAT IO_NUMBER))))
+               AMPGREAT AMPGREAT_GREAT IO_NUMBER IO_VARNAME))))
 
 (def (parse-redirect! ps)
-  (let ((fd #f))
-    ;; Optional IO_NUMBER prefix
-    (when (parser-check? ps 'IO_NUMBER)
-      (set! fd (string->number (token-value (parser-next! ps)))))
+  (let ((fd #f)
+        (fd-var #f))
+    ;; Optional IO_NUMBER or IO_VARNAME prefix
+    (cond
+      ((parser-check? ps 'IO_NUMBER)
+       (set! fd (string->number (token-value (parser-next! ps)))))
+      ((parser-check? ps 'IO_VARNAME)
+       (set! fd-var (token-value (parser-next! ps)))))
     (let ((op-tok (parser-next! ps)))
       (let ((op-type (token-type op-tok)))
         ;; Target word is required — syntax error if missing
+        ;; Exception: {fd}>&- doesn't need a target beyond "-"
         (let* ((target-tok (parser-peek ps))
                (_ (when (or (not target-tok) (not (token? target-tok))
                             (memq (token-type target-tok) '(NEWLINE SEMI EOF)))
@@ -562,7 +596,8 @@
                      ((AMPGREAT_GREAT) '&>>)
                      (else '>))
                    fd
-                   target)))
+                   target
+                   fd-var)))
           ;; For heredocs, register spec with lexer for body collection
           (when (memq op-type '(DLESS DLESSDASH))
             (let* ((lex (parser-state-lexer ps))

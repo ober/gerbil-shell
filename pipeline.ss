@@ -18,12 +18,33 @@
         :gsh/functions
         :gsh/util)
 
-;; Parameters for pipeline stdin/stdout fds.
-;; When set (non-#f), execute-external should dup2 these onto fd 0/1
+;; Parameter for pipeline stdout fd.
+;; When set (non-#f), execute-external should dup2 this onto fd 1
 ;; before open-process so external commands in pipeline threads
-;; inherit the pipe endpoints.
-(def *pipeline-stdin-fd* (make-parameter #f))
+;; inherit the pipe endpoint.
+;; Note: *pipeline-stdin-fd* is defined in environment.ss (shared with builtins.ss)
 (def *pipeline-stdout-fd* (make-parameter #f))
+
+;;; --- Helpers ---
+
+;; Build a temp env with prefix assignments exported for pipeline external commands.
+;; Simpler version of executor.ss apply-temp-assignments for use in pipeline context.
+(def (pipeline-temp-env assignments env)
+  (let ((child (env-push-scope env)))
+    (for-each
+     (lambda (asgn)
+       (let* ((raw-name (assignment-name asgn))
+              (name (resolve-nameref raw-name env))
+              (raw-value (assignment-value asgn))
+              (op (assignment-op asgn))
+              (val (expand-assignment-value raw-value child))
+              (final-val (if (eq? op '+=)
+                           (string-append (or (env-get child name) "") val)
+                           val)))
+         (hash-put! (shell-environment-vars child) name
+                    (make-shell-var final-val #t #f #f #f #f #f #f #f #f))))
+     assignments)
+    child))
 
 ;;; --- Public interface ---
 
@@ -40,10 +61,22 @@
 (def (execute-piped-commands commands env execute-fn (pipe-types #f))
   (let ((ptypes (or pipe-types (make-list (- (length commands) 1) 'PIPE))))
   (parameterize ((*procsub-cleanups* []))
+  ;; When running inside a pipeline thread (nested pipeline in brace group or eval),
+  ;; the outer pipe fds are only in character ports, not on real fds 0/1.
+  ;; We need inner pipeline commands to inherit the outer pipe fds.
+  ;; Save the true originals first, then dup2 outer pipe onto 0/1 for the inner pipeline,
+  ;; and restore originals when done (so the outer pipe write-end reference is removed,
+  ;; allowing downstream readers to see EOF).
+  (let* ((outer-in (*pipeline-stdin-fd*))
+         (outer-out (*pipeline-stdout-fd*))
+         (true-stdin (and outer-in (ffi-dup 0)))
+         (true-stdout (and outer-out (ffi-dup 1))))
+    (when outer-in (ffi-dup2 outer-in 0))
+    (when outer-out (ffi-dup2 outer-out 1))
   (let* ((n (length commands))
          ;; Create n-1 pipes: each is [read-fd write-fd]
          (pipes (make-pipes (- n 1)))
-         ;; Save original fds
+         ;; Save fds (now pointing to outer pipe if nested)
          (saved-stdin-fd (ffi-dup 0))
          (saved-stdout-fd (ffi-dup 1))
          (saved-stderr-fd (ffi-dup 2))
@@ -78,9 +111,36 @@
                    (ffi-dup2 (cadr out-pipe) 2))
 
                  ;; Launch the command (it inherits current real fds 0/1)
-                 (let ((proc (launch-pipeline-command
-                              (car cmds) env execute-fn
-                              (not is-first?) (not is-last?))))
+                 ;; For lastpipe: run last command in current shell (not subshell)
+                 (let ((proc (if (and is-last? (not is-first?)
+                                     (env-shopt? env "lastpipe")
+                                     (not (*in-subshell*)))
+                               ;; lastpipe: execute last command directly in current shell
+                               (let* ((pipe-in-fd (ffi-dup 0))
+                                      (in-port (open-input-file
+                                                (string-append "/dev/fd/"
+                                                               (number->string pipe-in-fd))))
+                                      (old-input (current-input-port))
+                                      (status (begin
+                                                (current-input-port in-port)
+                                                (with-catch
+                                                 (lambda (e)
+                                                   (cond
+                                                     ((subshell-exit-exception? e)
+                                                      (subshell-exit-exception-status e))
+                                                     ((errexit-exception? e)
+                                                      (errexit-exception-status e))
+                                                     (else (raise e))))
+                                                 (lambda ()
+                                                   (execute-fn (car cmds) env))))))
+                                 (current-input-port old-input)
+                                 (close-port in-port)
+                                 (ffi-close-fd pipe-in-fd)
+                                 (list 'direct status))
+                               ;; Normal: launch in thread/process
+                               (launch-pipeline-command
+                                (car cmds) env execute-fn
+                                (not is-first?) (not is-last?)))))
 
                    ;; Restore real fd 0, 1, and 2 for the parent
                    (when in-pipe
@@ -111,7 +171,7 @@
          (when (>= (cadr p) 0)
            (with-catch void (lambda () (ffi-close-fd (cadr p))))))
        pipes)
-      ;; Restore original fds and ports
+      ;; Restore fds and ports (to outer pipe fds if nested, or originals)
       (ffi-dup2 saved-stdin-fd 0)
       (ffi-dup2 saved-stdout-fd 1)
       (ffi-dup2 saved-stderr-fd 2)
@@ -125,8 +185,13 @@
       (let ((exit-codes (wait-for-all procs)))
         ;; Clean up any process substitution FIFOs
         (run-procsub-cleanups!)
+        ;; Restore true original fds if we were in a nested pipeline.
+        ;; This removes the extra reference to the outer pipe write-end
+        ;; so downstream readers see EOF.
+        (when true-stdin (ffi-dup2 true-stdin 0) (ffi-close-fd true-stdin))
+        (when true-stdout (ffi-dup2 true-stdout 1) (ffi-close-fd true-stdout))
         ;; Return the full list of exit codes (caller sets PIPESTATUS)
-        exit-codes))))))
+        exit-codes)))))))
 
 (def (make-pipes n)
   (let loop ((i 0) (pipes []))
@@ -142,26 +207,36 @@
 (def (launch-pipeline-command cmd env execute-fn has-pipe-in? has-pipe-out?)
   (cond
     ((simple-command? cmd)
-     (let* ((words (expand-words (simple-command-words cmd) env))
+     ;; Clone env so word expansion side effects (${var=value}) don't leak to parent
+     (let* ((child-env (env-clone env))
+            (words (expand-words (simple-command-words cmd) child-env))
             (cmd-name (if (pair? words) (car words) #f))
             (redirections (simple-command-redirections cmd)))
        (cond
          ;; Check builtins FIRST — before external commands
          ((and cmd-name (builtin-lookup cmd-name))
-          (launch-thread-piped cmd env execute-fn has-pipe-in? has-pipe-out?))
+          (launch-thread-piped cmd child-env execute-fn has-pipe-in? has-pipe-out?))
          ;; External command — inherits real fds 0/1 directly
          ((and cmd-name (which cmd-name))
           (let* ((path (which cmd-name))
+                 ;; Resolve relative paths to absolute for open-process
+                 (exec-path (if (string-contains? path "/")
+                              (path-expand path) path))
                  (args (if (pair? words) (cdr words) []))
+                 ;; Apply temp assignments so they appear in the environment
+                 (assignments (simple-command-assignments cmd))
+                 (cmd-env (if (pair? assignments)
+                            (pipeline-temp-env assignments child-env)
+                            child-env))
                  (redir-saved (if (pair? redirections)
                                 (with-catch
                                  (lambda (e) #f)
-                                 (lambda () (apply-redirections redirections env)))
+                                 (lambda () (apply-redirections redirections cmd-env)))
                                 []))
                  (proc (open-process
-                        [path: (string->c-safe path)
+                        [path: (string->c-safe exec-path)
                          arguments: (map string->c-safe args)
-                         environment: (map string->c-safe (env-exported-alist env))
+                         environment: (map string->c-safe (env-exported-alist cmd-env))
                          stdin-redirection: #f
                          stdout-redirection: #f
                          stderr-redirection: #f])))
@@ -171,7 +246,7 @@
             proc))
          ;; Shell function or unknown — run in thread
          (else
-          (launch-thread-piped cmd env execute-fn has-pipe-in? has-pipe-out?)))))
+          (launch-thread-piped cmd child-env execute-fn has-pipe-in? has-pipe-out?)))))
     (else
      (launch-thread-piped cmd env execute-fn has-pipe-in? has-pipe-out?))))
 
@@ -228,6 +303,9 @@
         (let ((raw-status (process-status proc)))
           (close-port proc)
           (status->exit-code raw-status)))
+       ((and (list? proc) (eq? (car proc) 'direct))
+        ;; lastpipe: already executed directly, return stored status
+        (cadr proc))
        ((and (list? proc) (eq? (car proc) 'thread))
         ;; Catch exceptions from pipeline threads (e.g. subshell-exit-exception
         ;; from 'exit N' in a brace group) and use the exit code from the box

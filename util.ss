@@ -100,8 +100,11 @@
 ;; Search PATH for an executable, return full path or #f
 (def (which name)
   (if (string-contains? name "/")
-    ;; Absolute or relative path — just check executability
-    (and (file-exists? name) (executable? name) name)
+    ;; Absolute or relative path — resolve to absolute for the executability
+    ;; check (ffi-access needs absolute path since Gambit's current-directory
+    ;; doesn't match OS cwd), but return original name for display
+    (let ((resolved (path-expand name)))
+      (and (file-exists? resolved) (executable? resolved) name))
     ;; Search PATH
     (let ((path-dirs (string-split-chars (or (getenv "PATH" #f) "/usr/bin:/bin") ":")))
       (let loop ((dirs path-dirs))

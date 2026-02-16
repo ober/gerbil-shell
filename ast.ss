@@ -40,6 +40,7 @@
 (defstruct arith-for-command (init test update body) transparent: #t) ; for ((init; test; update))
 (defstruct cond-command (expr) transparent: #t)             ; [[ expr ]]
 (defstruct coproc-command (name command) transparent: #t)    ; coproc [NAME] cmd
+(defstruct time-command (posix? pipeline) transparent: #t)   ; time [-p] pipeline
 
 ;;; --- Conditional expression nodes (for [[ ]]) ---
 (defstruct cond-binary (op left right) transparent: #t)     ; expr && expr, expr || expr
@@ -56,10 +57,11 @@
 (defstruct function-def (name body redirections) transparent: #t)
 
 ;;; --- Redirections ---
-(defstruct redir (op fd target) transparent: #t)
+(defstruct redir (op fd target fd-var) transparent: #t)
 ;; op: '< '> '>> 'clobber '<< '<<- '<<< '<> '>& '<& '&> '&>>
 ;; fd: integer or #f (default)
 ;; target: string (word) or heredoc-body string
+;; fd-var: string or #f — variable name for {varname}> syntax (auto-allocated fd)
 
 ;;; --- Assignment ---
 (defstruct assignment (name index value op) transparent: #t)
