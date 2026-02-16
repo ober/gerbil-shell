@@ -69,10 +69,11 @@
 ;;; --- Terminal I/O ---
 
 (def (term-raw! port)
-  ;; Set terminal to raw mode: char-at-a-time, no echo
+  ;; Set terminal to raw mode: char-at-a-time, no echo, no signal processing
+  ;; Args: port input-allow-special input-echo input-raw output-raw speed
   ;; Must use Gambit's tty-mode-set! exclusively — calling tcsetattr via FFI
   ;; desynchronizes Gambit's cached terminal state and breaks read-char.
-  (tty-mode-set! port #t #f #f #t 0))
+  (tty-mode-set! port #f #f #t #t 0))
 
 (def (term-cooked! port)
   ;; Restore terminal to cooked mode: canonical, echo
