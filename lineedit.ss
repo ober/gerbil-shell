@@ -488,8 +488,8 @@
     ;; Search mode handling
     ((line-state-search-mode state)
      (handle-search-key state key out-port))
-    ;; Character input
-    ((and (char? key) (>= (char->integer key) 32))
+    ;; Character input (exclude DEL/backspace = 127)
+    ((and (char? key) (>= (char->integer key) 32) (not (= (char->integer key) 127)))
      (buf-insert state key)
      (refresh-line state out-port))
     ;; Ctrl keys
@@ -747,8 +747,8 @@
     ((or (eq? key 'escape) (symbol? key))
      (search-accept state)
      (refresh-line state out-port))
-    ;; Printable char: add to search string
-    ((and (char? key) (>= (char->integer key) 32))
+    ;; Printable char: add to search string (exclude DEL = 127)
+    ((and (char? key) (>= (char->integer key) 32) (not (= (char->integer key) 127)))
      (set! (line-state-search-string state)
            (string-append (line-state-search-string state) (string key)))
      (search-update state)
@@ -904,8 +904,8 @@
        (begin
          (buf-delete-char state)
          (refresh-line state out-port))))
-    ;; Regular printable character
-    ((and (char? key) (>= (char->integer key) 32))
+    ;; Regular printable character (exclude DEL = 127)
+    ((and (char? key) (>= (char->integer key) 32) (not (= (char->integer key) 127)))
      (buf-insert state key)
      (refresh-line state out-port))
     (else #!void)))
