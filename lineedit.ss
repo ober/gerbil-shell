@@ -5,7 +5,8 @@
 (import :std/sugar
         :std/format
         :gsh/util
-        :gsh/history)
+        :gsh/history
+        :gsh/ffi)
 
 ;;; --- Constants ---
 
@@ -69,7 +70,8 @@
 
 (def (term-raw! port)
   ;; Set terminal to raw mode: char-at-a-time, no echo
-  ;; (tty-mode-set! port allow-special echo output-raw input-raw speed)
+  ;; Must use Gambit's tty-mode-set! exclusively — calling tcsetattr via FFI
+  ;; desynchronizes Gambit's cached terminal state and breaks read-char.
   (tty-mode-set! port #t #f #f #t 0))
 
 (def (term-cooked! port)
@@ -118,18 +120,7 @@
   (set! *terminal-columns* cols))
 
 (def (detect-terminal-columns)
-  (with-catch
-   (lambda (e) 80)
-   (lambda ()
-     (let ((port (open-input-process [path: "/bin/stty" arguments: ["size"]])))
-       (let ((line (read-line port)))
-         (close-port port)
-         (if (string? line)
-           (let ((parts (string-split-chars line #\space)))
-             (if (>= (length parts) 2)
-               (or (string->number (cadr parts)) 80)
-               80))
-           80))))))
+  (ffi-terminal-columns 0))
 
 ;;; --- Read input bytes ---
 

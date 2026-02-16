@@ -162,6 +162,10 @@
     (history-init! histfile histsize))
   ;; Set up signal handlers
   (setup-default-signal-handlers!)
+  ;; Save terminal state (slot 0) so we can restore after foreground commands
+  ;; that corrupt terminal settings (e.g. top, vim)
+  (when (= (ffi-isatty 0) 1)
+    (ffi-termios-save 0 0))
   ;; Determine edit mode
   (let ((edit-mode (if (env-option? env "vi") 'vi 'emacs)))
     ;; Main REPL loop
@@ -226,6 +230,12 @@
                        (let ((action (trap-get "ERR")))
                          (when (string? action)
                            (execute-input action env)))))))))
+           ;; Restore terminal to sane state after command
+           ;; (programs like top/vim may leave echo off or raw mode on).
+           ;; Must use Gambit's tty-mode-set! to keep port state in sync;
+           ;; raw tcsetattr behind Gambit's back desynchronizes its cache.
+           (when (= (ffi-isatty 0) 1)
+             (tty-mode-set! (current-input-port) #t #t #f #f 0))
            (loop (+ cmd-num 1))))))))
 
 (def (execute-input input env)
@@ -330,6 +340,9 @@
          (when (pair? script-args)
            (env-set-shell-name! env (car script-args))
            (env-set-positional! env (cdr script-args)))
+         ;; Set up signal handlers so signals are queued (not fatal)
+         ;; and EXIT traps can fire on signal-driven exit
+         (setup-noninteractive-signal-handlers!)
          ;; Load non-interactive startup
          (load-startup-files! env login? #f)
          ;; Try parse-complete-command first (handles here-docs correctly).
@@ -347,6 +360,10 @@
                 (status (with-catch
                          (lambda (e)
                            (cond
+                             ((subshell-exit-exception? e)
+                              (subshell-exit-exception-status e))
+                             ((errexit-exception? e)
+                              (errexit-exception-status e))
                              ((nounset-exception? e) (nounset-exception-status e))
                              ((break-exception? e) 0)
                              ((continue-exception? e) 0)
@@ -370,6 +387,8 @@
       ;; Script file
       (script
        (let ((script-args (hash-ref args-hash 'args)))
+         ;; Set up signal handlers so signals are queued (not fatal)
+         (setup-noninteractive-signal-handlers!)
          ;; Load non-interactive startup
          (load-startup-files! env login? #f)
          (let ((status (execute-script script script-args env)))

@@ -17,7 +17,8 @@
         :gsh/util
         :gsh/arithmetic
         :gsh/ffi
-        :gsh/glob)
+        :gsh/glob
+        :gsh/signals)
 
 ;;; --- Public interface ---
 
@@ -273,13 +274,14 @@
 (def (declaration-builtin? name)
   (member name '("export" "declare" "typeset" "local" "readonly")))
 
-;; Check if a raw word (list of AST parts) is a LITERAL declaration builtin
-;; Dynamic command names ($myvar expanding to "typeset") should NOT suppress splitting
-(def (literal-declaration-builtin? raw-word-parts)
-  (and (pair? raw-word-parts) (null? (cdr raw-word-parts))
-       (word-literal? (car raw-word-parts))
-       (member (word-literal-text (car raw-word-parts))
-               '("export" "declare" "typeset" "local" "readonly"))))
+;; Check if a raw word is a LITERAL declaration builtin name.
+;; Raw words from the parser are strings (token values from the lexer).
+;; Dynamic command names ($myvar expanding to "typeset") should NOT suppress splitting —
+;; those are NOT strings at this point, they're words with variable refs.
+(def (literal-declaration-builtin? raw-word)
+  (and (string? raw-word)
+       (member raw-word '("export" "declare" "typeset" "local" "readonly"))
+       #t))
 
 ;; Expand args for declaration builtins.
 ;; Flag args (starting with - or +) and assignment args (containing =)
@@ -376,10 +378,14 @@
          ;; If running inside a pipeline thread, dup2 the pipe fds onto
          ;; fd 0/1 so the child process inherits them. Save/restore around
          ;; open-process to minimize the window of altered fds.
+         ;; Lock the pipeline mutex to prevent other threads' nested pipelines
+         ;; from modifying real fds 0/1 during our fork window.
          (let* ((pipe-in (*pipeline-stdin-fd*))
                 (pipe-out (*pipeline-stdout-fd*))
+                (in-pipeline? (or pipe-in pipe-out))
                 (saved-0 (and pipe-in (ffi-dup 0)))
                 (saved-1 (and pipe-out (ffi-dup 1))))
+           (when in-pipeline? (mutex-lock! *pipeline-fd-mutex*))
            (when pipe-in (ffi-dup2 pipe-in 0))
            (when pipe-out (ffi-dup2 pipe-out 1))
            ;; Flush buffered Scheme output before forking so child
@@ -397,6 +403,7 @@
              ;; Restore fds immediately after fork
              (when saved-1 (ffi-dup2 saved-1 1) (ffi-close-fd saved-1))
              (when saved-0 (ffi-dup2 saved-0 0) (ffi-close-fd saved-0))
+             (when in-pipeline? (mutex-unlock! *pipeline-fd-mutex*))
              (let-values (((exit-code stopped?)
                            (wait-for-foreground-process pid proc)))
                (if stopped?
@@ -413,6 +420,14 @@
                  ;; Normal exit
                  (begin
                    (close-port proc)
+                   ;; If child was killed by a signal (exit >= 128), clear the
+                   ;; corresponding pending signal so the shell doesn't run the
+                   ;; trap for it (bash behavior: trap only fires for signals
+                   ;; received directly by the shell, not relayed from children)
+                   (when (>= exit-code 128)
+                     (let ((sig-name (signal-number->name (- exit-code 128))))
+                       (when sig-name
+                         (clear-pending-signal! sig-name))))
                    exit-code))))))))))
 
 ;;; --- exec builtin ---
@@ -459,23 +474,29 @@
         (begin
           (fprintf (current-error-port) "gsh: exec: ~a: not found~n" cmd-name)
           127)
-        ;; Replace shell with external command
-        ;; Use Gambit's open-process and then exit with its status
-        ;; (A true exec would use ffi-execvp but Gambit doesn't let us)
         (let* ((exec-path (if (string-contains? path "/")
                             (path-expand path) path))
-               (env-alist (if clear-env? [] (env-exported-alist env)))
-               (proc (open-process
-                      [path: (string->c-safe exec-path)
-                       arguments: (map string->c-safe cmd-args)
-                       environment: (map string->c-safe env-alist)
-                       stdin-redirection: #f
-                       stdout-redirection: #f
-                       stderr-redirection: #f]))
-               (status (process-status proc)))
-          (close-port proc)
-          (let ((code (status->exit-code status)))
-            (exit code)))))))
+               (env-alist (if clear-env? [] (env-exported-alist env))))
+          ;; Use ffi-execve to truly replace the process image.
+          ;; This is needed for exec -a (custom argv[0]) and is also
+          ;; more correct than open-process + exit for regular exec.
+          (let* ((actual-argv0 (cond
+                                 ((eq? argv0 'login) (string-append "-" cmd-name))
+                                 ((string? argv0) argv0)
+                                 (else cmd-name)))
+                 (argv-list (cons actual-argv0 cmd-args))
+                 (packed-argv (pack-with-soh (map string->c-safe argv-list)))
+                 (packed-env (pack-with-soh (map string->c-safe env-alist))))
+            ;; Flush ports before execve replaces the process
+            (force-output (current-output-port))
+            (force-output (current-error-port))
+            (let ((err (ffi-execve (string->c-safe exec-path) packed-argv packed-env)))
+              ;; execve only returns on failure
+              (fprintf (current-error-port) "gsh: exec: ~a: ~a~n" cmd-name
+                       (cond ((= err 13) "Permission denied")
+                             ((= err 2) "No such file or directory")
+                             (else (string-append "errno " (number->string err)))))
+              126)))))))
 
 ;;; --- Pipeline execution ---
 
@@ -932,6 +953,14 @@
                (number->string cs))))))
 
 ;;; --- Helpers ---
+
+;; Pack a list of strings with SOH (char 1) delimiter for ffi-execve
+(def *soh* (make-string 1 (integer->char 1)))
+(def (pack-with-soh strs)
+  (if (null? strs) ""
+      (let loop ((rest (cdr strs)) (acc (car strs)))
+        (if (null? rest) acc
+            (loop (cdr rest) (string-append acc *soh* (car rest)))))))
 
 (def (return-status env status)
   (env-set-last-status! env status)

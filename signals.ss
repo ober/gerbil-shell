@@ -103,16 +103,6 @@
                      uname)))
       (hash-get *signal-names* stripped))))
 
-;; Convert signal number to name
-(def (signal-number->name num)
-  (let ((result #f))
-    (hash-for-each
-     (lambda (name sig)
-       (when (= sig num)
-         (set! result name)))
-     *signal-names*)
-    result))
-
 ;; Human-readable signal descriptions (matching strsignal/bash output)
 (def *signal-descriptions*
   (hash
@@ -144,21 +134,22 @@
       ((or (eq? action 'default) (not action) (string=? (if (string? action) action "") "-"))
        (hash-remove! *trap-table* uname)
        (let ((signum (signal-name->number uname)))
-         (when signum
+         (when (and signum (not (hash-get *initially-ignored-signals* signum)))
            (with-catch (lambda (e) #!void) ;; ignore error if no handler installed
              (lambda () (remove-signal-handler! signum))))))
       ;; Ignore signal
       ((or (eq? action 'ignore) (and (string? action) (string=? action "")))
        (hash-put! *trap-table* uname 'ignore)
        (let ((signum (signal-name->number uname)))
-         (when signum
+         (when (and signum (not (hash-get *initially-ignored-signals* signum)))
            (add-signal-handler! signum (lambda () #!void)))))
       ;; Set command handler
       ((string? action)
        (hash-put! *trap-table* uname action)
        ;; For real signals, install a handler that flags for later execution
+       ;; POSIX: signals that were SIG_IGN at startup cannot be trapped
        (let ((signum (signal-name->number uname)))
-         (when signum
+         (when (and signum (not (hash-get *initially-ignored-signals* signum)))
            (add-signal-handler! signum
              (lambda ()
                ;; The actual command execution happens in the main loop
@@ -187,6 +178,23 @@
     (set! *pending-signals* [])
     (reverse pending)))
 
+;; Remove a specific signal from the pending queue.
+;; Used when a foreground child was killed by a signal — the shell should
+;; NOT run the trap for that signal (bash behavior).
+(def (clear-pending-signal! sig-name)
+  (set! *pending-signals*
+    (filter (lambda (s) (not (string=? s sig-name))) *pending-signals*)))
+
+;; Map a signal number to its short name (e.g. 2 -> "INT")
+(def (signal-number->name num)
+  (hash-get *signal-number-to-name* num))
+
+;;; --- Initially-ignored signals (POSIX) ---
+;; Signals that were SIG_IGN when the shell started.
+;; Non-interactive shells must not override these (POSIX requirement).
+;; Populated by setup-noninteractive-signal-handlers!
+(def *initially-ignored-signals* (make-hash-table))
+
 ;;; --- Default signal setup for interactive shell ---
 
 (def (setup-default-signal-handlers!)
@@ -212,6 +220,33 @@
   (add-signal-handler! SIGCHLD
     (lambda ()
       (set! *pending-signals* (cons "CHLD" *pending-signals*)))))
+
+;;; --- Signal setup for non-interactive shell (scripts, -c) ---
+
+(def (setup-noninteractive-signal-handlers!)
+  ;; Record which signals were SIG_IGN at startup (before Gambit).
+  ;; POSIX: non-interactive shells must not override inherited SIG_IGN.
+  (for-each
+   (lambda (signum)
+     (when (= (ffi-signal-was-ignored signum) 1)
+       (hash-put! *initially-ignored-signals* signum #t)
+       ;; Restore SIG_IGN that Gambit's startup overrode
+       (ffi-signal-set-ignore signum)))
+   (list SIGINT SIGQUIT SIGTERM SIGHUP))
+  ;; SIGINT: record for processing between commands
+  ;; Without this, Gambit's default handler terminates the process
+  ;; and EXIT traps never fire.
+  (unless (hash-get *initially-ignored-signals* SIGINT)
+    (add-signal-handler! SIGINT
+      (lambda ()
+        (set! *pending-signals* (cons "INT" *pending-signals*)))))
+  ;; SIGTERM: record for processing
+  (unless (hash-get *initially-ignored-signals* SIGTERM)
+    (add-signal-handler! SIGTERM
+      (lambda ()
+        (set! *pending-signals* (cons "TERM" *pending-signals*)))))
+  ;; SIGPIPE: ignore (always, regardless of initial state)
+  (add-signal-handler! SIGPIPE (lambda () #!void)))
 
 ;;; --- Signal context for command execution ---
 

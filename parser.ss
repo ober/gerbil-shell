@@ -64,8 +64,18 @@
              (let ((next (parse-and-or ps)))
                (if next
                  (loop (cons (cons 'sequential next) items))
-                 (if (= (length items) 1) (cdar items)
-                     (make-command-list (reverse items))))))
+                 ;; No more commands after ; — check for remaining tokens
+                 ;; that indicate a syntax error (e.g. "do", "done" at top level)
+                 (begin
+                   (let ((tok (parser-peek ps)))
+                     (when (and (token? tok)
+                                (not (eq? (token-type tok) 'NEWLINE)))
+                       (error (string-append "syntax error near unexpected token `"
+                                             (if (token-value tok) (token-value tok)
+                                                 (symbol->string (token-type tok)))
+                                             "'"))))
+                   (if (= (length items) 1) (cdar items)
+                       (make-command-list (reverse items)))))))
             ;; Ampersand — background (always wrap in command-list to preserve mode)
             ((parser-check? ps 'AMP)
              (parser-consume! ps)

@@ -142,13 +142,21 @@
           (job-notify!))
          (else #!void))
        (let ((action (trap-get sig-name)))
-         (when (and action (string? action))
-           ;; Save and restore $? so trap doesn't affect main flow
-           (let ((saved-status (shell-environment-last-status env))
-                 (exec-fn (*execute-input*)))
-             (when exec-fn
-               (exec-fn action env))
-             (env-set-last-status! env saved-status)))))
+         (cond
+           ;; Signal has a trap command — execute it
+           ((and action (string? action))
+            ;; Save and restore $? so trap doesn't affect main flow
+            (let ((saved-status (shell-environment-last-status env))
+                  (exec-fn (*execute-input*)))
+              (when exec-fn
+                (exec-fn action env))
+              (env-set-last-status! env saved-status)))
+           ;; Fatal signal with no trap — exit the script
+           ;; (POSIX: default action for INT/TERM is to terminate)
+           ((and (not action)
+                 (member sig-name '("INT" "TERM" "HUP")))
+            (let ((signum (signal-name->number sig-name)))
+              (raise (make-subshell-exit-exception (+ 128 (or signum 2)))))))))
      signals)))
 
 ;;; --- Helpers ---

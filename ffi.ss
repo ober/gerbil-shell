@@ -13,6 +13,11 @@
             ffi-open-raw ffi-mkfifo ffi-unlink ffi-getpid
             ffi-read-all-from-fd ffi-unsetenv ffi-strftime
             ffi-getrlimit-soft ffi-getrlimit-hard ffi-setrlimit
+            ffi-termios-save ffi-termios-restore ffi-set-raw-mode
+            ffi-read-byte ffi-byte-ready?
+            ffi-terminal-columns ffi-terminal-rows
+            ffi-execve
+            ffi-signal-was-ignored ffi-signal-set-ignore
             WNOHANG WUNTRACED WCONTINUED
             WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG WIFSTOPPED WSTOPSIG)
 
@@ -24,6 +29,38 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <time.h>
+#include <signal.h>
+#include <string.h>
+
+/* Record which signals were SIG_IGN at process startup, BEFORE Gambit
+   installs its own handlers.  POSIX: non-interactive shells must not
+   override inherited SIG_IGN dispositions. */
+static unsigned int _initially_ignored_signals = 0;
+
+__attribute__((constructor))
+static void _check_initial_signals(void) {
+    struct sigaction sa;
+    int sigs[] = {SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGPIPE,
+                  SIGTSTP, SIGTTIN, SIGTTOU, 0};
+    for (int i = 0; sigs[i]; i++) {
+        if (sigaction(sigs[i], NULL, &sa) == 0 && sa.sa_handler == SIG_IGN)
+            _initially_ignored_signals |= (1u << sigs[i]);
+    }
+}
+
+static int ffi_signal_was_ignored(int signum) {
+    if (signum > 0 && signum < 32)
+        return (_initially_ignored_signals & (1u << signum)) ? 1 : 0;
+    return 0;
+}
+
+static int ffi_signal_set_ignore(int signum) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_IGN;
+    sigemptyset(&sa.sa_mask);
+    return sigaction(signum, &sa, NULL);
+}
 
 /* We need to store the last waitpid result since we can't easily
    return multiple values from a single C call.
@@ -226,12 +263,13 @@ END-C2
 
   ;; strftime — format a time value
   (c-declare #<<END-STRFTIME
-static char _strftime_buf[4096];
+static char _strftime_buf[128];  /* Match bash's 128-byte truncation */
 static char* ffi_do_strftime(const char* fmt, int epoch) {
     time_t t = (time_t)epoch;
     struct tm *tm = localtime(&t);
     if (!tm) { _strftime_buf[0] = '\0'; return _strftime_buf; }
-    strftime(_strftime_buf, sizeof(_strftime_buf), fmt, tm);
+    if (strftime(_strftime_buf, sizeof(_strftime_buf), fmt, tm) == 0)
+        _strftime_buf[0] = '\0';  /* truncated or empty — return empty string */
     return _strftime_buf;
 }
 END-STRFTIME
@@ -280,5 +318,163 @@ END-RLIMIT
   (define-c-lambda _ffi_setrlimit (int int64 int64 int int) int "ffi_do_setrlimit")
   (define (ffi-setrlimit resource soft hard only-soft only-hard)
     (_ffi_setrlimit resource soft hard (if only-soft 1 0) (if only-hard 1 0)))
+
+  ;; termios save/restore — two independent slots for nesting
+  ;; Slot 0: saved by shell before line-edit (the "sane" cooked state)
+  ;; Slot 1: saved by line-edit before going raw
+  (c-declare #<<END-TERMIOS
+#include <termios.h>
+#define TERMIOS_SLOTS 2
+static struct termios _saved_termios[TERMIOS_SLOTS];
+static int _termios_valid[TERMIOS_SLOTS] = {0, 0};
+
+static int ffi_do_termios_save(int fd, int slot) {
+    if (slot < 0 || slot >= TERMIOS_SLOTS) return -1;
+    if (tcgetattr(fd, &_saved_termios[slot]) == 0) {
+        _termios_valid[slot] = 1;
+        return 0;
+    }
+    return -1;
+}
+
+static int ffi_do_termios_restore(int fd, int slot) {
+    if (slot < 0 || slot >= TERMIOS_SLOTS) return -1;
+    if (_termios_valid[slot]) {
+        return tcsetattr(fd, TCSANOW, &_saved_termios[slot]);
+    }
+    return -1;
+}
+END-TERMIOS
+  )
+  (define-c-lambda ffi-termios-save (int int) int "ffi_do_termios_save")
+  (define-c-lambda ffi-termios-restore (int int) int "ffi_do_termios_restore")
+
+  ;; Set raw mode on fd: disable echo, canonical, signals; VMIN=1 VTIME=0
+  (c-declare #<<END-RAW
+static int ffi_do_set_raw(int fd) {
+    struct termios raw;
+    if (tcgetattr(fd, &raw) != 0) return -1;
+    raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    raw.c_oflag &= ~(OPOST);
+    raw.c_cflag |= CS8;
+    raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    return tcsetattr(fd, TCSAFLUSH, &raw);
+}
+END-RAW
+  )
+  (define-c-lambda ffi-set-raw-mode (int) int "ffi_do_set_raw")
+
+  ;; Read a single byte from fd. Returns byte value (0-255) or -1 on EOF/error.
+  (c-declare #<<END-READBYTE
+#include <poll.h>
+static int ffi_do_read_byte(int fd) {
+    unsigned char c;
+    ssize_t n;
+    do {
+        n = read(fd, &c, 1);
+    } while (n < 0 && errno == EINTR);
+    if (n == 1) return (int)c;
+    return -1;
+}
+static int ffi_do_byte_ready(int fd) {
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    int ret = poll(&pfd, 1, 0);
+    return (ret > 0 && (pfd.revents & POLLIN)) ? 1 : 0;
+}
+END-READBYTE
+  )
+  (define-c-lambda ffi-read-byte (int) int "ffi_do_read_byte")
+  (define-c-lambda ffi-byte-ready? (int) int "ffi_do_byte_ready")
+
+  ;; Terminal window size via ioctl(TIOCGWINSZ)
+  (c-declare #<<END-WINSIZE
+#include <sys/ioctl.h>
+static int _ws_row = 0, _ws_col = 0;
+static int ffi_do_get_winsize(int fd) {
+    struct winsize ws;
+    if (ioctl(fd, TIOCGWINSZ, &ws) == 0) {
+        _ws_row = ws.ws_row;
+        _ws_col = ws.ws_col;
+        return 0;
+    }
+    return -1;
+}
+END-WINSIZE
+  )
+  (define-c-lambda _ffi_get_winsize (int) int "ffi_do_get_winsize")
+  (define-c-lambda _ffi_ws_col () int "___return(_ws_col);")
+  (define-c-lambda _ffi_ws_row () int "___return(_ws_row);")
+  (define (ffi-terminal-columns fd)
+    (if (= (_ffi_get_winsize fd) 0) (_ffi_ws_col) 80))
+  (define (ffi-terminal-rows fd)
+    (if (= (_ffi_get_winsize fd) 0) (_ffi_ws_row) 24))
+
+  ;; execve — replace current process image
+  ;; packed_argv and packed_env are SOH (\x01) delimited strings
+  (c-declare #<<END-EXECVE
+static int ffi_do_execve(const char *path, const char *packed_argv, const char *packed_env) {
+    /* Count delimiters to determine array sizes */
+    int argc = 1, envc = 0;
+    const char *p;
+    for (p = packed_argv; *p; p++) if (*p == '\x01') argc++;
+    if (packed_env[0]) { envc = 1; for (p = packed_env; *p; p++) if (*p == '\x01') envc++; }
+
+    /* Build argv array */
+    char **argv = (char **)malloc((argc + 1) * sizeof(char *));
+    if (!argv) return errno;
+    /* Copy and split packed_argv */
+    char *argv_copy = strdup(packed_argv);
+    if (!argv_copy) { free(argv); return errno; }
+    argv[0] = argv_copy;
+    int ai = 1;
+    for (p = argv_copy; *p; p++) {
+        if (*((char*)p) == '\x01') { *((char*)p) = '\0'; argv[ai++] = (char*)p + 1; }
+    }
+    argv[argc] = NULL;
+
+    /* Build envp array */
+    char **envp = NULL;
+    char *env_copy = NULL;
+    if (envc > 0) {
+        envp = (char **)malloc((envc + 1) * sizeof(char *));
+        env_copy = strdup(packed_env);
+        if (envp && env_copy) {
+            envp[0] = env_copy;
+            int ei = 1;
+            for (p = env_copy; *p; p++) {
+                if (*((char*)p) == '\x01') { *((char*)p) = '\0'; envp[ei++] = (char*)p + 1; }
+            }
+            envp[envc] = NULL;
+        }
+    } else {
+        envp = (char **)malloc(sizeof(char *));
+        if (envp) envp[0] = NULL;
+    }
+
+    execve(path, argv, envp);
+    /* Only reaches here on failure */
+    int err = errno;
+    free(argv_copy); free(argv);
+    if (env_copy) free(env_copy);
+    if (envp) free(envp);
+    return err;
+}
+END-EXECVE
+  )
+  (define-c-lambda _ffi_execve (char-string char-string char-string) int "ffi_do_execve")
+  (define (ffi-execve path packed-argv packed-env) (_ffi_execve path packed-argv packed-env))
+
+  ;; Check if a signal was SIG_IGN when the process started (before Gambit).
+  ;; Returns 1 if ignored, 0 otherwise.
+  (define-c-lambda ffi-signal-was-ignored (int) int "ffi_signal_was_ignored")
+
+  ;; Set a signal's disposition to SIG_IGN (restore inherited ignore).
+  ;; Returns 0 on success, -1 on error.
+  (define-c-lambda ffi-signal-set-ignore (int) int "ffi_signal_set_ignore")
 
 )

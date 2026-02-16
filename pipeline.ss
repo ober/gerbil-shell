@@ -58,6 +58,11 @@
 
 ;;; --- Multi-command pipeline ---
 
+;; Mutex to serialize fd-manipulation sections of pipeline setup.
+;; Nested pipelines (e.g. { cmd | cmd; } | cmd) run execute-piped-commands
+;; in threads that share real fds 0/1, so we must serialize the dup2/launch/restore.
+(def *pipeline-fd-mutex* (make-mutex "pipeline-fd"))
+
 (def (execute-piped-commands commands env execute-fn (pipe-types #f))
   (let ((ptypes (or pipe-types (make-list (- (length commands) 1) 'PIPE))))
   (parameterize ((*procsub-cleanups* []))
@@ -71,6 +76,10 @@
          (outer-out (*pipeline-stdout-fd*))
          (true-stdin (and outer-in (ffi-dup 0)))
          (true-stdout (and outer-out (ffi-dup 1))))
+    ;; Lock mutex to serialize fd manipulation across pipeline threads.
+    ;; Nested pipelines (e.g. { cmd | cmd; } | cmd) run in threads that
+    ;; share real fds 0/1, so we must serialize dup2/launch/restore.
+    (mutex-lock! *pipeline-fd-mutex*)
     (when outer-in (ffi-dup2 outer-in 0))
     (when outer-out (ffi-dup2 outer-out 1))
   (let* ((n (length commands))
@@ -171,25 +180,28 @@
          (when (>= (cadr p) 0)
            (with-catch void (lambda () (ffi-close-fd (cadr p))))))
        pipes)
-      ;; Restore fds and ports (to outer pipe fds if nested, or originals)
+      ;; Restore fds and ports
       (ffi-dup2 saved-stdin-fd 0)
       (ffi-dup2 saved-stdout-fd 1)
       (ffi-dup2 saved-stderr-fd 2)
       (ffi-close-fd saved-stdin-fd)
       (ffi-close-fd saved-stdout-fd)
       (ffi-close-fd saved-stderr-fd)
+      ;; Restore true original fds BEFORE wait-for-all.
+      ;; Without this, fd 1 holds an extra reference to the outer pipe
+      ;; write-end during the wait, preventing downstream readers from
+      ;; seeing EOF (causes hangs in nested pipelines).
+      (when true-stdin (ffi-dup2 true-stdin 0) (ffi-close-fd true-stdin))
+      (when true-stdout (ffi-dup2 true-stdout 1) (ffi-close-fd true-stdout))
       (current-input-port saved-stdin-port)
       (current-output-port saved-stdout-port)
       (current-error-port saved-stderr-port)
+      ;; Unlock mutex — all commands launched, fds fully restored.
+      (mutex-unlock! *pipeline-fd-mutex*)
       ;; Wait for all processes/threads
       (let ((exit-codes (wait-for-all procs)))
         ;; Clean up any process substitution FIFOs
         (run-procsub-cleanups!)
-        ;; Restore true original fds if we were in a nested pipeline.
-        ;; This removes the extra reference to the outer pipe write-end
-        ;; so downstream readers see EOF.
-        (when true-stdin (ffi-dup2 true-stdin 0) (ffi-close-fd true-stdin))
-        (when true-stdout (ffi-dup2 true-stdout 1) (ffi-close-fd true-stdout))
         ;; Return the full list of exit codes (caller sets PIPESTATUS)
         exit-codes)))))))
 
@@ -255,20 +267,23 @@
 ;; Each pipeline component runs as a subshell (exit only exits the component).
 (def (launch-thread-piped cmd env execute-fn has-pipe-in? has-pipe-out?)
   (let* ((exit-box (box 0))
-         ;; Dup the current real fds so the thread has its own copy
+         ;; Dup pipe fds so the thread has its own copy
          ;; (parent will restore 0/1 after this returns)
          (thread-in-fd (if has-pipe-in? (ffi-dup 0) #f))
-         (thread-out-fd (if has-pipe-out? (ffi-dup 1) #f)))
+         (thread-out-fd (if has-pipe-out? (ffi-dup 1) #f))
+         ;; Capture current Gambit ports for non-pipe ends (thread-safe)
+         (saved-in-port (current-input-port))
+         (saved-out-port (current-output-port)))
     (let ((t (spawn
               (lambda ()
                 (let ((in-port (if thread-in-fd
-                                (open-input-file
-                                 (string-append "/dev/fd/" (number->string thread-in-fd)))
-                                (current-input-port)))
+                                 (open-input-file
+                                  (string-append "/dev/fd/" (number->string thread-in-fd)))
+                                 saved-in-port))
                       (out-port (if thread-out-fd
                                  (open-output-file
                                   (string-append "/dev/fd/" (number->string thread-out-fd)))
-                                 (current-output-port))))
+                                 saved-out-port)))
                   (parameterize ((current-input-port in-port)
                                  (current-output-port out-port)
                                  (*in-subshell* #t)
@@ -285,8 +300,8 @@
                                    (lambda ()
                                      (execute-fn cmd env)))))
                       (set-box! exit-box status)
+                      (force-output out-port)
                       (when thread-out-fd
-                        (force-output out-port)
                         (close-port out-port)
                         (ffi-close-fd thread-out-fd))
                       (when thread-in-fd
