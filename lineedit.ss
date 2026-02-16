@@ -494,7 +494,7 @@
      (refresh-line state out-port))
     ;; Ctrl keys
     ((enter-key? key)
-     (display "\n" out-port)
+     (display "\r\n" out-port)
      (force-output out-port)
      (set! (line-state-done? state) #t)
      (set! (line-state-result state) (line-state-buffer state)))
@@ -516,7 +516,7 @@
      (if (= (string-length (line-state-buffer state)) 0)
        ;; EOF on empty line
        (begin
-         (display "\n" out-port)
+         (display "\r\n" out-port)
          (force-output out-port)
          (set! (line-state-done? state) #t)
          (set! (line-state-result state) 'eof))
@@ -575,7 +575,7 @@
      (refresh-line state out-port))
     ((and (char? key) (= (char->integer key) CTRL-C))
      ;; Abort line
-     (display "^C\n" out-port)
+     (display "^C\r\n" out-port)
      (force-output out-port)
      (set! (line-state-buffer state) "")
      (set! (line-state-cursor state) 0)
@@ -730,7 +730,7 @@
     ;; Enter: accept search
     ((enter-key? key)
      (search-accept state)
-     (display "\n" out-port)
+     (display "\r\n" out-port)
      (force-output out-port)
      (set! (line-state-done? state) #t)
      (set! (line-state-result state) (line-state-buffer state)))
@@ -802,7 +802,7 @@
                                  (string-length (line-state-buffer state)))))
                (set! (line-state-cursor state) (+ word-start (string-length prefix))))
              ;; Display completions
-             (display "\n" out-port)
+             (display "\r\n" out-port)
              (display-completions completions out-port (line-state-columns state))
              (refresh-line state out-port))))))))
 
@@ -838,6 +838,7 @@
 
 (def (display-completions completions port columns)
   ;; Display completions in columns
+  ;; Use \r\n because terminal is in raw output mode (no LF→CRLF conversion)
   (let* ((max-len (apply max (map string-length completions)))
          (col-width (+ max-len 2))
          (ncols (max 1 (quotient columns col-width))))
@@ -846,13 +847,13 @@
         (let ((item (car items)))
           (display item port)
           (if (= (+ col 1) ncols)
-            (begin (newline port) (loop (cdr items) 0))
+            (begin (display "\r\n" port) (loop (cdr items) 0))
             (begin
               (display (make-string (- col-width (string-length item)) #\space) port)
               (loop (cdr items) (+ col 1)))))))
     (when (and (pair? completions)
                (not (= 0 (modulo (length completions) ncols))))
-      (newline port))
+      (display "\r\n" port))
     (force-output port)))
 
 ;;; --- Vi mode (basic) ---
@@ -872,7 +873,7 @@
      (refresh-line state out-port))
     ;; Enter
     ((enter-key? key)
-     (display "\n" out-port)
+     (display "\r\n" out-port)
      (force-output out-port)
      (set! (line-state-done? state) #t)
      (set! (line-state-result state) (line-state-buffer state)))
@@ -883,7 +884,7 @@
      (refresh-line state out-port))
     ;; Ctrl-C
     ((and (char? key) (= (char->integer key) CTRL-C))
-     (display "^C\n" out-port)
+     (display "^C\r\n" out-port)
      (force-output out-port)
      (set! (line-state-buffer state) "")
      (set! (line-state-cursor state) 0)
@@ -896,7 +897,7 @@
     ((and (char? key) (= (char->integer key) CTRL-D))
      (if (= (string-length (line-state-buffer state)) 0)
        (begin
-         (display "\n" out-port)
+         (display "\r\n" out-port)
          (force-output out-port)
          (set! (line-state-done? state) #t)
          (set! (line-state-result state) 'eof))
@@ -977,7 +978,7 @@
      (refresh-line state out-port))
     ;; Enter
     ((enter-key? key)
-     (display "\n" out-port)
+     (display "\r\n" out-port)
      (force-output out-port)
      (set! (line-state-done? state) #t)
      (set! (line-state-result state) (line-state-buffer state)))
