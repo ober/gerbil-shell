@@ -366,7 +366,17 @@
                   (display-declare-var name var))))
             sorted))
          0)
-        ;; Export/unexport variables (with or without -p; -p ignored when names given)
+        ;; export -p with names: print named exported vars
+        (print?
+         (for-each
+          (lambda (name)
+            (let ((var (env-get-var env name)))
+              (when (and var (shell-var-exported? var)
+                         (not (eq? (shell-var-value var) +unset-sentinel+)))
+                (display-declare-var name var))))
+          names)
+         0)
+        ;; Export/unexport variables
         (else
          (let ((status 0))
            (for-each
@@ -492,7 +502,17 @@
                   (display-declare-var name var))))
             sorted))
          0)
-        ;; readonly with names (with or without -p; -p is ignored when names given)
+        ;; readonly -p with names: print named readonly vars
+        (print?
+         (for-each
+          (lambda (name)
+            (let ((var (env-get-var env name)))
+              (when (and var (shell-var-readonly? var)
+                         (not (eq? (shell-var-value var) +unset-sentinel+)))
+                (display-declare-var name var))))
+          names)
+         0)
+        ;; readonly with names: set readonly attribute
         (else
          (for-each
           (lambda (arg)
@@ -2042,16 +2062,29 @@
   (lambda (args env)
     ;; Handle local -p: print local vars in declare format
     (if (and (pair? args) (string=? (car args) "-p"))
-      (begin
-        (let ((names (sort! (hash-keys (shell-environment-vars env)) string<?)))
-          (for-each
-           (lambda (name)
-             (let ((var (hash-get (shell-environment-vars env) name)))
-               (when (and var (shell-var-local? var)
-                          (not (eq? (shell-var-value var) +unset-sentinel+)))
-                 (display-declare-var name var))))
-           names))
-        0)
+      (let ((specific-names (cdr args)))
+        (if (pair? specific-names)
+          ;; local -p name ...: print named local vars
+          (begin
+            (for-each
+             (lambda (name)
+               (let ((var (hash-get (shell-environment-vars env) name)))
+                 (when (and var (shell-var-local? var)
+                            (not (eq? (shell-var-value var) +unset-sentinel+)))
+                   (display-declare-var name var))))
+             specific-names)
+            0)
+          ;; local -p (no names): print all local vars
+          (begin
+            (let ((names (sort! (hash-keys (shell-environment-vars env)) string<?)))
+              (for-each
+               (lambda (name)
+                 (let ((var (hash-get (shell-environment-vars env) name)))
+                   (when (and var (shell-var-local? var)
+                              (not (eq? (shell-var-value var) +unset-sentinel+)))
+                     (display-declare-var name var))))
+               names))
+            0)))
     ;; Bare local (no args): list local vars in simple name=value format
     (if (null? args)
       (begin
@@ -2365,24 +2398,15 @@
              (fprintf (current-error-port) "declare: `~a': not a valid identifier~n" arg)
              (set! status 1))
          (if print?
-           ;; -p name: print declaration, filtered by attribute flags
+           ;; -p name: print declaration
            ;; -pg: look in global scope only
+           ;; Bash ignores attribute filter flags (-n/-r/-x) when specific
+           ;; variable names are given with -p — just prints the variable.
            (let* ((lookup-env (if (hash-get flags 'global) (env-root env) env))
                   (var (or (env-get-var lookup-env name)
-                           (env-get-raw-var lookup-env name)))
-                  (filter-export (hash-get flags 'export))
-                  (filter-readonly (hash-get flags 'readonly))
-                  (filter-nameref (hash-get flags 'nameref))
-                  (filter-array (hash-get flags 'array))
-                  (filter-assoc (hash-get flags 'assoc)))
+                           (env-get-raw-var lookup-env name))))
              (if var
-               ;; If attribute flags given, only print vars with matching flags
-               (when (and (or (not filter-export) (shell-var-exported? var))
-                          (or (not filter-readonly) (shell-var-readonly? var))
-                          (or (not filter-nameref) (shell-var-nameref? var))
-                          (or (not filter-array) (shell-var-array? var))
-                          (or (not filter-assoc) (shell-var-assoc? var)))
-                 (display-declare-var name var))
+               (display-declare-var name var)
                (begin
                  (fprintf (current-error-port) "declare: ~a: not found~n" name)
                  (set! status 1))))
@@ -2669,7 +2693,7 @@
          (displayln ")")))
       (else
        (displayln (format "declare ~a ~a=~a" flag-str name
-                         (declare-quote-scalar (shell-var-scalar-value var))))))))
+                         (declare-quote-value (shell-var-scalar-value var))))))))
 
 ;; Continuation for early return from declare
 (def return-from-declare (make-parameter #f))

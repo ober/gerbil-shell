@@ -18,13 +18,6 @@
         :gsh/functions
         :gsh/util)
 
-;; Parameter for pipeline stdout fd.
-;; When set (non-#f), execute-external should dup2 this onto fd 1
-;; before open-process so external commands in pipeline threads
-;; inherit the pipe endpoint.
-;; Note: *pipeline-stdin-fd* is defined in environment.ss (shared with builtins.ss)
-(def *pipeline-stdout-fd* (make-parameter #f))
-
 ;;; --- Helpers ---
 
 ;; Build a temp env with prefix assignments exported for pipeline external commands.
@@ -245,7 +238,7 @@
                                  (lambda (e) #f)
                                  (lambda () (apply-redirections redirections cmd-env)))
                                 []))
-                 (proc (open-process
+                 (proc (open-process-with-sigpipe
                         [path: (string->c-safe exec-path)
                          arguments: (map string->c-safe args)
                          environment: (map string->c-safe (env-exported-alist cmd-env))

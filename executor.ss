@@ -115,14 +115,13 @@
 ;; Each binding is visible to subsequent bindings in the same prefix.
 ;; After the command returns, the bindings are discarded.
 (def (apply-temp-assignments assignments env)
-  ;; Reject array subscript assignments in env prefix position
-  (for-each
-   (lambda (asgn)
-     (let ((name (assignment-name asgn)))
-       (when (string-find-char* name #\[)
-         (error (format "~a: not a valid identifier" name)))))
-   assignments)
-  (let ((child (env-push-scope env)))
+  ;; Filter out array subscript and compound array assignments in env prefix.
+  ;; Bash silently ignores b[0]=2 in prefix position (doesn't export it).
+  (let* ((filtered (filter (lambda (asgn)
+                             (and (not (assignment-index asgn))    ;; no arr[idx]=val
+                                  (not (list? (assignment-value asgn))))) ;; no arr=(...)
+                           assignments))
+         (child (env-push-scope env)))
     (for-each
      (lambda (asgn)
        (let* ((raw-name (assignment-name asgn))
@@ -137,7 +136,7 @@
          ;; (make-shell-var value exported? readonly? local? integer? uppercase? lowercase? nameref? array? assoc?)
          (hash-put! (shell-environment-vars child) name
                     (make-shell-var final-val #t #f #f #f #f #f #f #f #f))))
-     assignments)
+     filtered)
     child))
 
 ;;; --- Simple command execution ---
@@ -207,8 +206,11 @@
                    (fprintf (current-error-port) "~a~a~n"
                             ps4 (string-join-words expanded))))
                ;; Apply command-scoped assignments
-               ;; These must be exported so external commands see them
-               (let* ((temp-env (if (pair? assignments)
+               ;; These must be exported so external commands see them.
+               ;; Exception: declaration builtins (local, declare, etc.)
+               ;; ignore prefix assignments — they operate on the current scope.
+               (let* ((temp-env (if (and (pair? assignments)
+                                         (not (declaration-builtin? cmd-name)))
                                   (apply-temp-assignments assignments env)
                                   env))
                       (status
@@ -294,52 +296,55 @@
    (lambda (w)
      (let ((s (if (string? w) w (expand-word-nosplit w env))))
        (cond
-         ;; Flag argument - no splitting
+         ;; Flag argument starting with - or +
          ((and (string? s) (> (string-length s) 0)
                (or (char=? (string-ref s 0) #\-)
                    (char=? (string-ref s 0) #\+)))
-          [(expand-word-nosplit w env)])
-         ;; Literal assignment argument (contains =) - expand value with assignment
-         ;; tilde rules (tilde at start and after colons)
+          ;; Check for multi-word array expansion (e.g. -"${a[@]}" → -x foo=F bar=B).
+          ;; expand-words handles IFS splitting and globbing, which is correct for
+          ;; the flag case since flags don't have assignment values to protect.
+          (let ((multi (expand-words [w] env)))
+            (if (> (length multi) 1)
+              multi  ;; Array in flag produced multiple words
+              [s]))) ;; Normal flag: reuse nosplit result (no double-expansion)
+         ;; Literal assignment argument (contains =) - expand value with
+         ;; assignment tilde rules (tilde at start and after colons)
          ((and (string? w) (has-equals-sign? w))
-          (let* ((eq-pos (string-find-char* w #\=))
-                 (raw-val (and eq-pos (substring w (+ eq-pos 1) (string-length w)))))
-            ;; Compound array assignment (value starts with "(") — expand each element
-            ;; individually to preserve empty quoted strings like '' and ""
-            (if (and raw-val (> (string-length raw-val) 0)
-                     (char=? (string-ref raw-val 0) #\())
-              (let* ((name-part (expand-word-nosplit (substring w 0 (+ eq-pos 1)) env))
-                     ;; Strip outer parens
-                     (inner (if (and (> (string-length raw-val) 1)
-                                     (char=? (string-ref raw-val (- (string-length raw-val) 1)) #\)))
-                              (substring raw-val 1 (- (string-length raw-val) 1))
-                              (substring raw-val 1 (string-length raw-val))))
-                     ;; Parse raw elements preserving quoting structure
-                     (raw-elems (parse-array-compound-raw inner))
-                     ;; Brace-expand each element (e.g. {1..9} → "1" "2" ... "9")
-                     (brace-elems (if (env-option? env "braceexpand")
-                                    (append-map brace-expand raw-elems)
-                                    raw-elems))
-                     ;; Expand each element individually, re-quote for reassembly
-                     (expanded-elems (map (lambda (e) (expand-word-nosplit e env)) brace-elems))
-                     ;; Re-quote each element with declare-quote-value so empty strings
-                     ;; survive as "" and special chars are escaped
-                     (quoted-elems (map declare-quote-value expanded-elems))
-                     ;; Reassemble: name=("elem1" "elem2" ...)
-                     (rebuilt (string-append "(" (string-join quoted-elems " ") ")")))
-                [(string-append name-part rebuilt)])
-              ;; For literal assignments: split raw name=value BEFORE expansion,
-              ;; then expand name and value separately to avoid double quote removal.
-              ;; expand-word-nosplit on the whole thing would strip outer quotes,
-              ;; then expand-assignment-value would strip inner quotes (double expansion).
-              (let* ((raw-eq-pos (string-find-char* w #\=))
-                     (raw-name (and raw-eq-pos (substring w 0 (+ raw-eq-pos 1))))
-                     (raw-val (and raw-eq-pos (substring w (+ raw-eq-pos 1) (string-length w)))))
-                (if raw-eq-pos
-                  (let* ((expanded-name (expand-word-nosplit raw-name env))
-                         (expanded-val (expand-assignment-value raw-val env)))
-                    [(string-append expanded-name expanded-val)])
-                  [(expand-word-nosplit w env)])))))
+              (let* ((eq-pos (string-find-char* w #\=))
+                     (raw-val (and eq-pos (substring w (+ eq-pos 1) (string-length w)))))
+                ;; Compound array assignment (value starts with "(")
+                (if (and raw-val (> (string-length raw-val) 0)
+                         (char=? (string-ref raw-val 0) #\())
+                  (let* ((name-part (expand-word-nosplit (substring w 0 (+ eq-pos 1)) env))
+                         ;; Strip outer parens
+                         (inner (if (and (> (string-length raw-val) 1)
+                                         (char=? (string-ref raw-val (- (string-length raw-val) 1)) #\)))
+                                  (substring raw-val 1 (- (string-length raw-val) 1))
+                                  (substring raw-val 1 (string-length raw-val))))
+                         ;; Parse raw elements preserving quoting structure
+                         (raw-elems (parse-array-compound-raw inner))
+                         ;; Brace-expand each element (e.g. {1..9} → "1" "2" ... "9")
+                         (brace-elems (if (env-option? env "braceexpand")
+                                        (append-map brace-expand raw-elems)
+                                        raw-elems))
+                         ;; Expand each element individually, re-quote for reassembly
+                         (expanded-elems (map (lambda (e) (expand-word-nosplit e env)) brace-elems))
+                         ;; Re-quote each element with declare-quote-value so empty strings
+                         ;; survive as "" and special chars are escaped
+                         (quoted-elems (map declare-quote-value expanded-elems))
+                         ;; Reassemble: name=("elem1" "elem2" ...)
+                         (rebuilt (string-append "(" (string-join quoted-elems " ") ")")))
+                    [(string-append name-part rebuilt)])
+                  ;; For literal assignments: split raw name=value BEFORE expansion,
+                  ;; then expand name and value separately to avoid double quote removal.
+                  (let* ((raw-eq-pos (string-find-char* w #\=))
+                         (raw-name (and raw-eq-pos (substring w 0 (+ raw-eq-pos 1))))
+                         (raw-val (and raw-eq-pos (substring w (+ raw-eq-pos 1) (string-length w)))))
+                    (if raw-eq-pos
+                      (let* ((expanded-name (expand-word-nosplit raw-name env))
+                             (expanded-val (expand-assignment-value raw-val env)))
+                        [(string-append expanded-name expanded-val)])
+                      [(expand-word-nosplit w env)])))))
          ;; Regular arg - normal expansion with splitting
          (else (expand-word w env)))))
    words))
@@ -392,7 +397,7 @@
            ;; doesn't interleave with pending parent output
            (force-output)
            (force-output (current-error-port))
-           (let* ((proc (open-process
+           (let* ((proc (open-process-with-sigpipe
                          [path: (string->c-safe exec-path)
                           arguments: (map string->c-safe args)
                           environment: (map string->c-safe (env-exported-alist env))
@@ -1113,7 +1118,7 @@
                  (exec-path (if (string-contains? path "/")
                               (path-expand path) path))
                  (_flush (begin (force-output) (force-output (current-error-port))))
-                 (proc (open-process
+                 (proc (open-process-with-sigpipe
                         [path: (string->c-safe exec-path)
                          arguments: (map string->c-safe actual-args)
                          environment: (map string->c-safe (env-exported-alist temp-env))

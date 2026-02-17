@@ -42,6 +42,11 @@
 ;;; Gambit character port (which doesn't handle pipe EOF properly).
 (def *pipeline-stdin-fd* (make-parameter #f))
 
+;;; When non-#f, holds the raw fd for the pipeline write-end.
+;;; Used by execute-external to dup2 onto fd 1 before open-process
+;;; so external commands in pipeline threads write to the pipe.
+(def *pipeline-stdout-fd* (make-parameter #f))
+
 ;;; --- Internal logical PWD ---
 ;;; Tracks the shell's logical working directory independently of $PWD.
 ;;; This ensures that `pwd` returns the correct path even if the user

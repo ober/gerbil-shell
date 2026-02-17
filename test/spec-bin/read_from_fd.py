@@ -21,9 +21,12 @@ def main(argv):
             sys.exit(1)
 
         s = '%d: ' % fd
-        #sys.stdout.write(s.encode('utf-8'))
         sys.stdout.write(s)
-        sys.stdout.write(in_str)  # write binary data to stdout
+        # Handle both str (Python 2) and bytes (Python 3)
+        if isinstance(in_str, bytes):
+            sys.stdout.write(in_str.decode('utf-8', errors='surrogateescape'))
+        else:
+            sys.stdout.write(in_str)
 
 
 if __name__ == '__main__':

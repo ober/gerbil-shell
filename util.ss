@@ -43,6 +43,18 @@
      (+ 128 (WSTOPSIG raw-status)))
     (else 255)))
 
+;;; --- Process launching ---
+
+;; Launch an external command via open-process, ensuring SIGPIPE is
+;; unblocked for the child.  Gambit blocks SIGPIPE (sigprocmask),
+;; which children inherit through fork+exec, causing commands like
+;; cat to get EPIPE (exit 1) instead of being killed by SIGPIPE (exit 141).
+(def (open-process-with-sigpipe settings)
+  (ffi-sigpipe-unblock)
+  (let ((proc (open-process settings)))
+    (ffi-sigpipe-block)
+    proc))
+
 ;;; --- String utilities ---
 
 ;; Split string by any character in charset (a string of delimiters)

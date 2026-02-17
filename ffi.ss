@@ -17,7 +17,8 @@
             ffi-read-byte ffi-byte-ready?
             ffi-terminal-columns ffi-terminal-rows
             ffi-execve
-            ffi-signal-was-ignored ffi-signal-set-ignore
+            ffi-signal-was-ignored ffi-signal-set-ignore ffi-signal-set-default
+            ffi-sigpipe-unblock ffi-sigpipe-block
             WNOHANG WUNTRACED WCONTINUED
             WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG WIFSTOPPED WSTOPSIG)
 
@@ -60,6 +61,31 @@ static int ffi_signal_set_ignore(int signum) {
     sa.sa_handler = SIG_IGN;
     sigemptyset(&sa.sa_mask);
     return sigaction(signum, &sa, NULL);
+}
+
+static int ffi_signal_set_default(int signum) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    return sigaction(signum, &sa, NULL);
+}
+
+/* Unblock SIGPIPE so children inherit a clean signal mask.
+   Returns 0 on success. */
+static int ffi_sigpipe_unblock(void) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGPIPE);
+    return sigprocmask(SIG_UNBLOCK, &set, NULL);
+}
+
+/* Re-block SIGPIPE in the parent after fork. */
+static int ffi_sigpipe_block(void) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGPIPE);
+    return sigprocmask(SIG_BLOCK, &set, NULL);
 }
 
 /* We need to store the last waitpid result since we can't easily
@@ -476,5 +502,14 @@ END-EXECVE
   ;; Set a signal's disposition to SIG_IGN (restore inherited ignore).
   ;; Returns 0 on success, -1 on error.
   (define-c-lambda ffi-signal-set-ignore (int) int "ffi_signal_set_ignore")
+
+  ;; Set a signal's disposition to SIG_DFL (reset to default).
+  ;; Returns 0 on success, -1 on error.
+  (define-c-lambda ffi-signal-set-default (int) int "ffi_signal_set_default")
+
+  ;; Unblock SIGPIPE before open-process so children inherit a clean mask.
+  (define-c-lambda ffi-sigpipe-unblock () int "ffi_sigpipe_unblock")
+  ;; Re-block SIGPIPE after open-process returns.
+  (define-c-lambda ffi-sigpipe-block () int "ffi_sigpipe_block")
 
 )
