@@ -2400,13 +2400,32 @@
          (if print?
            ;; -p name: print declaration
            ;; -pg: look in global scope only
-           ;; Bash ignores attribute filter flags (-n/-r/-x) when specific
-           ;; variable names are given with -p — just prints the variable.
+           ;; When attribute flags (-n/-r/-x) are present with -p and names,
+           ;; filter to show only variables matching those attributes.
            (let* ((lookup-env (if (hash-get flags 'global) (env-root env) env))
                   (var (or (env-get-var lookup-env name)
-                           (env-get-raw-var lookup-env name))))
+                           (env-get-raw-var lookup-env name)))
+                  ;; Check if any attribute filter flags are set
+                  (has-attr-filter? (or (hash-get flags 'nameref)
+                                       (hash-get flags 'readonly)
+                                       (hash-get flags 'export)
+                                       (hash-get flags 'integer)
+                                       (hash-get flags 'array)
+                                       (hash-get flags 'assoc)
+                                       (hash-get flags 'uppercase)
+                                       (hash-get flags 'lowercase))))
              (if var
-               (display-declare-var name var)
+               ;; If attribute filters present, only print if var matches
+               (when (or (not has-attr-filter?)
+                         (and (hash-get flags 'nameref) (shell-var-nameref? var))
+                         (and (hash-get flags 'readonly) (shell-var-readonly? var))
+                         (and (hash-get flags 'export) (shell-var-exported? var))
+                         (and (hash-get flags 'integer) (shell-var-integer? var))
+                         (and (hash-get flags 'array) (shell-var-array? var))
+                         (and (hash-get flags 'assoc) (shell-var-assoc? var))
+                         (and (hash-get flags 'uppercase) (shell-var-uppercase? var))
+                         (and (hash-get flags 'lowercase) (shell-var-lowercase? var)))
+                 (display-declare-var name var))
                (begin
                  (fprintf (current-error-port) "declare: ~a: not found~n" name)
                  (set! status 1))))

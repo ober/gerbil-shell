@@ -895,21 +895,36 @@
                     (and close
                          (let ((subscript (substring rest (+ bracket-pos 1) close)))
                            (or (string=? subscript "@") (string=? subscript "*"))))))
-           ;; ${!name[@]} — array keys
-           (let* ((name (substring rest 0 bracket-pos))
+           ;; ${!name[@]} or ${!name[*]} — array keys, possibly with @op suffix
+           (let* ((close (string-find-char-from rest #\] (+ bracket-pos 1)))
+                  (name (substring rest 0 bracket-pos))
+                  ;; Check for transform suffix after ], e.g. @a in ${!A[@]@a}
+                  (after-bracket (substring rest (+ close 1) (string-length rest)))
+                  (has-at-op? (and (> (string-length after-bracket) 0)
+                                   (char=? (string-ref after-bracket 0) #\@)))
+                  (at-op-char (and has-at-op? (> (string-length after-bracket) 1)
+                                   (string-ref after-bracket 1)))
                   (keys (env-array-keys env name)))
-             ;; ${!arr[@]} — return keys as separate words
-             (if (null? keys)
-               ""
-               (make-modifier-segments
-                (let eloop ((rest keys) (segs []) (first? #t))
-                  (if (null? rest)
-                    (reverse segs)
-                    (let ((new-segs (if first?
-                                     (cons (cons (car rest) 'expanded) segs)
-                                     (cons (cons (car rest) 'expanded)
-                                           (cons (cons "" 'word-break) segs)))))
-                      (eloop (cdr rest) new-segs #f)))))))
+             ;; Apply transform to keys if @a suffix present
+             (let ((transformed-keys
+                    (if (and has-at-op? at-op-char (char=? at-op-char #\a))
+                      ;; @a: get attributes of each key-as-variable-name
+                      (map (lambda (k)
+                             (let ((k-str (if (string? k) k (number->string k))))
+                               (get-var-attributes k-str env)))
+                           keys)
+                      keys)))
+               (if (null? transformed-keys)
+                 ""
+                 (make-modifier-segments
+                  (let eloop ((rest transformed-keys) (segs []) (first? #t))
+                    (if (null? rest)
+                      (reverse segs)
+                      (let ((new-segs (if first?
+                                       (cons (cons (car rest) 'expanded) segs)
+                                       (cons (cons (car rest) 'expanded)
+                                             (cons (cons "" 'word-break) segs)))))
+                        (eloop (cdr rest) new-segs #f))))))))
            ;; Check for ${!prefix@} or ${!prefix*} — variable name matching
            (let* ((rlen (string-length rest))
                   (last-ch (and (> rlen 0) (string-ref rest (- rlen 1)))))
@@ -952,6 +967,12 @@
                         (bracket-pos (and ref-name (find-array-subscript-start ref-name)))
                         (val (cond
                                ((not ref-name) #f)
+                               ;; For @a with indirect array ref like ${!r@a} where r='a[0]',
+                               ;; return attributes of the base variable, not the element value
+                               ((and bracket-pos (eq? modifier 'at-op)
+                                     (string=? arg "a"))
+                                (let ((base-name (substring ref-name 0 bracket-pos)))
+                                  (get-var-attributes base-name env)))
                                (bracket-pos
                                 ;; Resolve indirect to array element/slice
                                 ;; Build the full content with any modifier appended
@@ -973,6 +994,8 @@
                                   (expand-array-parameter indirect-content bp env)))
                                (else (env-get env ref-name)))))
                    (cond
+                     ;; @a with indirect array ref already computed above
+                     ((and bracket-pos (eq? modifier 'at-op) (string=? arg "a")) val)
                      ;; Array path already handled modifiers
                      (bracket-pos val)
                      (modifier
