@@ -280,10 +280,14 @@
                      ;; to avoid sendto-on-non-socket errors when Gambit cached
                      ;; the fd type at startup. Track the new port in save for cleanup.
                      (if (and (<= 0 fd 2) (not (<= 0 target-fd 2)))
-                       ;; High fd → standard fd: need fresh Gambit port
+                       ;; High fd → standard fd: try to create fresh Gambit port
+                       ;; If /dev/fd/N fails (e.g., socket), keep existing port
                        (let ((new-port (make-port-for-fd fd)))
-                         (set-current-port-for-fd! fd new-port)
-                         (append save (list new-port)))
+                         (if new-port
+                           (begin
+                             (set-current-port-for-fd! fd new-port)
+                             (append save (list new-port)))
+                           save))
                        ;; Standard fd → standard fd: copy existing Gambit port
                        (begin (dup-gambit-port! target-fd fd)
                               save)))))
@@ -329,9 +333,13 @@
                     (when close-source?
                       (ffi-close-fd target-fd))
                     (if (and (<= 0 fd 2) (not (<= 0 target-fd 2)))
+                      ;; Try to create fresh port; keep existing if it fails
                       (let ((new-port (make-port-for-fd fd)))
-                        (set-current-port-for-fd! fd new-port)
-                        (append save (list new-port)))
+                        (if new-port
+                          (begin
+                            (set-current-port-for-fd! fd new-port)
+                            (append save (list new-port)))
+                          save))
                       (begin (dup-gambit-port! target-fd fd)
                              save))))
                 (begin
@@ -469,7 +477,10 @@
                    (when close-source?
                      (ffi-close-fd target-fd))
                    (if (and (<= 0 fd 2) (not (<= 0 target-fd 2)))
-                     (set-current-port-for-fd! fd (make-port-for-fd fd))
+                     ;; Try to create fresh port; keep existing if it fails
+                     (let ((new-port (make-port-for-fd fd)))
+                       (when new-port
+                         (set-current-port-for-fd! fd new-port)))
                      (dup-gambit-port! target-fd fd))))
                 ((redir-fd redir)
                  (error (string-append target-str ": Bad file descriptor")))
@@ -500,7 +511,10 @@
                   (when close-source?
                     (ffi-close-fd target-fd))
                   (if (and (<= 0 fd 2) (not (<= 0 target-fd 2)))
-                    (set-current-port-for-fd! fd (make-port-for-fd fd))
+                    ;; Try to create fresh port; keep existing if it fails
+                    (let ((new-port (make-port-for-fd fd)))
+                      (when new-port
+                        (set-current-port-for-fd! fd new-port)))
                     (dup-gambit-port! target-fd fd)))
                 (fprintf (current-error-port) "gsh: ~a: bad file descriptor~n" target-str)))))))
       ((<>) (redirect-fd-to-file! fd target-str O_RDWR #o666))
@@ -622,11 +636,15 @@
 
 ;; Create a fresh Gambit port for a standard fd (0/1/2) after dup2
 ;; Uses /dev/fd/N so Gambit creates a proper port with write() not sendto()
+;; Returns #f if /dev/fd/N cannot be opened (e.g., fd points to a socket)
 (def (make-port-for-fd fd)
-  (case fd
-    ((0) (open-input-file [path: (string-append "/dev/fd/" (number->string fd))]))
-    ((1 2) (open-output-file [path: (string-append "/dev/fd/" (number->string fd))
-                              append: #t]))))
+  (with-catch
+   (lambda (e) #f)  ;; Return #f if open fails (e.g., socket, ENXIO)
+   (lambda ()
+     (case fd
+       ((0) (open-input-file [path: (string-append "/dev/fd/" (number->string fd))]))
+       ((1 2) (open-output-file [path: (string-append "/dev/fd/" (number->string fd))
+                                 append: #t]))))))
 
 ;; Set current-input/output/error-port for a standard fd
 (def (set-current-port-for-fd! fd port)

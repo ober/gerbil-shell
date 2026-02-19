@@ -8,6 +8,12 @@ BASH       := /bin/bash
 build:
 	LIBRARY_PATH="$$(brew --prefix openssl@3 2>/dev/null)/lib:$$LIBRARY_PATH" gerbil build
 
+install: build
+	@mkdir -p ~/.gerbil/bin
+	@cp $(GSH) ~/.gerbil/bin/gsh
+	@chmod +x ~/.gerbil/bin/gsh
+	@echo "Installed gsh to ~/.gerbil/bin/gsh"
+
 # --- Spec test targets ---
 
 # Run the smoke test (quick sanity check)
@@ -70,5 +76,5 @@ vendor-update: $(OILS_DIR)
 clean:
 	gerbil build --clean
 
-.PHONY: build clean compat compat-smoke compat-tier0 compat-tier1 compat-tier2 \
+.PHONY: build install clean compat compat-smoke compat-tier0 compat-tier1 compat-tier2 \
         compat-one compat-range compat-debug vendor-update
