@@ -160,7 +160,7 @@
                            (let ((saved (apply-redirections redirections env)))
                              (restore-redirections saved)
                              0)))
-                        (shell-environment-last-status env))))
+                        0)))  ;; Assignment without redirections returns 0
           (env-set-last-status! env status)
           (check-errexit! env status)
           status))
