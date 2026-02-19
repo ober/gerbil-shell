@@ -29,3 +29,5 @@ test_osh
 
 # Editor / misc
 "\n"
+.claude
+manifest.ss
