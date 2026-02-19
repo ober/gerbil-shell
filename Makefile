@@ -67,6 +67,17 @@ compat: compat-tier0 compat-tier1 compat-tier2
 compat-debug: build $(OILS_DIR)
 	$(SH_SPEC) -v $(OILS_DIR)/spec/$(SPEC).test.sh $(BASH) $(GSH)
 
+# --- Benchmarks ---
+
+SHELLBENCH_DIR := $(HOME)/mine/shellbench
+
+bench: install
+	@if [ ! -d "$(SHELLBENCH_DIR)" ]; then \
+	  echo "Error: shellbench not found at $(SHELLBENCH_DIR)"; \
+	  exit 1; \
+	fi
+	@cd $(SHELLBENCH_DIR) && setsid ./shellbench -s $(HOME)/.gerbil/bin/gsh,bash sample/*
+
 # --- Vendor management ---
 
 $(OILS_DIR):
@@ -80,4 +91,4 @@ clean:
 	rm -rf .gerbil
 
 .PHONY: build install clean compat compat-smoke compat-tier0 compat-tier1 compat-tier2 \
-        compat-one compat-range compat-debug vendor-update
+        compat-one compat-range compat-debug vendor-update bench
