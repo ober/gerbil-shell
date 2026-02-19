@@ -7,7 +7,8 @@
         :std/os/signal
         :gsh/ffi
         :gsh/util
-        :gsh/signals)
+        :gsh/signals
+        :gsh/environment)
 
 ;;; --- Job structures ---
 
@@ -198,6 +199,22 @@
         ((= result 0)
          ;; Still running — sleep and poll again
          (thread-sleep! delay)
+         ;; Check for terminating signals (TERM, INT, etc) and forward to child
+         (thread-yield!)
+         (let ((pending (pending-signals!)))
+           (for-each
+            (lambda (sig-name)
+              (cond
+                ;; TERM or INT: forward to child process
+                ((or (string=? sig-name "TERM") (string=? sig-name "INT"))
+                 (let ((signum (signal-name->number sig-name)))
+                   (when signum
+                     ;; Send signal to child's process group (negative PID)
+                     (kill (- pid) signum))))
+                ;; Other signals: re-queue for later processing
+                (else
+                 (set! *pending-signals* (cons sig-name *pending-signals*)))))
+            pending))
          (loop (min 0.05 (* delay 1.5))))
         (else
          ;; ECHILD — Gambit already reaped the child via its internal handler.
