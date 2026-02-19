@@ -58,6 +58,10 @@
            (if (null? remaining)
              status
              (begin
+               ;; Yield to signal handlers and process pending signals
+               (thread-yield!)
+               (let ((trap-fn (*process-traps-fn*)))
+                 (when trap-fn (trap-fn env)))
                (env-set! env var-name (car remaining))
                (set! remaining (cdr remaining))
                (let ((caught
@@ -91,6 +95,10 @@
    (lambda ()
      (let ((status 0))
        (let loop ()
+         ;; Yield to signal handlers and process pending signals
+         (thread-yield!)
+         (let ((trap-fn (*process-traps-fn*)))
+           (when trap-fn (trap-fn env)))
          ;; Evaluate test condition with break/continue handling
          (let ((test-caught
                 (with-catch
@@ -154,6 +162,10 @@
    (lambda ()
      (let ((status 0))
        (let loop ()
+         ;; Yield to signal handlers and process pending signals
+         (thread-yield!)
+         (let ((trap-fn (*process-traps-fn*)))
+           (when trap-fn (trap-fn env)))
          (let ((test-status (parameterize ((*in-condition-context* #t))
                               (execute-fn (until-command-test cmd) env))))
            (if (not (= test-status 0))
