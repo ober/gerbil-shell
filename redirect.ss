@@ -21,6 +21,7 @@
 (def O_CREAT   64)
 (def O_TRUNC  512)
 (def O_APPEND 1024)
+(def O_NONBLOCK 2048)
 
 ;;; --- Saved state structure ---
 ;;; Each entry: (fd saved-real-fd saved-port)
@@ -346,9 +347,23 @@
                   (fprintf (current-error-port) "gsh: ~a: bad file descriptor~n" target-str)
                   #f)))))))
       ;; <> file — open read-write on fd
+      ;; For FIFOs, use O_NONBLOCK to avoid blocking, then clear it
       ((<>)
        (let ((save (save-fd fd)))
-         (redirect-fd-to-file! fd target-str O_RDWR #o666)
+         ;; Open with O_NONBLOCK to prevent blocking on FIFO
+         (let ((raw-fd (ffi-open-raw target-str (bitwise-ior O_RDWR O_NONBLOCK) #o666)))
+           (when (< raw-fd 0)
+             (restore-single! save)
+             (fprintf (current-error-port) "gsh: ~a: No such file or directory~n" target-str)
+             (error "cannot open file" target-str))
+           ;; Clear O_NONBLOCK flag after successful open
+           (let ((flags (ffi-fcntl-getfl raw-fd)))
+             (when (>= flags 0)
+               (ffi-fcntl-setfl raw-fd (bitwise-and flags (bitwise-not O_NONBLOCK)))))
+           ;; dup2 onto target fd and close original
+           (unless (= raw-fd fd)
+             (ffi-dup2 raw-fd fd)
+             (ffi-close-fd raw-fd)))
          save))
       (else
        (fprintf (current-error-port) "gsh: unsupported redirect operator ~a~n" op)
@@ -517,7 +532,22 @@
                         (set-current-port-for-fd! fd new-port)))
                     (dup-gambit-port! target-fd fd)))
                 (fprintf (current-error-port) "gsh: ~a: bad file descriptor~n" target-str)))))))
-      ((<>) (redirect-fd-to-file! fd target-str O_RDWR #o666))
+      ;; <> file — open read-write (permanent)
+      ;; For FIFOs, use O_NONBLOCK to avoid blocking, then clear it
+      ((<>)
+       ;; Open with O_NONBLOCK to prevent blocking on FIFO
+       (let ((raw-fd (ffi-open-raw target-str (bitwise-ior O_RDWR O_NONBLOCK) #o666)))
+         (when (< raw-fd 0)
+           (fprintf (current-error-port) "gsh: ~a: No such file or directory~n" target-str)
+           (error "cannot open file" target-str))
+         ;; Clear O_NONBLOCK flag after successful open
+         (let ((flags (ffi-fcntl-getfl raw-fd)))
+           (when (>= flags 0)
+             (ffi-fcntl-setfl raw-fd (bitwise-and flags (bitwise-not O_NONBLOCK)))))
+         ;; dup2 onto target fd and close original
+         (unless (= raw-fd fd)
+           (ffi-dup2 raw-fd fd)
+           (ffi-close-fd raw-fd))))
       ;; << heredoc (permanent)
       ((<< <<- <<q <<-q)
        (let-values (((read-fd write-fd) (ffi-pipe-raw)))

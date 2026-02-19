@@ -3,6 +3,8 @@ OILS_DIR   := _vendor/oils
 SH_SPEC    := python3 $(CURDIR)/test/run_spec.py
 BASH       := /bin/bash
 
+export GERBIL_BUILD_CORES := $(shell echo $$(( $$(nproc) / 2 )))
+
 # --- Build ---
 
 build:
@@ -74,7 +76,8 @@ vendor-update: $(OILS_DIR)
 	cd $(OILS_DIR) && git pull --ff-only
 
 clean:
-	gerbil build --clean
+	gerbil clean
+	rm -rf .gerbil
 
 .PHONY: build install clean compat compat-smoke compat-tier0 compat-tier1 compat-tier2 \
         compat-one compat-range compat-debug vendor-update

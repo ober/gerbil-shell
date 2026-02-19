@@ -11,6 +11,7 @@
             ffi-getegid ffi-access
             ffi-isatty ffi-setsid ffi-pipe-raw ffi-close-fd
             ffi-open-raw ffi-mkfifo ffi-unlink ffi-getpid
+            ffi-fcntl-getfl ffi-fcntl-setfl
             ffi-read-all-from-fd ffi-unsetenv ffi-strftime
             ffi-getrlimit-soft ffi-getrlimit-hard ffi-setrlimit
             ffi-termios-save ffi-termios-restore ffi-set-raw-mode
@@ -227,8 +228,13 @@ END-C
   (define-c-lambda ffi-setsid () int "setsid")
 
   ;; Raw open — open a file and return raw fd
-  ;; flags: O_RDONLY=0, O_WRONLY=1, O_RDWR=2, O_CREAT=64, O_TRUNC=512, O_APPEND=1024
+  ;; flags: O_RDONLY=0, O_WRONLY=1, O_RDWR=2, O_CREAT=64, O_TRUNC=512, O_APPEND=1024, O_NONBLOCK=2048
   (define-c-lambda ffi-open-raw (char-string int int) int "open")
+
+  ;; fcntl — get/set file descriptor flags
+  ;; F_GETFL returns current flags, F_SETFL sets flags
+  (define-c-lambda ffi-fcntl-getfl (int) int "___return(fcntl(___arg1, F_GETFL));")
+  (define-c-lambda ffi-fcntl-setfl (int int) int "___return(fcntl(___arg1, F_SETFL, ___arg2));")
 
   ;; Raw pipe — returns 0 on success, -1 on error
   ;; After calling, retrieve fds with ffi-pipe-read-fd / ffi-pipe-write-fd
