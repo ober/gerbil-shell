@@ -8,7 +8,9 @@ export GERBIL_BUILD_CORES := $(shell echo $$(( $$(nproc) / 2 )))
 # --- Build ---
 
 build:
-	LIBRARY_PATH="$$(brew --prefix openssl@3 2>/dev/null)/lib:$$LIBRARY_PATH" gerbil build
+	GERBIL_LOADPATH="$$HOME/.gerbil/pkg/gerbil-pcre/.gerbil/lib:$$GERBIL_LOADPATH" \
+	LIBRARY_PATH="$$(brew --prefix openssl@3 2>/dev/null)/lib:$$LIBRARY_PATH" \
+	gerbil build
 
 install: build
 	@mkdir -p ~/.gerbil/bin
