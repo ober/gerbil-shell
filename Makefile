@@ -13,10 +13,16 @@ build:
 	gerbil build
 
 install: build
-	@mkdir -p ~/.gerbil/bin
-	@cp $(GSH) ~/.gerbil/bin/gsh
-	@chmod +x ~/.gerbil/bin/gsh
-	@echo "Installed gsh to ~/.gerbil/bin/gsh"
+	@echo "Cleaning old gsh artifacts from ~/.gerbil/ and ~/.local/bin/..."
+	@rm -f ~/.gerbil/bin/gsh
+	@rm -f ~/.local/bin/gsh
+	@rm -rf ~/.gerbil/lib/gsh/
+	@rm -f ~/.gerbil/lib/static/gsh__*.scm
+	@echo "Installing new gsh..."
+	@mkdir -p ~/.local/bin
+	@cp $(GSH) ~/.local/bin/gsh
+	@chmod +x ~/.local/bin/gsh
+	@echo "Installed gsh to ~/.local/bin/gsh"
 
 # --- Spec test targets ---
 

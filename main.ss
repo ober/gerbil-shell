@@ -154,6 +154,73 @@
     (register-late-builtins! env)
     env))
 
+;;; --- Scheme Evaluation (Meta-Command) ---
+;;;
+;;; Lines starting with comma (,) are evaluated as Gerbil Scheme expressions
+;;; instead of being parsed as shell commands. This provides a convenient way
+;;; to execute Scheme code without leaving the shell.
+;;;
+;;; Examples:
+;;;   ,(+ 1 2)                               => 3
+;;;   ,(string-append "hello" " " "world")   => "hello world"
+;;;   ,(map (lambda (x) (* x x)) '(1 2 3))   => (1 4 9)
+;;;   ,(current-directory)                   => "/path/to/dir/"
+;;;   ,(getenv "HOME")                       => "/home/user"
+;;;   ,(define x 42)                         => (no output)
+;;;   ,x                                     => 42
+;;;
+;;; Scheme expressions have access to:
+;;;   - All Gerbil standard library functions
+;;;   - Shell environment via (getenv "VAR")
+;;;   - File system operations (file-exists?, directory-files, etc.)
+;;;   - The full Gambit runtime
+;;;
+;;; Error handling:
+;;;   - Syntax/runtime errors are caught and displayed
+;;;   - The shell continues after errors (similar to failed shell commands)
+;;;   - Exit status is set to 1 on error, 0 on success
+;;;
+
+(def (eval-scheme-expr expr-str)
+  ;; Evaluate a Gerbil Scheme expression string and return (cons result-string status)
+  ;; Status: 0 = success, 1 = error
+  (with-catch
+   (lambda (e)
+     (cons (call-with-output-string
+            (lambda (port)
+              (display "Scheme error: " port)
+              (display-exception e port)))
+           1))
+   (lambda ()
+     (let* ((expr (call-with-input-string expr-str read))
+            (result (eval expr)))
+       (cons
+        (cond
+          ;; void: no output
+          ((eq? result (void)) "")
+          ;; Multiline results: use pretty-print
+          ((or (pair? result) (vector? result))
+           (call-with-output-string
+            (lambda (port)
+              (pretty-print result port))))
+          ;; Simple values: use write for unambiguous output
+          (else
+           (call-with-output-string
+            (lambda (port)
+              (write result port)))))
+        0)))))
+
+(def (scheme-eval-line? input)
+  ;; Check if input starts with comma meta-command
+  (and (> (string-length input) 0)
+       (char=? (string-ref input 0) #\,)))
+
+(def (extract-scheme-expr input)
+  ;; Strip leading comma and whitespace
+  (let* ((without-comma (substring input 1 (string-length input)))
+         (trimmed (string-trim-whitespace without-comma)))
+    trimmed))
+
 ;;; --- REPL ---
 
 (def (repl env)
@@ -195,6 +262,21 @@
           ;; Empty line
           ((string=? (string-trim-whitespace input) "")
            (loop cmd-num))
+          ;; Scheme eval meta-command (,expr)
+          ((scheme-eval-line? input)
+           (let* ((expr-str (extract-scheme-expr input))
+                  (result-status (eval-scheme-expr expr-str))
+                  (result (car result-status))
+                  (status (cdr result-status)))
+             ;; Display result if non-empty
+             (unless (string=? result "")
+               (display result)
+               (newline))
+             ;; Add to history
+             (history-add! input)
+             ;; Update exit status
+             (env-set-last-status! env status)
+             (loop cmd-num)))
           ;; Non-empty input
           (else
            ;; History expansion
@@ -241,35 +323,48 @@
 
 (def (execute-input input env)
   ;; Parse and execute a line of input
-  (with-catch
-   (lambda (e)
-     (cond
-       ((nounset-exception? e) (raise e))
-       ((errexit-exception? e) (errexit-exception-status e))
-       ((subshell-exit-exception? e) (raise e))
-       ((break-exception? e) (raise e))
-       ((continue-exception? e) (raise e))
-       ((return-exception? e) (raise e))
-       (else
-        (let ((msg (exception-message e)))
-          (fprintf (current-error-port) "gsh: ~a~n" msg)
-          ;; POSIX: syntax errors / unclosed bad substitution → exit code 2
-          (if (and (string? msg)
-                   (or (string-prefix? "parse error" msg)
-                       (string-prefix? "bad substitution: unclosed" msg)))
-            2 1)))))
-   (lambda ()
-     (let ((cmd (with-catch
-                 (lambda (e)
-                   (fprintf (current-error-port) "gsh: syntax error: ~a~n"
-                            (exception-message e))
-                   'error)
-                 (lambda ()
-                   (parse-complete-command input (env-shopt? env "extglob"))))))
+  ;; Check for Scheme eval meta-command first (,expr)
+  (if (scheme-eval-line? input)
+    ;; Evaluate as Scheme
+    (let* ((expr-str (extract-scheme-expr input))
+           (result-status (eval-scheme-expr expr-str))
+           (result (car result-status))
+           (status (cdr result-status)))
+      ;; Display result if non-empty
+      (unless (string=? result "")
+        (display result)
+        (newline))
+      status)
+    ;; Normal shell command parsing and execution
+    (with-catch
+     (lambda (e)
        (cond
-         ((eq? cmd 'error) 2)
-         ((not cmd) 0)
-         (else (execute-command cmd env)))))))
+         ((nounset-exception? e) (raise e))
+         ((errexit-exception? e) (errexit-exception-status e))
+         ((subshell-exit-exception? e) (raise e))
+         ((break-exception? e) (raise e))
+         ((continue-exception? e) (raise e))
+         ((return-exception? e) (raise e))
+         (else
+          (let ((msg (exception-message e)))
+            (fprintf (current-error-port) "gsh: ~a~n" msg)
+            ;; POSIX: syntax errors / unclosed bad substitution → exit code 2
+            (if (and (string? msg)
+                     (or (string-prefix? "parse error" msg)
+                         (string-prefix? "bad substitution: unclosed" msg)))
+              2 1)))))
+     (lambda ()
+       (let ((cmd (with-catch
+                   (lambda (e)
+                     (fprintf (current-error-port) "gsh: syntax error: ~a~n"
+                              (exception-message e))
+                     'error)
+                   (lambda ()
+                     (parse-complete-command input (env-shopt? env "extglob"))))))
+         (cond
+           ((eq? cmd 'error) 2)
+           ((not cmd) 0)
+           (else (execute-command cmd env))))))))
 
 ;;; --- Trap processing ---
 

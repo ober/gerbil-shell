@@ -14,6 +14,53 @@
         :gsh/signals
         :gsh/jobs)
 
+;;; --- Scheme Evaluation Helpers ---
+
+(def (eval-scheme-expr expr-str)
+  ;; Evaluate a Gerbil Scheme expression string and return (cons result-string status)
+  ;; Status: 0 = success, 1 = error
+  (with-catch
+   (lambda (e)
+     (cons (call-with-output-string
+            (lambda (port)
+              (display "Scheme error: " port)
+              (display-exception e port)))
+           1))
+   (lambda ()
+     (let* ((expr (call-with-input-string expr-str read))
+            (result (eval expr)))
+       (cons
+        (cond
+          ;; void: no output
+          ((eq? result (void)) "")
+          ;; Multiline results: use pretty-print
+          ((or (pair? result) (vector? result))
+           (call-with-output-string
+            (lambda (port)
+              (pretty-print result port))))
+          ;; Simple values: use write for unambiguous output
+          (else
+           (call-with-output-string
+            (lambda (port)
+              (write result port)))))
+        0)))))
+
+(def (scheme-eval-line? line)
+  ;; Check if line starts with comma meta-command
+  (and (> (string-length line) 0)
+       (char=? (string-ref line 0) #\,)))
+
+(def (extract-scheme-expr line)
+  ;; Strip leading comma and whitespace
+  (let* ((without-comma (substring line 1 (string-length line)))
+         (start 0)
+         (end (string-length without-comma)))
+    ;; Trim leading whitespace
+    (let loop-start ((i 0))
+      (if (and (< i end) (char-whitespace? (string-ref without-comma i)))
+        (loop-start (+ i 1))
+        (substring without-comma i end)))))
+
 ;;; --- Public interface ---
 
 ;; Execute a script file with arguments.
@@ -77,9 +124,44 @@
 
 ;; Parse and execute a string of shell commands.
 ;; Used by both execute-script and source-file!
+;; Lines starting with comma (,) are evaluated as Scheme instead of being parsed as shell.
 (def (execute-string input env (interactive? #f))
+  ;; Split input into lines for preprocessing
+  (let ((lines (string-split input #\newline)))
+    (let line-loop ((remaining-lines lines) (status 0) (shell-buffer '()))
+      (cond
+        ;; No more lines - execute any pending shell commands
+        ((null? remaining-lines)
+         (if (null? shell-buffer)
+           status
+           (let ((shell-input (string-join (reverse shell-buffer) "\n")))
+             (execute-shell-lines shell-input env interactive? status))))
+        ;; Scheme eval line (starts with comma)
+        ((scheme-eval-line? (car remaining-lines))
+         ;; First, execute any accumulated shell commands
+         (let* ((shell-status (if (null? shell-buffer)
+                                status
+                                (let ((shell-input (string-join (reverse shell-buffer) "\n")))
+                                  (execute-shell-lines shell-input env interactive? status))))
+                ;; Then evaluate the Scheme expression
+                (expr-str (extract-scheme-expr (car remaining-lines)))
+                (result-status (eval-scheme-expr expr-str))
+                (result (car result-status))
+                (scheme-status (cdr result-status)))
+           ;; Display result if non-empty
+           (unless (string=? result "")
+             (display result)
+             (newline))
+           (env-set-last-status! env scheme-status)
+           (line-loop (cdr remaining-lines) scheme-status '())))
+        ;; Regular shell line - accumulate
+        (else
+         (line-loop (cdr remaining-lines) status (cons (car remaining-lines) shell-buffer)))))))
+
+;; Execute accumulated shell lines using the lexer/parser
+(def (execute-shell-lines input env interactive? initial-status)
   (let ((lexer (make-shell-lexer input (env-shopt? env "extglob"))))
-    (let loop ((status 0))
+    (let loop ((status initial-status))
       (let ((cmd (with-catch
                   (lambda (e)
                     (fprintf (current-error-port) "gsh: syntax error: ~a~n"
