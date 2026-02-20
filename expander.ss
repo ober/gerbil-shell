@@ -1917,20 +1917,15 @@
                                (string-append "/dev/fd/" (number->string 1)))))
                (current-output-port pipe-port)
                ;; Execute in subshell context so exit doesn't terminate parent.
-               ;; For pipelines: set *pipeline-stdout-fd* to the raw fd so the
-               ;; last command can inherit it properly.
-               (let ((stdout-fd-dup (ffi-dup 1)))
-                 (with-catch
-                  (lambda (e)
-                    (ffi-close-fd stdout-fd-dup)
-                    (when (subshell-exit-exception? e)
-                      (env-set-last-status! env (subshell-exit-exception-status e))))
-                  (lambda ()
-                    (parameterize ((*in-subshell* #t)
-                                   (*pipeline-stdin-fd* #f)
-                                   (*pipeline-stdout-fd* stdout-fd-dup))
-                      (exec-fn cmd env))))
-                 (ffi-close-fd stdout-fd-dup))
+               ;; For pipelines: DON'T set pipeline fd params - let commands
+               ;; inherit the already-redirected real fds 0/1 directly.
+               (with-catch
+                (lambda (e)
+                  (when (subshell-exit-exception? e)
+                    (env-set-last-status! env (subshell-exit-exception-status e))))
+                (lambda ()
+                  (parameterize ((*in-subshell* #t))
+                    (exec-fn cmd env))))
                ;; Flush and close the pipe port
                (force-output pipe-port)
                (close-port pipe-port))

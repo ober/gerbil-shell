@@ -247,7 +247,7 @@
                                         cmd-num
                                         (history-count)
                                         ;; Command executor for $(...) in prompts
-                                        ;; Redirect stdin to /dev/null to prevent hangs
+                                        ;; NOTE: Does NOT redirect stdin to /dev/null - that breaks pipelines
                                         (lambda (cmd)
                                           (let ((saved-stdin (ffi-dup 0)))
                                             (with-catch
@@ -256,13 +256,10 @@
                                                (ffi-close-fd saved-stdin)
                                                "")
                                              (lambda ()
-                                               (let ((null-fd (ffi-open-raw "/dev/null" 0)))
-                                                 (ffi-dup2 null-fd 0)
-                                                 (ffi-close-fd null-fd)
-                                                 (let ((result (command-substitute cmd env)))
-                                                   (ffi-dup2 saved-stdin 0)
-                                                   (ffi-close-fd saved-stdin)
-                                                   result))))))))
+                                               (let ((result (command-substitute cmd env)))
+                                                 (ffi-dup2 saved-stdin 0)
+                                                 (ffi-close-fd saved-stdin)
+                                                 result)))))))
              ;; Create completion function
              (complete-fn (lambda (line cursor)
                            (complete-word line cursor env)))
