@@ -211,19 +211,31 @@
          (pwidth (line-state-prompt-width state))
          (cols (line-state-columns state))
          ;; Count newlines in prompt to handle multi-line prompts
-         (prompt-lines (count-newlines prompt)))
+         (prompt-lines (count-newlines prompt))
+         ;; Calculate the width of the LAST line of the prompt
+         ;; This is what we need for cursor positioning on multi-line prompts
+         (last-line-width (visible-width-last-line prompt)))
     ;; Move to start of prompt (handle multi-line prompts)
     ;; Move up by number of newlines in prompt, then carriage return
     (when (> prompt-lines 0)
       (term-move-up prompt-lines port))
     (display "\r" port)
-    (display prompt port)
+    ;; Display prompt with explicit \r after each \n
+    ;; This ensures cursor returns to column 0 on each new line
+    (let ((len (string-length prompt)))
+      (let loop ((i 0))
+        (when (< i len)
+          (let ((ch (string-ref prompt i)))
+            (display (string ch) port)
+            (when (char=? ch #\newline)
+              (display "\r" port)))
+          (loop (+ i 1)))))
     (display buf port)
     (term-clear-to-eol port)
-    ;; Position cursor
-    (let ((cursor-col (+ pwidth cursor)))
+    ;; Position cursor - use last-line-width instead of pwidth for multi-line prompts
+    (let ((cursor-col (+ last-line-width cursor)))
       ;; Move cursor back from end of line to cursor position
-      (let ((end-col (+ pwidth (string-length buf))))
+      (let ((end-col (+ last-line-width (string-length buf))))
         (when (> end-col cursor-col)
           (term-cursor-back (- end-col cursor-col) port))))
     (force-output port)))
@@ -1049,6 +1061,10 @@
           (dynamic-wind
             (lambda () (term-raw! in-port))
             (lambda ()
+              ;; Ensure we're on a fresh line before showing prompt
+              ;; If previous command didn't end with newline, this prevents bleed-over
+              (display "\n" out-port)
+              (force-output out-port)
               ;; Show initial prompt
               (refresh-line state out-port)
               ;; Main editing loop
