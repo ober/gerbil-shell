@@ -4,7 +4,7 @@
 (import :std/misc/string
         :std/misc/list
         :std/misc/path
-        :std/pregexp
+        ./pregexp-compat
         :std/format
         :std/sugar
         :std/iter

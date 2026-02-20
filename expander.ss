@@ -5,7 +5,7 @@
 (export #t)
 (import :std/sugar
         :std/format
-        :std/pregexp
+        ./pregexp-compat
         :std/srfi/1
         :gsh/ast
         :gsh/util

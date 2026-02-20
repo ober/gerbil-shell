@@ -4,6 +4,7 @@
   '("ffi"
     "util"
     "ast"
+    "pregexp-compat"
     "environment"
     "lexer"
     "glob"
@@ -26,5 +27,6 @@
     "completion"
     "script"
     "startup"
-    (exe: "main" bin: "gsh" optimize: #t debug: 'env))
+    (exe: "main" bin: "gsh" optimize: #t debug: 'env
+          "-ld-options" "-lpcre2-8"))
   parallelize: (max 1 (quotient (##cpu-count) 2)))

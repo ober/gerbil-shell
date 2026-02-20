@@ -3,7 +3,7 @@
 (export #t)
 (import :std/sugar
         :std/format
-        :std/pregexp
+        ./pregexp-compat
         :gsh/util)
 
 ;;; --- History state ---

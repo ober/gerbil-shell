@@ -5,7 +5,7 @@
         :std/format
         :std/iter
         :std/sort
-        :std/pregexp
+        ./pregexp-compat
         :std/os/signal
         :std/os/fdio
         :gsh/ast

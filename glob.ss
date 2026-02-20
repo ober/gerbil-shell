@@ -1,7 +1,7 @@
 ;;; glob.ss — Pathname expansion (globbing) for gsh
 
 (export #t)
-(import :std/pregexp
+(import ./pregexp-compat
         :std/sort
         :std/sugar
         :std/iter
@@ -86,7 +86,8 @@
     (let loop ((i 0) (in-bracket? #f))
       (if (>= i (string-length pattern))
         (begin (display "$" rx)
-               (pregexp (get-output-string rx)))
+               ;; Return STRING not compiled regex - let pregexp-match cache it!
+               (get-output-string rx))
         (let ((ch (string-ref pattern i)))
           (cond
             ;; Inside bracket expression

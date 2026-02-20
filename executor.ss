@@ -4,7 +4,7 @@
 (export #t)
 (import :std/sugar
         :std/format
-        :std/pregexp
+        ./pregexp-compat
         :gsh/ast
         :gsh/environment
         :gsh/expander
