@@ -244,7 +244,10 @@
                                         (lambda (name) (env-get env name))
                                         (job-count)
                                         cmd-num
-                                        (history-count)))
+                                        (history-count)
+                                        ;; Command executor for $(...) in prompts
+                                        (lambda (cmd)
+                                          (command-substitute cmd env))))
              ;; Create completion function
              (complete-fn (lambda (line cursor)
                            (complete-word line cursor env)))

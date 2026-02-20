@@ -4,7 +4,8 @@
 (import :std/sugar
         :std/format
         :gsh/ffi
-        :gsh/util)
+        :gsh/util
+        (only-in :gsh/expander find-matching-paren))
 
 ;;; --- Public interface ---
 
@@ -13,16 +14,35 @@
 ;; job-count: number of active jobs
 ;; cmd-number: command number
 ;; history-number: history number
+;; cmd-exec-fn: optional (lambda (cmd-string) -> output-string) for $(...) expansion
 (def (expand-prompt ps-string env-get
                     (job-count 0)
                     (cmd-number 0)
-                    (history-number 0))
+                    (history-number 0)
+                    (cmd-exec-fn #f))
   (let ((len (string-length ps-string))
         (out (open-output-string)))
     (let loop ((i 0) (in-non-printing? #f))
       (cond
         ((>= i len)
          (get-output-string out))
+        ;; Command substitution $(...)
+        ((and cmd-exec-fn
+              (char=? (string-ref ps-string i) #\$)
+              (< (+ i 1) len)
+              (char=? (string-ref ps-string (+ i 1)) #\())
+         (let ((close (find-matching-paren ps-string (+ i 2))))
+           (if close
+             (let* ((cmd-str (substring ps-string (+ i 2) close))
+                    (output (with-catch
+                             (lambda (e) "")  ;; Silently ignore errors in prompt commands
+                             (lambda () (cmd-exec-fn cmd-str)))))
+               (display output out)
+               (loop (+ close 1) in-non-printing?))
+             ;; No matching ) - output literally
+             (begin
+               (display "$(" out)
+               (loop (+ i 2) in-non-printing?)))))
         ;; Backslash escape sequence
         ((and (char=? (string-ref ps-string i) #\\)
               (< (+ i 1) len))
