@@ -1021,7 +1021,7 @@
           (if (eof-object? line) 'eof line)))
       ;; Interactive: use line editor
       (let ((cols (detect-terminal-columns))
-            (pw (visible-width prompt)))
+            (pw (visible-width-last-line prompt)))
         (set-terminal-columns! cols)
         (let ((state (make-line-state
                       ""          ;; buffer
@@ -1073,6 +1073,30 @@
 (def (visible-width str)
   (let ((len (string-length str)))
     (let loop ((i 0) (width 0) (in-escape? #f))
+      (cond
+        ((>= i len) width)
+        ((and (not in-escape?)
+              (char=? (string-ref str i) #\escape))
+         (loop (+ i 1) width #t))
+        (in-escape?
+         (if (char-alphabetic? (string-ref str i))
+           (loop (+ i 1) width #f)
+           (loop (+ i 1) width #t)))
+        (else
+         (loop (+ i 1) (+ width 1) #f))))))
+
+(def (visible-width-last-line str)
+  ;; For multi-line prompts, return width of only the last line
+  ;; Find the last newline and measure from there
+  (let* ((len (string-length str))
+         (last-newline (let loop ((i (- len 1)))
+                         (cond
+                           ((< i 0) -1)
+                           ((char=? (string-ref str i) #\newline) i)
+                           (else (loop (- i 1))))))
+         (start (+ last-newline 1)))
+    ;; Calculate visible width from start to end
+    (let loop ((i start) (width 0) (in-escape? #f))
       (cond
         ((>= i len) width)
         ((and (not in-escape?)
