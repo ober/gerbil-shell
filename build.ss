@@ -26,5 +26,5 @@
     "completion"
     "script"
     "startup"
-    (exe: "main" bin: "gsh"))
+    (exe: "main" bin: "gsh" optimize: #t debug: 'env))
   parallelize: (max 1 (quotient (##cpu-count) 2)))

@@ -383,14 +383,17 @@
              (display (pregexp-quote-char ch) rx)
              (loop (+ i 1)))))))))
 
-;; Join strings with a separator
+;; Join strings with a separator (O(n) via output port)
 (def (glob-join-alternatives strs sep)
   (if (null? strs)
     ""
-    (let loop ((rest (cdr strs)) (result (car strs)))
-      (if (null? rest)
-        result
-        (loop (cdr rest) (string-append result sep (car rest)))))))
+    (call-with-output-string
+      (lambda (port)
+        (display (car strs) port)
+        (for-each (lambda (s)
+                    (display sep port)
+                    (display s port))
+                  (cdr strs))))))
 
 ;;; --- Path expansion ---
 

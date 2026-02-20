@@ -233,13 +233,11 @@
     ;; Walk scope chain
     (let walk ((e env))
       (when e
-        (hash-for-each
-         (lambda (k v)
-           (when (and (string? k)
-                      (string-prefix? prefix k)
-                      (not (eq? (shell-var-value v) +unset-sentinel+)))
-             (hash-put! result k #t)))
-         (shell-environment-vars e))
+        (for ([k . v] (hash->list (shell-environment-vars e)))
+          (when (and (string? k)
+                     (string-prefix? prefix k)
+                     (not (eq? (shell-var-value v) +unset-sentinel+)))
+            (hash-put! result k #t)))
         (walk (shell-environment-parent e))))
     ;; Also check OS environment
     (for-each
@@ -379,13 +377,11 @@
 (def (env-collect-exports! env target)
   (let ((parent (shell-environment-parent env)))
     (when parent (env-collect-exports! parent target)))
-  (hash-for-each
-   (lambda (name var)
-     (when (shell-var-exported? var)
-       (let ((v (shell-var-value var)))
-         (unless (eq? v +unset-sentinel+)
-           (hash-put! target name (or (shell-var-scalar-value var) ""))))))
-   (shell-environment-vars env)))
+  (for ([name . var] (hash->list (shell-environment-vars env)))
+    (when (shell-var-exported? var)
+      (let ((v (shell-var-value var)))
+        (unless (eq? v +unset-sentinel+)
+          (hash-put! target name (or (shell-var-scalar-value var) "")))))))
 
 ;; Push a new scope (for function calls)
 (def (env-push-scope env)
@@ -420,22 +416,20 @@
 (def (clone-vars-from-chain! env target)
   (let ((parent (shell-environment-parent env)))
     (when parent (clone-vars-from-chain! parent target)))
-  (hash-for-each
-   (lambda (name var)
-     (hash-put! target name
-                (make-shell-var (let ((v (shell-var-value var)))
-                                  ;; Deep-copy array hash-tables for subshell isolation
-                                  (if (hash-table? v) (hash-copy v) v))
-                                (shell-var-exported? var)
-                                (shell-var-readonly? var)
-                                (shell-var-local? var)
-                                (shell-var-integer? var)
-                                (shell-var-uppercase? var)
-                                (shell-var-lowercase? var)
-                                (shell-var-nameref? var)
-                                (shell-var-array? var)
-                                (shell-var-assoc? var))))
-   (shell-environment-vars env)))
+  (for ([name . var] (hash->list (shell-environment-vars env)))
+    (hash-put! target name
+               (make-shell-var (let ((v (shell-var-value var)))
+                                 ;; Deep-copy array hash-tables for subshell isolation
+                                 (if (hash-table? v) (hash-copy v) v))
+                               (shell-var-exported? var)
+                               (shell-var-readonly? var)
+                               (shell-var-local? var)
+                               (shell-var-integer? var)
+                               (shell-var-uppercase? var)
+                               (shell-var-lowercase? var)
+                               (shell-var-nameref? var)
+                               (shell-var-array? var)
+                               (shell-var-assoc? var)))))
 
 ;; Pop back to parent scope
 (def (env-pop-scope env)
@@ -486,14 +480,12 @@
 (def (env-all-variables env)
   ;; Return all scalar variables sorted by name
   (let ((result []))
-    (hash-for-each
-     (lambda (name var)
-       (when (and (shell-var? var)
-                  (not (shell-var-array? var))
-                  (not (shell-var-assoc? var))
-                  (shell-var-value var))
-         (set! result (cons (cons name (shell-var-value var)) result))))
-     (shell-environment-vars env))
+    (for ([name . var] (hash->list (shell-environment-vars env)))
+      (when (and (shell-var? var)
+                 (not (shell-var-array? var))
+                 (not (shell-var-assoc? var))
+                 (shell-var-value var))
+        (set! result (cons (cons name (shell-var-value var)) result))))
     (sort result (lambda (a b) (string<? (car a) (car b))))))
 
 (def (env-shopt-set! env name value)
@@ -644,9 +636,13 @@
 
 (def (string-join-with sep lst)
   (if (null? lst) ""
-      (let loop ((rest (cdr lst)) (acc (car lst)))
-        (if (null? rest) acc
-            (loop (cdr rest) (string-append acc sep (car rest)))))))
+      (call-with-output-string
+        (lambda (port)
+          (display (car lst) port)
+          (for-each (lambda (s)
+                      (display sep port)
+                      (display s port))
+                    (cdr lst))))))
 
 ;;; --- Array operations ---
 

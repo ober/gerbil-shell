@@ -2507,10 +2507,8 @@
       (when e
         ;; Walk parents first so closer scopes override
         (walk (shell-environment-parent e))
-        (hash-for-each
-         (lambda (name var)
-           (hash-put! result name var))
-         (shell-environment-vars e))))
+        (for ([name . var] (hash->list (shell-environment-vars e)))
+          (hash-put! result name var))))
     result))
 
 ;; Print all variables matching flags criteria from entire scope chain
@@ -4046,9 +4044,13 @@
 
 (def (string-join-sp lst)
   (if (null? lst) ""
-      (let loop ((rest (cdr lst)) (acc (car lst)))
-        (if (null? rest) acc
-            (loop (cdr rest) (string-append acc " " (car rest)))))))
+      (call-with-output-string
+        (lambda (port)
+          (display (car lst) port)
+          (for-each (lambda (s)
+                      (display " " port)
+                      (display s port))
+                    (cdr lst))))))
 
 (def (string-find-char* str ch)
   (let loop ((i 0))
@@ -4069,11 +4071,9 @@
 
 (def (env-exported-alist-pairs env)
   (let ((result []))
-    (hash-for-each
-     (lambda (name var)
-       (when (shell-var-exported? var)
-         (set! result (cons (cons name (or (shell-var-scalar-value var) "")) result))))
-     (shell-environment-vars env))
+    (for ([name . var] (hash->list (shell-environment-vars env)))
+      (when (shell-var-exported? var)
+        (set! result (cons (cons name (or (shell-var-scalar-value var) "")) result))))
     result))
 
 (def (arith-eval-wrapper expr env)

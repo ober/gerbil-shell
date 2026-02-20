@@ -4,6 +4,7 @@
 (export #t)
 (import :std/sugar
         :std/format
+        :std/iter
         :std/sort
         :gsh/util
         :gsh/environment
@@ -368,9 +369,8 @@
   (let ((names []))
     (let loop ((e env))
       (when e
-        (hash-for-each
-         (lambda (k v) (set! names (cons k names)))
-         (shell-environment-vars e))
+        (for ([k . v] (hash->list (shell-environment-vars e)))
+          (set! names (cons k names)))
         (loop (shell-environment-parent e))))
     (unique-strings names)))
 

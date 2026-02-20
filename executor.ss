@@ -956,13 +956,17 @@
 
 ;;; --- Helpers ---
 
-;; Pack a list of strings with SOH (char 1) delimiter for ffi-execve
+;; Pack a list of strings with SOH (char 1) delimiter for ffi-execve (O(n) via output port)
 (def *soh* (make-string 1 (integer->char 1)))
 (def (pack-with-soh strs)
   (if (null? strs) ""
-      (let loop ((rest (cdr strs)) (acc (car strs)))
-        (if (null? rest) acc
-            (loop (cdr rest) (string-append acc *soh* (car rest)))))))
+      (call-with-output-string
+        (lambda (port)
+          (display (car strs) port)
+          (for-each (lambda (s)
+                      (display *soh* port)
+                      (display s port))
+                    (cdr strs))))))
 
 (def (return-status env status)
   (env-set-last-status! env status)
@@ -970,9 +974,13 @@
 
 (def (string-join-words words)
   (if (null? words) ""
-      (let loop ((rest (cdr words)) (acc (car words)))
-        (if (null? rest) acc
-            (loop (cdr rest) (string-append acc " " (car rest)))))))
+      (call-with-output-string
+        (lambda (port)
+          (display (car words) port)
+          (for-each (lambda (w)
+                      (display " " port)
+                      (display w port))
+                    (cdr words))))))
 
 ;;; --- Coproc execution ---
 

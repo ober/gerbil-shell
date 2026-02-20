@@ -3,6 +3,7 @@
 (export #t)
 (import :std/sugar
         :std/format
+        :std/iter
         :gsh/ast
         :gsh/environment
         :gsh/ffi)
@@ -58,18 +59,16 @@
 ;; After function return, restore OS environment for variables that were
 ;; local+exported in the child scope but shouldn't persist in parent
 (def (cleanup-exported-locals! child-env parent-env)
-  (hash-for-each
-   (lambda (name var)
-     (when (and (shell-var-local? var) (shell-var-exported? var))
-       ;; Check if parent scope has this variable
-       (let ((parent-var (env-get-raw-var parent-env name)))
-         (if (and parent-var (shell-var-exported? parent-var))
-           ;; Parent has it exported — restore parent's value
-           (let ((v (shell-var-scalar-value parent-var)))
-             (if v (setenv name v) (ffi-unsetenv name)))
-           ;; Parent doesn't have it exported — remove from OS env
-           (ffi-unsetenv name)))))
-   (shell-environment-vars child-env)))
+  (for ([name . var] (hash->list (shell-environment-vars child-env)))
+    (when (and (shell-var-local? var) (shell-var-exported? var))
+      ;; Check if parent scope has this variable
+      (let ((parent-var (env-get-raw-var parent-env name)))
+        (if (and parent-var (shell-var-exported? parent-var))
+          ;; Parent has it exported — restore parent's value
+          (let ((v (shell-var-scalar-value parent-var)))
+            (if v (setenv name v) (ffi-unsetenv name)))
+          ;; Parent doesn't have it exported — remove from OS env
+          (ffi-unsetenv name))))))
 
 ;;; --- Return exception ---
 ;; Used to implement 'return' from functions
@@ -136,9 +135,8 @@
 ;; Remove all aliases
 (def (alias-clear! env)
   ;; Replace with new empty table
-  (hash-for-each
-   (lambda (k v) (hash-remove! (shell-environment-aliases env) k))
-   (shell-environment-aliases env)))
+  (for ([k . v] (hash->list (shell-environment-aliases env)))
+    (hash-remove! (shell-environment-aliases env) k)))
 
 ;; List all aliases as alist
 (def (alias-list env)

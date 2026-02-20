@@ -92,12 +92,16 @@
             ((string=? (substring haystack i (+ i nlen)) needle) #t)
             (else (loop (+ i 1))))))))
 
-;; Join strings with separator
+;; Join strings with separator (O(n) via output port)
 (def (string-join lst sep)
   (if (null? lst) ""
-      (let loop ((rest (cdr lst)) (acc (car lst)))
-        (if (null? rest) acc
-            (loop (cdr rest) (string-append acc sep (car rest)))))))
+      (call-with-output-string
+        (lambda (port)
+          (display (car lst) port)
+          (for-each (lambda (s)
+                      (display sep port)
+                      (display s port))
+                    (cdr lst))))))
 
 ;; Find last occurrence of character in string
 (def (string-last-index-of str ch)
