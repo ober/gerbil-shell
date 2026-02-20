@@ -129,7 +129,8 @@
   (let ((env (make-shell-environment)))
     (env-init! env)
     ;; Set shell-specific defaults
-    (env-set! env "SHELL" (or (getenv "SHELL" #f) "/usr/local/bin/gsh"))
+    ;; SHELL should point to this shell, not the parent shell
+    (env-set! env "SHELL" (path-normalize (car (command-line))))
     (env-set! env "GSH_VERSION" "0.1.0")
     ;; Set default PS1 if not inherited
     (unless (env-get env "PS1")
