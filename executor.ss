@@ -8,6 +8,7 @@
         :gsh/ast
         :gsh/environment
         :gsh/expander
+        :gsh/registry
         :gsh/builtins
         :gsh/functions
         :gsh/pipeline
@@ -697,18 +698,14 @@
     ((string=? op "-z") (= (string-length arg) 0))
     ((string=? op "-n") (> (string-length arg) 0))
     ((string=? op "-e") (file-exists? arg))
-    ((string=? op "-f") (and (file-exists? arg)
-                             (eq? (file-info-type (file-info arg)) 'regular)))
-    ((string=? op "-d") (and (file-exists? arg)
-                             (eq? (file-info-type (file-info arg)) 'directory)))
-    ((string=? op "-L") (and (file-exists? arg)
-                             (eq? (file-info-type (file-info arg #f)) 'symbolic-link)))
+    ((string=? op "-f") (file-regular? arg))
+    ((string=? op "-d") (file-directory? arg))
+    ((string=? op "-L") (file-symlink? arg))
     ((string=? op "-h") (eval-cond-unary "-L" arg env))
     ((string=? op "-r") (and (file-exists? arg) (cond-file-access? arg 4)))
     ((string=? op "-w") (and (file-exists? arg) (cond-file-access? arg 2)))
     ((string=? op "-x") (and (file-exists? arg) (cond-file-access? arg 1)))
-    ((string=? op "-s") (and (file-exists? arg)
-                             (> (file-info-size (file-info arg)) 0)))
+    ((string=? op "-s") (file-nonempty? arg))
     ((string=? op "-p") (and (file-exists? arg)
                              (eq? (file-info-type (file-info arg)) 'fifo)))
     ((string=? op "-S") (and (file-exists? arg)

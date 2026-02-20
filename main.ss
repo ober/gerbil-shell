@@ -13,6 +13,7 @@
         :gsh/executor
         :gsh/expander
         :gsh/functions
+        :gsh/registry
         :gsh/builtins
         :gsh/history
         :gsh/prompt

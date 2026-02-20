@@ -14,6 +14,7 @@
         :gsh/environment
         :gsh/expander
         :gsh/redirect
+        :gsh/registry
         :gsh/builtins
         :gsh/functions
         :gsh/util)

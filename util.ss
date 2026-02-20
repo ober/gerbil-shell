@@ -135,18 +135,16 @@
       (if (null? dirs) #f
           (let ((full (string-append (car dirs) "/" name)))
             (if (and (file-exists? full)
-                     (with-catch (lambda (e) #f)
-                       (lambda () (not (eq? (file-info-type (file-info full)) 'directory)))))
+                     (not (file-directory? full)))
               full
               (loop (cdr dirs))))))))
 
 ;; Check if file is executable (by current user)
 (def (executable? path)
-  (with-catch
-   (lambda (e) #f)
-   (lambda ()
-     (and (not (eq? (file-info-type (file-info path)) 'directory))
-          (= (ffi-access path 1) 0)))))  ;; X_OK = 1
+  (and (not (file-directory? path))
+       (with-catch
+        (lambda (e) #f)
+        (lambda () (= (ffi-access path 1) 0)))))  ;; X_OK = 1
 
 ;; Return home directory
 (def (home-directory)
@@ -288,3 +286,46 @@
           ((< b #xE0) (loop (+ i 1) (+ count 1)))       ;; 2-byte lead
           ((< b #xF0) (loop (+ i 1) (+ count 1)))       ;; 3-byte lead
           (else        (loop (+ i 1) (+ count 1))))))))
+
+;;; --- File test helpers (for refactored builtins) ---
+
+;; Test if path is a regular file
+(def (file-regular? path)
+  (and (file-exists? path)
+       (with-catch
+        (lambda (e) #f)
+        (lambda () (eq? (file-info-type (file-info path)) 'regular)))))
+
+;; Test if path is a directory
+(def (file-directory? path)
+  (and (file-exists? path)
+       (with-catch
+        (lambda (e) #f)
+        (lambda () (eq? (file-info-type (file-info path)) 'directory)))))
+
+;; Test if path is a symbolic link (don't follow symlinks)
+(def (file-symlink? path)
+  (with-catch
+   (lambda (e) #f)
+   (lambda () (eq? (file-info-type (file-info path #f)) 'symbolic-link))))
+
+;; Test if path exists and is non-empty
+(def (file-nonempty? path)
+  (and (file-exists? path)
+       (with-catch
+        (lambda (e) #f)
+        (lambda () (> (file-info-size (file-info path)) 0)))))
+
+;; Test if path is readable
+(def (file-readable? path)
+  (with-catch
+   (lambda (e) #f)
+   (lambda () (= (ffi-access path 4) 0))))  ;; R_OK = 4
+
+;; Test if path is writable
+(def (file-writable? path)
+  (with-catch
+   (lambda (e) #f)
+   (lambda () (= (ffi-access path 2) 0))))  ;; W_OK = 2
+
+;; Note: file-executable? is already defined above as executable?

@@ -4,7 +4,8 @@
 (import :std/pregexp
         :std/sort
         :std/sugar
-        :std/iter)
+        :std/iter
+        :gsh/util)
 
 ;;; --- Public interface ---
 
@@ -477,10 +478,7 @@
 
 ;; Check if path is a directory
 (def (directory-exists? path)
-  (with-catch
-   (lambda (e) #f)
-   (lambda ()
-     (eq? (file-info-type (file-info path)) 'directory))))
+  (file-directory? path))
 
 ;;; --- GLOBIGNORE filtering ---
 

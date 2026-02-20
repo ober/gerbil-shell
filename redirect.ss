@@ -12,7 +12,8 @@
         :gsh/ast
         :gsh/ffi
         :gsh/environment
-        :gsh/expander)
+        :gsh/expander
+        :gsh/util)
 
 ;;; --- O_* flags for ffi-open-raw ---
 (def O_RDONLY   0)
@@ -153,8 +154,7 @@
        (let ((save (save-fd fd)))
          ;; Check noclobber — only block regular files (not /dev/null etc.)
          (when (and (env-option? env "noclobber")
-                    (file-exists? target-str)
-                    (eq? (file-info-type (file-info target-str)) 'regular))
+                    (file-regular? target-str))
            (fprintf (current-error-port) "gsh: ~a: cannot overwrite existing file~n" target-str)
            (restore-single! save)
            (error "cannot overwrite existing file"))

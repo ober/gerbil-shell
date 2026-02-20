@@ -16,30 +16,12 @@
         :gsh/jobs
         :gsh/signals
         :gsh/history
-        :gsh/util)
-
-;;; --- Built-in registry ---
-
-(def *builtins* (make-hash-table))
+        :gsh/util
+        :gsh/registry
+        :gsh/macros)
 
 ;; Parameter for execute-external — set from executor.ss to break circular dep
 (def *execute-external-fn* (make-parameter #f))
-
-;; Register a built-in command
-(def (builtin-register! name handler)
-  (hash-put! *builtins* name handler))
-
-;; Look up a built-in by name
-(def (builtin-lookup name)
-  (hash-get *builtins* name))
-
-;; List all built-in names
-(def (builtin-list)
-  (sort! (hash-keys *builtins*) string<?))
-
-;; Check if a name is a built-in
-(def (builtin? name)
-  (and (builtin-lookup name) #t))
 
 ;;; --- Pipeline-safe I/O helpers ---
 ;;; Gambit character ports opened via /dev/fd/N don't properly detect EOF
@@ -66,22 +48,19 @@
 
 ;;; --- Built-in implementations ---
 ;;; Each handler: (lambda (args env) -> exit-status)
+;;; Using defbuiltin macro from :gsh/macros for cleaner syntax
 
 ;; : (colon) — no-op, always succeeds
-(builtin-register! ":"
-  (lambda (args env) 0))
+(defbuiltin ":" 0)
 
 ;; true
-(builtin-register! "true"
-  (lambda (args env) 0))
+(defbuiltin "true" 0)
 
 ;; false
-(builtin-register! "false"
-  (lambda (args env) 1))
+(defbuiltin "false" 1)
 
 ;; echo [-neE] [args...]
-(builtin-register! "echo"
-  (lambda (args env)
+(defbuiltin "echo"
     ;; Parse echo flags: -n, -e, -E, or combinations like -en, -neE
     (let loop ((args args) (newline? #t) (escape? #f))
       (if (and (pair? args)
@@ -121,11 +100,10 @@
                (arg-loop (cdr rest) #f)))
            (when newline? (newline))
            (force-output)
-           0))))))
+           0)))))
 
 ;; printf [-v var] format [args...]
-(builtin-register! "printf"
-  (lambda (args env)
+(defbuiltin "printf"
     (if (null? args)
       (begin (fprintf (current-error-port) "printf: usage: printf [-v var] format [arguments]~n") 2)
       ;; Parse -v option and --
@@ -168,7 +146,7 @@
                    (begin (write-subu8vector output 0 (u8vector-length output)
                                              (current-output-port))
                           (force-output)
-                          (if (*printf-conversion-error*) 1 0))))))))))))
+                          (if (*printf-conversion-error*) 1 0)))))))))))
 
 ;; Helper: strip trailing slash (except for root /)
 (def (strip-trailing-slash path)
@@ -228,8 +206,7 @@
               (loop (cdr dirs)))))))))
 
 ;; cd [-L|-P] [--] [dir]
-(builtin-register! "cd"
-  (lambda (args env)
+(defbuiltin "cd"
     ;; Parse options
     (let loop ((rest args) (physical? #f))
       (cond
@@ -314,11 +291,10 @@
          (loop (cdr rest) #t))
         ;; Unknown option - treat as dir
         (else
-         (loop (cons "--" rest) physical?))))))
+         (loop (cons "--" rest) physical?)))))
 
 ;; pwd [-L|-P]
-(builtin-register! "pwd"
-  (lambda (args env)
+(defbuiltin "pwd"
     (let ((physical? (and (pair? args) (string=? (car args) "-P"))))
       (displayln (strip-trailing-slash
                   (if physical?
@@ -326,11 +302,10 @@
                     ;; Logical mode: use internal tracked PWD (not $PWD which user can override)
                     (or (*internal-pwd*)
                         (strip-trailing-slash (current-directory)))))))
-    0))
+    0)
 
 ;; export [name[=value] ...]
-(builtin-register! "export"
-  (lambda (args env)
+(defbuiltin "export"
     ;; Parse flags: -p, -n
     (let ((print? #f) (remove? #f) (names []))
       (let loop ((args args))
@@ -400,11 +375,10 @@
                         (ffi-unsetenv arg)))
                     (env-export! env arg)))))
             names)
-           status))))))
+           status)))))
 
 ;; unset [-fvn] name ...
-(builtin-register! "unset"
-  (lambda (args env)
+(defbuiltin "unset"
     (let loop ((args args) (unset-func? #f) (unset-nameref? #f))
       (cond
         ((null? args) 0)
@@ -462,11 +436,10 @@
                               (env-unset! env name)
                               (function-unset! env name)))))))))))
             args)
-           status))))))
+           status)))))
 
 ;; readonly [-aAp] [name[=value] ...]
-(builtin-register! "readonly"
-  (lambda (args env)
+(defbuiltin "readonly"
     ;; Parse flags
     (let ((print? #f) (array? #f) (assoc? #f) (names []))
       (let loop ((args args))
@@ -584,11 +557,10 @@
                                 (if (or array? assoc?) (make-hash-table) +unset-sentinel+)
                                 #f #t #t #f #f #f #f array? assoc?)))))))
           names)
-         0)))))
+         0))))
 
 ;; exit [n]
-(builtin-register! "exit"
-  (lambda (args env)
+(defbuiltin "exit"
     (if (and (pair? args) (pair? (cdr args)))
       ;; Too many arguments → fatal error
       (begin
@@ -621,11 +593,10 @@
                   (when exec-fn
                     (exec-fn exit-trap env)))))
             (history-save!)
-            (exit code)))))))
+            (exit code))))))
 
 ;; return [n]
-(builtin-register! "return"
-  (lambda (args env)
+(defbuiltin "return"
     (let ((code (if (pair? args)
                   (let ((n (string->number (car args))))
                     (cond
@@ -640,11 +611,10 @@
                        1)
                       (else (bitwise-and n #xFF))))
                   (shell-environment-last-status env))))
-      (shell-return! code))))
+      (shell-return! code)))
 
 ;; break [n]
-(builtin-register! "break"
-  (lambda (args env)
+(defbuiltin "break"
     (cond
       ;; Too many arguments — special builtin error is fatal (bash: exit 1)
       ((> (length args) 1)
@@ -666,11 +636,10 @@
             (env-set-last-status! env 1)
             (shell-break! 1))
            (else (shell-break! n)))))
-      (else (shell-break! 1)))))
+      (else (shell-break! 1))))
 
 ;; continue [n]
-(builtin-register! "continue"
-  (lambda (args env)
+(defbuiltin "continue"
     (cond
       ;; Too many arguments — special builtin error is fatal (bash: exit 1)
       ((> (length args) 1)
@@ -692,11 +661,10 @@
             (env-set-last-status! env 1)
             (shell-continue! 1))
            (else (shell-continue! n)))))
-      (else (shell-continue! 1)))))
+      (else (shell-continue! 1))))
 
 ;; set [options] [-- args...]
-(builtin-register! "set"
-  (lambda (args env)
+(defbuiltin "set"
     (if (null? args)
       ;; No args: display all variables in re-evaluable format
       (begin
@@ -756,7 +724,7 @@
           (else
            ;; Positional parameters
            (env-set-positional! env args)
-           0))))))
+           0)))))
 
 (def (shell-quote-value val)
   ;; Check if value needs any quoting at all
@@ -806,8 +774,7 @@
 
 
 ;; shift [n]
-(builtin-register! "shift"
-  (lambda (args env)
+(defbuiltin "shift"
     (if (pair? args)
       (let ((n (string->number (car args))))
         (cond
@@ -829,11 +796,10 @@
           1
           (begin
             (env-set-positional! env (list-tail pos 1))
-            0))))))
+            0)))))
 
 ;; eval [args...]
-(builtin-register! "eval"
-  (lambda (args env)
+(defbuiltin "eval"
     ;; Skip leading -- (eval accepts/ignores it)
     (let ((args (if (and (pair? args) (string=? (car args) "--"))
                   (cdr args)
@@ -854,17 +820,15 @@
              (exec-fn input env)
              (begin
                (fprintf (current-error-port) "gsh: eval: executor not initialized~n")
-               1))))))))
+               1)))))))
 
 ;; test / [ — conditional expressions
-(builtin-register! "test"
-  (lambda (args env)
+(defbuiltin "test"
     (parameterize ((*test-var-fn* (lambda (name) (env-get env name)))
                    (*test-option-fn* (lambda (name) (env-option? env name))))
-      (test-eval args))))
+      (test-eval args)))
 
-(builtin-register! "["
-  (lambda (args env)
+(defbuiltin "["
     (if (and (pair? args)
              (string=? (last-elem* args) "]"))
       (let ((inner (butlast args)))
@@ -875,11 +839,10 @@
            (lambda () (test-eval inner)))))
       (begin
         (fprintf (current-error-port) "[: missing `]'~n")
-        2))))
+        2)))
 
 ;; type [-afptP] name...
-(builtin-register! "type"
-  (lambda (args env)
+(defbuiltin "type"
     ;; Parse flags
     (let parse-flags ((args args) (flags []))
       (if (and (pair? args) (> (string-length (car args)) 0)
@@ -918,7 +881,7 @@
                 ;; Not found — output to stderr
                 (else
                  (fprintf (current-error-port) "~a: not found~n" name)
-                 (loop (cdr args) 1))))))))))
+                 (loop (cdr args) 1)))))))))
 
 (def (shell-keyword? name)
   (member name '("if" "then" "else" "elif" "fi" "case" "esac" "for" "while"
@@ -933,8 +896,7 @@
        (builtin? name)))
 
 ;; command [-pvV] cmd [args...]
-(builtin-register! "command"
-  (lambda (args env)
+(defbuiltin "command"
     (cond
       ((null? args) 0)
       ((string=? (car args) "-v")
@@ -976,12 +938,11 @@
                (exec-ext cmd-name cmd-args env)
                (begin
                  (fprintf (current-error-port) "gsh: ~a: command not found~n" cmd-name)
-                 127)))))))))
+                 127))))))))
 
 ;; builtin name [args...]
 ;; Execute a shell builtin, bypassing function lookup
-(builtin-register! "builtin"
-  (lambda (args env)
+(defbuiltin "builtin"
     (if (null? args)
       0
       (let ((handler (builtin-lookup (car args))))
@@ -989,11 +950,10 @@
           (handler (cdr args) env)
           (begin
             (fprintf (current-error-port) "gsh: builtin: ~a: not a shell builtin~n" (car args))
-            1))))))
+            1)))))
 
 ;; alias [name[=value] ...]
-(builtin-register! "alias"
-  (lambda (args env)
+(defbuiltin "alias"
     (if (null? args)
       ;; List all aliases
       (begin
@@ -1016,21 +976,19 @@
                    (displayln (format "alias ~a='~a'" arg val))
                    (fprintf (current-error-port) "alias: ~a: not found~n" arg))))))
          args)
-        0))))
+        0)))
 
 ;; unalias [-a] name...
-(builtin-register! "unalias"
-  (lambda (args env)
+(defbuiltin "unalias"
     (cond
       ((and (pair? args) (string=? (car args) "-a"))
        (alias-clear! env) 0)
       (else
        (for-each (lambda (name) (alias-unset! env name)) args)
-       0))))
+       0)))
 
 ;; read [-r] [-p prompt] [-t timeout] [-d delim] [-n count] [-N count] [-s] [-a arr] [-u fd] var...
-(builtin-register! "read"
-  (lambda (args env)
+(defbuiltin "read"
     (let loop ((args args) (raw? #f) (silent? #f) (prompt "")
                (nchars #f) (nchars-raw? #f) (delim #f) (timeout #f)
                (fd #f) (array-name #f) (vars []))
@@ -1440,7 +1398,7 @@
                     2)))))))
         (else
          (loop (cdr args) raw? silent? prompt nchars nchars-raw?
-               delim timeout fd array-name (cons (car args) vars)))))))
+               delim timeout fd array-name (cons (car args) vars))))))
 
 ;; Strip backslashes in non-raw read mode
 ;; In read without -r, backslash-char becomes just char (backslash removed)
@@ -1769,8 +1727,7 @@
       s1)))
 
 ;; trap ['command'] [signal ...]
-(builtin-register! "trap"
-  (lambda (args env)
+(defbuiltin "trap"
     ;; Helper: print a trap entry with canonical signal display name
     (def (print-trap short-name action)
       (let ((display-name (signal-display-name short-name)))
@@ -1878,11 +1835,10 @@
            status)
          ;; Normal case: first arg is action, rest are signals
          (trap-set-action (car args) (cdr args))))
-      (else 0))))
+      (else 0)))
 
 ;; jobs [-lnprs]
-(builtin-register! "jobs"
-  (lambda (args env)
+(defbuiltin "jobs"
     (job-update-status!)
     (let ((print-pids? (and (pair? args) (string=? (car args) "-p"))))
       (for-each
@@ -1901,11 +1857,10 @@
        (job-table-list))
       ;; Clean up completed jobs after listing
       (job-table-cleanup!)
-      0)))
+      0))
 
 ;; fg [jobspec]
-(builtin-register! "fg"
-  (lambda (args env)
+(defbuiltin "fg"
     (let ((spec (if (pair? args) (car args) "%%")))
       (let ((job (job-table-get spec)))
         (if job
@@ -1914,11 +1869,10 @@
             (job-foreground! job))
           (begin
             (fprintf (current-error-port) "fg: ~a: no such job~n" spec)
-            1))))))
+            1)))))
 
 ;; bg [jobspec...]
-(builtin-register! "bg"
-  (lambda (args env)
+(defbuiltin "bg"
     (let ((specs (if (null? args) ["%%"] args)))
       (for-each
        (lambda (spec)
@@ -1927,11 +1881,10 @@
              (job-background! job)
              (fprintf (current-error-port) "bg: ~a: no such job~n" spec))))
        specs)
-      0)))
+      0))
 
 ;; wait [id...]
-(builtin-register! "wait"
-  (lambda (args env)
+(defbuiltin "wait"
     (let ((result
            (cond
              ;; wait with no args - wait for all background jobs
@@ -1982,11 +1935,10 @@
                          (loop (cdr args) 127)))))))))))
       ;; Clean up completed jobs
       (job-table-cleanup!)
-      result)))
+      result))
 
 ;; kill [-signal] pid|jobspec
-(builtin-register! "kill"
-  (lambda (args env)
+(defbuiltin "kill"
     (if (null? args)
       (begin
         (fprintf (current-error-port) "kill: usage: kill [-signal] pid|jobspec~n")
@@ -2024,11 +1976,10 @@
              ;; handler thread time to run so the trap can fire promptly
              (when sent-to-self?
                (thread-sleep! 0.001))
-             0)))))))
+             0))))))
 
 ;; history [n]
-(builtin-register! "history"
-  (lambda (args env)
+(defbuiltin "history"
     (cond
       ;; Too many arguments
       ((and (pair? args) (pair? (cdr args)))
@@ -2055,11 +2006,10 @@
            (when (pair? entries)
              (displayln (format "  ~a  ~a" num (car entries)))
              (loop (cdr entries) (+ num 1))))
-         0)))))
+         0))))
 
 ;; local [-n] [-i] [-r] [-x] var[=value] ...
-(builtin-register! "local"
-  (lambda (args env)
+(defbuiltin "local"
     ;; Handle local -p: print local vars in declare format
     (if (and (pair? args) (string=? (car args) "-p"))
       (let ((specific-names (cdr args)))
@@ -2203,7 +2153,7 @@
                                                 effective-export? readonly? #t
                                                 integer? #f #f nameref? array? assoc?)))))))
             args)
-           0))))))))
+           0)))))))
 
 ;; declare/typeset [-aAfFgilnrtux] [-p] [name[=value] ...]
 ;; Parse compound array elements from the content inside (...).
@@ -2717,30 +2667,26 @@
 ;; Continuation for early return from declare
 (def return-from-declare (make-parameter #f))
 
-(builtin-register! "declare"
-  (lambda (args env)
+(defbuiltin "declare"
     (let/cc return
       (parameterize ((return-from-declare return))
-        (builtin-declare args env)))))
+        (builtin-declare args env))))
 
-(builtin-register! "typeset"
-  (lambda (args env)
+(defbuiltin "typeset"
     (let/cc return
       (parameterize ((return-from-declare return))
-        (builtin-declare args env)))))
+        (builtin-declare args env))))
 
 ;; let expr...
-(builtin-register! "let"
-  (lambda (args env)
+(defbuiltin "let"
     (let loop ((args args) (result 0))
       (if (null? args)
         (if (= result 0) 1 0)  ;; let returns 1 if last expr is 0
         (let ((val (arith-eval-wrapper (car args) env)))
-          (loop (cdr args) val))))))
+          (loop (cdr args) val)))))
 
 ;; shopt [-su] [optname...]
-(builtin-register! "shopt"
-  (lambda (args env)
+(defbuiltin "shopt"
     (cond
       ((null? args)
        ;; List all shopts
@@ -2751,11 +2697,10 @@
       ((string=? (car args) "-u")
        (for-each (lambda (name) (env-shopt-set! env name #f)) (cdr args))
        0)
-      (else 0))))
+      (else 0)))
 
 ;; help [pattern]
-(builtin-register! "help"
-  (lambda (args env)
+(defbuiltin "help"
     (if (null? args)
       (begin
         (displayln "gsh - Gerbil Shell")
@@ -2763,11 +2708,10 @@
         (for-each (lambda (name) (display "  ") (displayln name))
                   (builtin-list))
         0)
-      0)))
+      0))
 
 ;; umask [-S] [mode]
-(builtin-register! "umask"
-  (lambda (args env)
+(defbuiltin "umask"
     (if (null? args)
       ;; Display current umask
       (let ((mask (ffi-umask 0)))
@@ -2778,7 +2722,7 @@
       (let ((mode (string->number (car args) 8)))
         (if mode
           (begin (ffi-umask mode) 0)
-          (begin (fprintf (current-error-port) "umask: ~a: invalid octal number~n" (car args)) 1))))))
+          (begin (fprintf (current-error-port) "umask: ~a: invalid octal number~n" (car args)) 1)))))
 
 ;; ulimit [-SHa] [-cdefilmnpqrstuvx] [limit]
 ;; Resource limit management
@@ -2804,8 +2748,7 @@
     (#\e "scheduling priority             (-e)" 13 1)
     (#\p "pipe size            (512 bytes, -p)" #f 1)))  ;; pipe size is read-only
 
-(builtin-register! "ulimit"
-  (lambda (args env)
+(defbuiltin "ulimit"
     (let ((soft? #f) (hard? #f) (show-all? #f)
           (resource-flag #f) (value #f) (explicit-sh? #f))
       ;; Parse args
@@ -2920,17 +2863,15 @@
                2)
              (begin
                (set! value (car rest))
-               (loop (cdr rest) seen-resource)))))))))
+               (loop (cdr rest) seen-resource))))))))
 
 ;; dirs [-clpv]
-(builtin-register! "dirs"
-  (lambda (args env)
+(defbuiltin "dirs"
     (for-each displayln (cons (current-directory) (shell-environment-dir-stack env)))
-    0))
+    0)
 
 ;; pushd [dir]
-(builtin-register! "pushd"
-  (lambda (args env)
+(defbuiltin "pushd"
     (let ((dir (if (pair? args) (car args)
                    ;; Swap top two
                    (if (pair? (shell-environment-dir-stack env))
@@ -2956,11 +2897,10 @@
                        (shell-environment-dir-stack env))
              (newline)
              0)))
-        1))))
+        1)))
 
 ;; popd [+N|-N]
-(builtin-register! "popd"
-  (lambda (args env)
+(defbuiltin "popd"
     (let ((stack (shell-environment-dir-stack env)))
       (if (null? stack)
         (begin (fprintf (current-error-port) "popd: directory stack empty~n") 1)
@@ -2975,7 +2915,7 @@
           (for-each (lambda (d) (display " ") (display d))
                     (shell-environment-dir-stack env))
           (newline)
-          0)))))
+          0))))
 
 ;; mapfile [-d delim] [-n count] [-O origin] [-s count] [-t] [array]
 ;; readarray is an alias for mapfile
@@ -3191,20 +3131,13 @@
     ((-z) (if (= (string-length arg) 0) 0 1))
     ((-n) (if (> (string-length arg) 0) 0 1))
     ((-e -a) (if (file-exists? arg) 0 1))  ;; -a as unary is alias for -e
-    ((-f) (if (and (file-exists? arg)
-                    (eq? (file-info-type (file-info arg)) 'regular)) 0 1))
-    ((-d) (if (and (file-exists? arg)
-                    (eq? (file-info-type (file-info arg)) 'directory)) 0 1))
-    ((-r) (if (= (ffi-access arg 4) 0) 0 1))  ;; R_OK = 4
-    ((-w) (if (= (ffi-access arg 2) 0) 0 1))  ;; W_OK = 2
+    ((-f) (if (file-regular? arg) 0 1))
+    ((-d) (if (file-directory? arg) 0 1))
+    ((-r) (if (file-readable? arg) 0 1))
+    ((-w) (if (file-writable? arg) 0 1))
     ((-x) (if (= (ffi-access arg 1) 0) 0 1))  ;; X_OK = 1
-    ((-s) (if (and (file-exists? arg)
-                    (> (file-info-size (file-info arg)) 0)) 0 1))
-    ((-L -h) ;; Symlink: use file-info with #f to not follow symlinks
-     (with-catch (lambda (e) 1)
-       (lambda ()
-         (let ((fi (file-info arg #f)))
-           (if (eq? (file-info-type fi) 'symbolic-link) 0 1)))))
+    ((-s) (if (file-nonempty? arg) 0 1))
+    ((-L -h) (if (file-symlink? arg) 0 1))
     ((-t) (let ((fd (string->number arg)))
              (if (not fd) 2  ;; invalid fd → exit 2
                (if (= (ffi-isatty fd) 1) 0 1))))

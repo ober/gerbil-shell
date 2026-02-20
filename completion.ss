@@ -7,6 +7,7 @@
         :std/sort
         :gsh/util
         :gsh/environment
+        :gsh/registry
         :gsh/builtins
         :gsh/functions
         :gsh/glob)
@@ -359,10 +360,7 @@
   (string-split-chars path-str #\:))
 
 (def (directory? path)
-  (with-catch
-   (lambda (e) #f)
-   (lambda ()
-     (eq? (file-info-type (file-info path)) 'directory))))
+  (file-directory? path))
 
 (def (env-var-names env)
   ;; Get all variable names from the environment

@@ -14,6 +14,8 @@
     "pipeline"
     "signals"
     "jobs"
+    "registry"
+    "macros"
     "builtins"
     "functions"
     "control"
