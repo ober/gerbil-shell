@@ -205,8 +205,13 @@
          (buf (line-state-buffer state))
          (cursor (line-state-cursor state))
          (pwidth (line-state-prompt-width state))
-         (cols (line-state-columns state)))
-    ;; Move to start of line, clear, redraw
+         (cols (line-state-columns state))
+         ;; Count newlines in prompt to handle multi-line prompts
+         (prompt-lines (count-newlines prompt)))
+    ;; Move to start of prompt (handle multi-line prompts)
+    ;; Move up by number of newlines in prompt, then carriage return
+    (when (> prompt-lines 0)
+      (term-move-up prompt-lines port))
     (display "\r" port)
     (display prompt port)
     (display buf port)
@@ -1079,3 +1084,14 @@
            (loop (+ i 1) width #t)))
         (else
          (loop (+ i 1) (+ width 1) #f))))))
+
+(def (count-newlines str)
+  ;; Count number of newline characters in string
+  (let ((len (string-length str)))
+    (let loop ((i 0) (count 0))
+      (cond
+        ((>= i len) count)
+        ((char=? (string-ref str i) #\newline)
+         (loop (+ i 1) (+ count 1)))
+        (else
+         (loop (+ i 1) count))))))
