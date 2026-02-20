@@ -187,6 +187,10 @@
       ;; seeing EOF (causes hangs in nested pipelines).
       (when true-stdin (ffi-dup2 true-stdin 0) (ffi-close-fd true-stdin))
       (when true-stdout (ffi-dup2 true-stdout 1) (ffi-close-fd true-stdout))
+      ;; CRITICAL: Also close the outer-in/outer-out fds passed from command substitution
+      ;; to prevent dangling references to the capture pipe write-end
+      (when outer-in (ffi-close-fd outer-in))
+      (when outer-out (ffi-close-fd outer-out))
       (current-input-port saved-stdin-port)
       (current-output-port saved-stdout-port)
       (current-error-port saved-stderr-port)
