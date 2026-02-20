@@ -313,9 +313,27 @@
    (lambda (proc)
      (cond
        ((port? proc)
-        (let ((raw-status (process-status proc)))
-          (close-port proc)
-          (status->exit-code raw-status)))
+        ;; Use ffi-waitpid polling instead of Gambit's process-status.
+        ;; process-status hangs when the child exits before the event condvar
+        ;; is polled (lost SIGCHLD wakeup in Gambit's I/O system).
+        (let ((pid (process-pid proc)))
+          (let loop ((delay 0.001))
+            (let ((result (ffi-waitpid-pid pid WNOHANG)))
+              (cond
+                ((> result 0)
+                 ;; Process exited — get status
+                 (let ((raw (ffi-waitpid-status)))
+                   (close-port proc)
+                   (status->exit-code raw)))
+                ((= result 0)
+                 ;; Still running — sleep and poll again
+                 (thread-sleep! delay)
+                 (loop (min 0.05 (* delay 1.5))))
+                (else
+                 ;; ECHILD — Gambit already reaped it, fall back to process-status
+                 (let ((raw-status (process-status proc)))
+                   (close-port proc)
+                   (status->exit-code raw-status))))))))
        ((and (list? proc) (eq? (car proc) 'direct))
         ;; lastpipe: already executed directly, return stored status
         (cadr proc))

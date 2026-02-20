@@ -256,7 +256,7 @@
                                                (ffi-close-fd saved-stdin)
                                                "")
                                              (lambda ()
-                                               (let ((null-fd (ffi-open-raw "/dev/null" 0)))
+                                               (let ((null-fd (ffi-open-raw "/dev/null" 0 0)))
                                                  (ffi-dup2 null-fd 0)
                                                  (ffi-close-fd null-fd)
                                                  (let ((result (command-substitute cmd env)))
