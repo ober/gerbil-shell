@@ -22,7 +22,7 @@
                     (cmd-exec-fn #f))
   (let ((len (string-length ps-string))
         (out (open-output-string)))
-    (let loop ((i 0) (in-non-printing? #f))
+    (let loop ((i 0))
       (cond
         ((>= i len)
          (get-output-string out))
@@ -38,11 +38,11 @@
                              (lambda (e) "")  ;; Silently ignore errors in prompt commands
                              (lambda () (cmd-exec-fn cmd-str)))))
                (display output out)
-               (loop (+ close 1) in-non-printing?))
+               (loop (+ close 1)))
              ;; No matching ) - output literally
              (begin
                (display "$(" out)
-               (loop (+ i 2) in-non-printing?)))))
+               (loop (+ i 2))))))
         ;; Backslash escape sequence
         ((and (char=? (string-ref ps-string i) #\\)
               (< (+ i 1) len))
@@ -51,7 +51,7 @@
              ;; Username
              ((#\u)
               (display (or (env-get "USER") (user-name)) out)
-              (loop (+ i 2) in-non-printing?))
+              (loop (+ i 2)))
              ;; Hostname (short)
              ((#\h)
               (let* ((host (or (env-get "HOSTNAME")
@@ -59,14 +59,14 @@
                                           (lambda () (hostname-short)))))
                      (dot (string-index host #\.)))
                 (display (if dot (substring host 0 dot) host) out)
-                (loop (+ i 2) in-non-printing?)))
+                (loop (+ i 2))))
              ;; Hostname (full)
              ((#\H)
               (display (or (env-get "HOSTNAME")
                           (with-catch (lambda (e) "localhost")
                                       (lambda () (hostname-short))))
                        out)
-              (loop (+ i 2) in-non-printing?))
+              (loop (+ i 2)))
              ;; Working directory with ~ for home
              ((#\w)
               (let* ((pwd (or (env-get "PWD") (current-directory)))
@@ -77,7 +77,7 @@
                                                                   (string-length pwd)))
                                    pwd)))
                 (display display-pwd out)
-                (loop (+ i 2) in-non-printing?)))
+                (loop (+ i 2))))
              ;; Basename of working directory
              ((#\W)
               (let* ((pwd (or (env-get "PWD") (current-directory)))
@@ -85,86 +85,67 @@
                 (if (string=? pwd home)
                   (display "~" out)
                   (display (path-basename pwd) out))
-                (loop (+ i 2) in-non-printing?)))
+                (loop (+ i 2))))
              ;; Date
              ((#\d)
               ;; Simplified: just show date
               (display (date-string) out)
-              (loop (+ i 2) in-non-printing?))
+              (loop (+ i 2)))
              ;; Time formats
              ((#\t)  ;; 24h HH:MM:SS
               (display (time-string-24h) out)
-              (loop (+ i 2) in-non-printing?))
+              (loop (+ i 2)))
              ((#\T)  ;; 12h HH:MM:SS
               (display (time-string-12h) out)
-              (loop (+ i 2) in-non-printing?))
+              (loop (+ i 2)))
              ((#\@)  ;; 12h am/pm
               (display (time-string-ampm) out)
-              (loop (+ i 2) in-non-printing?))
+              (loop (+ i 2)))
              ((#\A)  ;; 24h HH:MM
               (display (time-string-hhmm) out)
-              (loop (+ i 2) in-non-printing?))
+              (loop (+ i 2)))
              ;; Newline / carriage return
-             ((#\n) (display "\n" out) (loop (+ i 2) in-non-printing?))
-             ((#\r) (display "\r" out) (loop (+ i 2) in-non-printing?))
+             ((#\n) (display "\n" out) (loop (+ i 2)))
+             ((#\r) (display "\r" out) (loop (+ i 2)))
              ;; Shell name
              ((#\s)
               (display "gsh" out)
-              (loop (+ i 2) in-non-printing?))
+              (loop (+ i 2)))
              ;; Shell version
              ((#\v)
               (display "0.1" out)
-              (loop (+ i 2) in-non-printing?))
+              (loop (+ i 2)))
              ((#\V)
               (display "0.1.0" out)
-              (loop (+ i 2) in-non-printing?))
+              (loop (+ i 2)))
              ;; Number of jobs
              ((#\j)
               (display (number->string job-count) out)
-              (loop (+ i 2) in-non-printing?))
+              (loop (+ i 2)))
              ;; Terminal basename
              ((#\l)
               (display "tty" out)
-              (loop (+ i 2) in-non-printing?))
+              (loop (+ i 2)))
              ;; Command number
              ((#\#)
               (display (number->string cmd-number) out)
-              (loop (+ i 2) in-non-printing?))
+              (loop (+ i 2)))
              ;; History number
              ((#\!)
               (display (number->string history-number) out)
-              (loop (+ i 2) in-non-printing?))
+              (loop (+ i 2)))
              ;; $ or # (root check)
              ((#\$)
               (display (if (= (ffi-geteuid) 0) "#" "$") out)
-              (loop (+ i 2) in-non-printing?))
-             ;; Non-printing delimiters
-             ((#\[)
-              (loop (+ i 2) #t))
-             ((#\])
-              (loop (+ i 2) #f))
+              (loop (+ i 2)))
              ;; Bell
              ((#\a)
               (display "\007" out)
-              (loop (+ i 2) in-non-printing?))
-             ;; Escape
-             ((#\e)
-              (display "\033" out)
-              (loop (+ i 2) in-non-printing?))
+              (loop (+ i 2)))
              ;; Literal backslash
              ((#\\)
               (display "\\" out)
-              (loop (+ i 2) in-non-printing?))
-             ;; Octal character \0nnn
-             ((#\0)
-              (let-values (((ch-val end) (read-octal ps-string (+ i 2))))
-                (display (string (integer->char ch-val)) out)
-                (loop end in-non-printing?)))
-             ;; Hex character \xNN
-             ((#\x)
-              (let-values (((ch-val end) (read-hex ps-string (+ i 2))))
-                (display (string (integer->char ch-val)) out)
-                (loop end in-non-printing?)))
+              (loop (+ i 2)))
              ;; strftime format \D{format}
              ((#\D)
               (if (and (< (+ i 2) len) (char=? (string-ref ps-string (+ i 2)) #\{))
@@ -173,22 +154,22 @@
                     (begin
                       ;; Simplified: just show ISO date
                       (display (date-string) out)
-                      (loop (+ close 1) in-non-printing?))
+                      (loop (+ close 1)))
                     (begin
                       (display "\\D" out)
-                      (loop (+ i 2) in-non-printing?))))
+                      (loop (+ i 2)))))
                 (begin
                   (display "\\D" out)
-                  (loop (+ i 2) in-non-printing?))))
+                  (loop (+ i 2)))))
              ;; Unknown escape: output literally
              (else
               (display "\\" out)
               (display (string ch) out)
-              (loop (+ i 2) in-non-printing?)))))
+              (loop (+ i 2))))))
         ;; Regular character
         (else
          (display (string (string-ref ps-string i)) out)
-         (loop (+ i 1) in-non-printing?))))))
+         (loop (+ i 1)))))))
 
 ;; Calculate visible width of a prompt (excluding \[...\] non-printing sequences)
 (def (prompt-width prompt-string)
@@ -283,33 +264,3 @@
       ((char=? (string-ref str i) ch) i)
       (else (loop (+ i 1))))))
 
-(def (read-octal str start)
-  (let loop ((i start) (val 0) (count 0))
-    (if (and (< i (string-length str))
-             (< count 3)
-             (let ((ch (string-ref str i)))
-               (and (char>=? ch #\0) (char<=? ch #\7))))
-      (loop (+ i 1)
-            (+ (* val 8) (- (char->integer (string-ref str i)) (char->integer #\0)))
-            (+ count 1))
-      (values (if (= count 0) 0 val) i))))
-
-(def (read-hex str start)
-  (let loop ((i start) (val 0) (count 0))
-    (if (and (< i (string-length str))
-             (< count 2)
-             (hex-char? (string-ref str i)))
-      (loop (+ i 1)
-            (+ (* val 16) (hex-value (string-ref str i)))
-            (+ count 1))
-      (values (if (= count 0) 0 val) i))))
-
-(def (hex-value ch)
-  (cond
-    ((and (char>=? ch #\0) (char<=? ch #\9))
-     (- (char->integer ch) (char->integer #\0)))
-    ((and (char>=? ch #\a) (char<=? ch #\f))
-     (+ 10 (- (char->integer ch) (char->integer #\a))))
-    ((and (char>=? ch #\A) (char<=? ch #\F))
-     (+ 10 (- (char->integer ch) (char->integer #\A))))
-    (else 0)))
