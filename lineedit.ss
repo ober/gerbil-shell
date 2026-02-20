@@ -121,7 +121,11 @@
   (set! *terminal-columns* cols))
 
 (def (detect-terminal-columns)
-  (ffi-terminal-columns 0))
+  (let ((cols (ffi-terminal-columns 0)))
+    ;; Fallback to 80 if detection fails
+    (if (or (not cols) (= cols 0))
+      80
+      cols)))
 
 ;;; --- Read input bytes ---
 
@@ -1020,8 +1024,8 @@
         (let ((line (read-line in-port)))
           (if (eof-object? line) 'eof line)))
       ;; Interactive: use line editor
-      (let ((cols (detect-terminal-columns))
-            (pw (visible-width-last-line prompt)))
+      (let* ((cols (detect-terminal-columns))
+             (pw (visible-width-last-line prompt)))
         (set-terminal-columns! cols)
         (let ((state (make-line-state
                       ""          ;; buffer
