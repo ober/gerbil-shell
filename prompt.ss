@@ -125,11 +125,11 @@
               (loop (+ i 2) #f))
              ;; Bell
              ((#\a)
-              (display "\x07;" out)
+              (display "\007" out)
               (loop (+ i 2) in-non-printing?))
              ;; Escape
              ((#\e)
-              (display "\x1b;" out)
+              (display "\033" out)
               (loop (+ i 2) in-non-printing?))
              ;; Literal backslash
              ((#\\)
