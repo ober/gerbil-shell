@@ -10,12 +10,12 @@
 
 ;;; --- Shell functions ---
 
-(defstruct shell-function (name body redirections) transparent: #t)
+(defstruct shell-function (name body redirections lineno source-file) transparent: #t)
 
 ;; Define a shell function
-(def (function-define! env name body (redirections []))
+(def (function-define! env name body (redirections []) (lineno #f) (source-file #f))
   (hash-put! (shell-environment-functions env) name
-             (make-shell-function name body redirections)))
+             (make-shell-function name body redirections lineno source-file)))
 
 ;; Look up a function by name
 (def (function-lookup env name)

@@ -673,7 +673,9 @@
   (function-define! env
                     (function-def-name cmd)
                     (function-def-body cmd)
-                    (function-def-redirections cmd))
+                    (function-def-redirections cmd)
+                    (function-def-lineno cmd)
+                    (*current-source-file*))
   0)
 
 ;;; --- [[ ]] conditional command ---

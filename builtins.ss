@@ -2322,8 +2322,12 @@
              (let ((func (hash-get (shell-environment-functions env) fname)))
                (if func
                  (if (eq? func-mode 'F)
-                   ;; declare -F name: just the name (no "declare -f" prefix)
-                   (displayln fname)
+                   ;; declare -F name: with extdebug, show line and file
+                   (if (env-shopt? env "extdebug")
+                     (let ((lineno (or (shell-function-lineno func) ""))
+                           (srcfile (or (shell-function-source-file func) "")))
+                       (displayln (format "~a ~a ~a" fname lineno srcfile)))
+                     (displayln fname))
                    (displayln (format "~a () { ... }" fname)))
                  (begin
                    (fprintf (current-error-port) "declare: ~a: not found~n" fname)
@@ -2677,7 +2681,7 @@
          (displayln ")")))
       (else
        (displayln (format "declare ~a ~a=~a" flag-str name
-                         (declare-quote-scalar (shell-var-scalar-value var))))))))
+                         (declare-quote-value (shell-var-scalar-value var))))))))
 
 ;; Continuation for early return from declare
 (def return-from-declare (make-parameter #f))

@@ -27,6 +27,9 @@
 ;;; Set from main.ss at startup.
 (def *process-traps-fn* (make-parameter #f))
 
+;;; --- Current source file tracking (for extdebug) ---
+(def *current-source-file* (make-parameter "main"))
+
 ;;; --- Condition context for errexit suppression ---
 ;;; When #t, errexit (set -e) does not trigger on command failure.
 ;;; Set to #t in: if-test, while/until-test, && / || LHS, ! prefix.

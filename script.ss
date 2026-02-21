@@ -91,7 +91,8 @@
          ;; Set LINENO tracking
          (env-set! script-env "LINENO" "0")
          ;; Execute the script content
-         (execute-string script-content script-env))))))
+         (parameterize ((*current-source-file* filename))
+           (execute-string script-content script-env)))))))
 
 ;; Source a file into the current environment (like bash's `source` or `.`)
 ;; Runs in the CURRENT environment, not a child.
@@ -118,7 +119,8 @@
      (lambda ()
        (let* ((content (read-file-to-string filename))
               (script-content (strip-shebang content)))
-         (execute-string script-content env))))))
+         (parameterize ((*current-source-file* filename))
+           (execute-string script-content env)))))))
 
 ;;; --- String execution ---
 
@@ -210,6 +212,9 @@
                             2 1)))))
                    (lambda ()
                      (execute-command cmd env)))))
+             ;; Flush stdout/stderr so builtin output appears before next command
+             (force-output (current-output-port))
+             (force-output (current-error-port))
              (env-set-last-status! env new-status)
              ;; Process pending signals between commands
              (process-pending-traps! env)
@@ -253,16 +258,16 @@
 ;;; --- Helpers ---
 
 (def (strip-shebang content)
-  ;; Remove #! line if present
+  ;; Replace #! line with blank line (preserves line numbering for extdebug)
   (if (and (>= (string-length content) 2)
            (char=? (string-ref content 0) #\#)
            (char=? (string-ref content 1) #\!))
-    ;; Find end of first line
+    ;; Find end of first line and replace with empty
     (let loop ((i 0))
       (cond
         ((>= i (string-length content)) "")
         ((char=? (string-ref content i) #\newline)
-         (substring content (+ i 1) (string-length content)))
+         (substring content i (string-length content)))
         (else (loop (+ i 1)))))
     content))
 

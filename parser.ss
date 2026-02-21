@@ -468,14 +468,16 @@
                 (begin
                   (parser-consume! ps)  ;; )
                   ;; This is a function definition
-                  (skip-newlines! ps)
-                  (let ((body (parse-command ps))
-                        (redirs (parse-redirect-list ps)))
-                    (return
-                     (make-function-def
-                      (car words)  ;; function name
-                      body
-                      redirs))))
+                  (let ((func-line (lexer-line (parser-state-lexer ps))))
+                    (skip-newlines! ps)
+                    (let ((body (parse-command ps))
+                          (redirs (parse-redirect-list ps)))
+                      (return
+                       (make-function-def
+                        (car words)  ;; function name
+                        body
+                        redirs
+                        func-line)))))  ;; line number
                 ;; Bare ( after command word is a syntax error (bash behavior)
                 (error (string-append "parse error near unexpected token `('"))))
             ;; Parse suffix: more words and redirections
@@ -1154,10 +1156,11 @@
       (unless (parser-check? ps 'RPAREN)
         (error "parse error: expected ')' after '(' in function definition"))
       (parser-consume! ps))
-    (skip-newlines! ps)
-    (let ((body (parse-command ps))
-          (redirs (parse-redirect-list ps)))
-      (make-function-def (token-value name-tok) body redirs))))
+    (let ((func-line (lexer-line (parser-state-lexer ps))))
+      (skip-newlines! ps)
+      (let ((body (parse-command ps))
+            (redirs (parse-redirect-list ps)))
+        (make-function-def (token-value name-tok) body redirs func-line)))))
 
 ;;; --- [[ ]] conditional command ---
 

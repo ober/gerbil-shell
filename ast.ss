@@ -54,7 +54,7 @@
 ;; terminator: 'break (;;) 'fallthrough (;&) 'test-next (;;&)
 
 ;; Function definition
-(defstruct function-def (name body redirections) transparent: #t)
+(defstruct function-def (name body redirections lineno) transparent: #t)
 
 ;;; --- Redirections ---
 (defstruct redir (op fd target fd-var) transparent: #t)
