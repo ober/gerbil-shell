@@ -2677,7 +2677,7 @@
          (displayln ")")))
       (else
        (displayln (format "declare ~a ~a=~a" flag-str name
-                         (declare-quote-value (shell-var-scalar-value var))))))))
+                         (declare-quote-scalar (shell-var-scalar-value var))))))))
 
 ;; Continuation for early return from declare
 (def return-from-declare (make-parameter #f))
