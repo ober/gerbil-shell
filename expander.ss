@@ -48,6 +48,11 @@
 ;; only $, `, ", \, newline are special; others preserve the backslash.
 (def *in-dquote-context* (make-parameter #f))
 
+;; Set to #t when a command substitution runs during expansion.
+;; Used by execute-simple-command to decide whether bare assignments
+;; should preserve $? from command subs or reset to 0.
+(def *command-sub-ran* (make-parameter #f))
+
 ;;; --- Modifier segments (preserves quoting info from parameter defaults) ---
 ;; When a parameter modifier like ${X:-'a b c'} expands a default value,
 ;; we need to preserve the quoting information so word splitting respects it.
@@ -864,7 +869,7 @@
                                    (or close-pos (string-length rest))))
                     (val (env-array-get env name (expand-word-nosplit idx env))))
                (number->string (string-length val)))
-             ;; ${#name} — string length (UTF-8 code points)
+             ;; ${#name} — string length (code points, or bytes under LC_ALL=C)
              ;; Reject ${#name<modifier>} combinations like ${#x-default}
              (begin
                (when (let check ((j 0))
@@ -879,8 +884,15 @@
                       (val (or val (begin
                                     (when (env-option? env "nounset")
                                       (nounset-error! rest env))
-                                    ""))))
-                 (number->string (utf8-string-length val))))))))
+                                    "")))
+                      ;; Under C/POSIX locale, return byte count
+                      (lc-all (env-get env "LC_ALL"))
+                      (byte-locale? (and lc-all
+                                         (or (string=? lc-all "C")
+                                             (string=? lc-all "POSIX")))))
+                 (number->string (if byte-locale?
+                                   (utf8-byte-count val)
+                                   (utf8-string-length val)))))))))
       ;; ${!name[@]} or ${!name[*]} — array keys/indices
       ;; Also handle ${!name} — indirect expansion
       ((and (> len 1)
@@ -1652,10 +1664,23 @@
   ;; Inside ${...}, the lexer preserved \} to prevent premature brace close.
   ;; Now that we have the complete arg, unescape \} → } since } is not a
   ;; real backslash-escape target in double-quote context.
-  (let ((arg (unescape-brace arg0)))
+  (let ((arg (unescape-brace arg0))
+        ;; For $* and $@, "null" check depends on context:
+        ;; - Unquoted with 2+ positional params: always non-null (even if expansion is empty)
+        ;; - Quoted or 0-1 params: check actual expanded value
+        ;; This matches bash behavior where unquoted $* with IFS= and set -- "" ""
+        ;; is non-null, but "$*" in the same scenario IS null.
+        (colon-null? (lambda (v)
+                       (or (not v)
+                           (and (string? v) (string=? v "")
+                                ;; $* and $@ unquoted with 2+ params: non-null
+                                (not (and (not (*in-dquote-context*))
+                                          (or (string=? name "*") (string=? name "@"))
+                                          (let ((params (env-positional-list env)))
+                                            (and (pair? params) (pair? (cdr params)))))))))))
   (case modifier
     ;; ${name:-word} — default if unset or null
-    ((:-) (if (or (not val) (string=? val ""))
+    ((:-) (if (colon-null? val)
             (let ((earg (if (*in-dquote-context*) arg (tilde-expand-default arg env))))
               (if (*in-dquote-context*)
                 (expand-string earg env)
@@ -1669,7 +1694,7 @@
                (make-modifier-segments (segments-literals-splittable (expand-string-segments earg env)))))
            val))
     ;; ${name:=word} — assign default if unset or null
-    ((:=) (if (or (not val) (string=? val ""))
+    ((:=) (if (colon-null? val)
             (let* ((earg (if (*in-dquote-context*) arg (tilde-expand-default arg env)))
                    (default (expand-string earg env)))
               (env-set! env name default)
@@ -1687,15 +1712,21 @@
                (make-modifier-segments (segments-literals-splittable (expand-string-segments earg env)))))
            val))
     ;; ${name:?word} — error if unset or null
-    ((:?) (if (or (not val) (string=? val ""))
-            (error (format "~a: ~a" name (if (string=? arg "") "parameter null or not set" arg)))
+    ((:?) (if (colon-null? val)
+            (let ((msg (if (string=? arg "") "parameter null or not set"
+                         (expand-string arg env))))
+              (fprintf (current-error-port) "gsh: ~a: ~a~n" name msg)
+              (raise (make-nounset-exception 1)))
             val))
     ;; ${name?word} — error if unset
     ((?) (if (not val)
-           (error (format "~a: ~a" name (if (string=? arg "") "parameter not set" arg)))
+           (let ((msg (if (string=? arg "") "parameter not set"
+                        (expand-string arg env))))
+             (fprintf (current-error-port) "gsh: ~a: ~a~n" name msg)
+             (raise (make-nounset-exception 1)))
            val))
     ;; ${name:+word} — alternate if set and non-null
-    ((:+) (if (and val (not (string=? val "")))
+    ((:+) (if (not (colon-null? val))
             (let ((earg (if (*in-dquote-context*) arg (tilde-expand-default arg env))))
               (if (*in-dquote-context*)
                 (expand-string earg env)
@@ -1899,6 +1930,8 @@
 ;; Execute a command and capture its stdout
 ;; Strips trailing newlines (per POSIX)
 (def (command-substitute cmd env)
+  ;; Signal that a command substitution ran (for bare assignment $? tracking)
+  (*command-sub-ran* #t)
   (let ((exec-fn (*execute-input*)))
     (if exec-fn
       ;; Use gsh's own executor: redirect stdout to a pipe, run command, read output
@@ -1930,7 +1963,9 @@
                     (parameterize ((*in-subshell* #t)
                                    (*pipeline-stdin-fd* #f)
                                    (*pipeline-stdout-fd* #f))
-                      (exec-fn cmd sub-env)))))
+                      (exec-fn cmd sub-env))
+                    ;; Normal completion: propagate $? from subshell
+                    (env-set-last-status! env (shell-environment-last-status sub-env)))))
                ;; Flush and close the pipe port
                (force-output pipe-port)
                (close-port pipe-port))

@@ -280,14 +280,16 @@
         ;; All done, return exit status of first done job
         (let ((done-job (find (lambda (j) (memq (job-status j) '(done killed))) jobs)))
           (if done-job (job-wait done-job) 127))
-        ;; Poll running jobs until one finishes
-        (let poll-loop ((delay 0.001))
+        ;; Poll running jobs until one finishes.
+        ;; Use small fixed delay (no backoff) for responsive wait-n ordering.
+        (let poll-loop ((n 0))
+          (thread-yield!)
           (let jloop ((js running))
             (cond
               ((null? js)
-               ;; None finished yet — sleep and retry with backoff
-               (thread-sleep! delay)
-               (poll-loop (min (* delay 2) 0.05)))
+               ;; None finished yet — brief sleep then retry
+               (thread-sleep! 0.001)
+               (poll-loop (+ n 1)))
               (else
                (let* ((job (car js))
                       (procs (job-processes job))
@@ -322,6 +324,10 @@
                                 (set! (job-process-status proc)
                                   (if (WIFSIGNALED raw-status) 'signaled 'exited))
                                 #t))
+                             ((< result 0)
+                              ;; ECHILD: Gambit already reaped. Mark as finished;
+                              ;; job-wait will use process-status to get exit code.
+                              #t)
                              (else #f))))))))
           procs))))
 

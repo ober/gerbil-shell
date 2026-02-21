@@ -150,21 +150,31 @@
     ;; Exit status is that of the last command substitution, or 0
     (if (null? raw-words)
       (begin
-        (for-each (lambda (asgn) (apply-assignment! asgn env)) assignments)
-        ;; Process redirections even without command (e.g. "> file" creates empty file)
-        (let ((status (if (pair? redirections)
-                        (with-catch
-                         (lambda (e)
-                           (fprintf (current-error-port) "gsh: ~a~n" (exception-message e))
-                           1)
-                         (lambda ()
-                           (let ((saved (apply-redirections redirections env)))
-                             (restore-redirections saved)
-                             0)))
-                        0)))  ;; Assignment without redirections returns 0
-          (env-set-last-status! env status)
-          (check-errexit! env status)
-          status))
+        ;; Expand assignments. Don't reset $? before expansion so that
+        ;; status=$? captures the previous command's exit status.
+        ;; Track whether any command substitution ran during expansion.
+        (parameterize ((*command-sub-ran* #f))
+          (for-each (lambda (asgn) (apply-assignment! asgn env)) assignments)
+          ;; Process redirections even without command (e.g. "> file" creates empty file)
+          (let ((status (if (pair? redirections)
+                          (with-catch
+                           (lambda (e)
+                             (fprintf (current-error-port) "gsh: ~a~n" (exception-message e))
+                             1)
+                           (lambda ()
+                             (let ((saved (apply-redirections redirections env)))
+                               (restore-redirections saved)
+                               ;; If command sub ran, use its status; otherwise 0
+                               (if (*command-sub-ran*)
+                                 (shell-environment-last-status env)
+                                 0))))
+                          ;; No redirections: use command sub status or 0
+                          (if (*command-sub-ran*)
+                            (shell-environment-last-status env)
+                            0))))
+            (env-set-last-status! env status)
+            (check-errexit! env status)
+            status)))
       ;; Expand words (process substitutions handled by expand-word)
       (parameterize ((*procsub-cleanups* []))
         (unwind-protect

@@ -291,6 +291,17 @@
           ((< b #xF0) (loop (+ i 1) (+ count 1)))       ;; 3-byte lead
           (else        (loop (+ i 1) (+ count 1))))))))
 
+;; Count UTF-8 byte length of a Gambit Unicode string
+(def (utf8-byte-count str)
+  (let ((len (string-length str)))
+    (let loop ((i 0) (bytes 0))
+      (if (>= i len) bytes
+        (let ((cp (char->integer (string-ref str i))))
+          (loop (+ i 1) (+ bytes (cond ((< cp #x80) 1)
+                                       ((< cp #x800) 2)
+                                       ((< cp #x10000) 3)
+                                       (else 4)))))))))
+
 ;;; --- File test helpers (for refactored builtins) ---
 
 ;; Test if path is a regular file
