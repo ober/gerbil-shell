@@ -30,12 +30,12 @@ Generated: 2026-02-21
 |-------|-------------|-----|-----|
 | here-doc | Here-documents (<<, <<-, <<< ) | 35/36 | **36/36** |
 | quote | Quoting (single, double, $'...') | 31/35 | **35/35** |
-| word-eval | Word evaluation and expansion | **8/8** | 7/8 |
+| word-eval | Word evaluation and expansion | **8/8** | **8/8** |
 | word-split | IFS word splitting | 50/55 | **55/55** |
 | var-sub | Variable substitution ($var, ${var}) | 5/6 | **6/6** |
 | var-sub-quote | Variable substitution in quoting contexts | 40/41 | **41/41** |
 | var-num | Numeric/special variables ($#, $?, $$, etc.) | **7/7** | **7/7** |
-| var-op-test | Variable operators (${var:-default}, etc.) | 33/37 | 34/37 |
+| var-op-test | Variable operators (${var:-default}, etc.) | 33/37 | 33/37 |
 | var-op-strip | Variable pattern stripping (${var#pat}, etc.) | 28/29 | **29/29** |
 | var-op-len | Variable length ${#var} | 5/9 | 7/9 |
 | assign | Variable assignment | 36/48 | **48/48** |
@@ -60,13 +60,13 @@ Generated: 2026-02-21
 | builtin-cd | cd builtin | 27/30 | 29/30 |
 | builtin-set | set and shopt builtins | **24/24** | **24/24** |
 | builtin-type | type/command/which builtins | 4/6 | **6/6** |
-| builtin-trap | trap builtin | 31/33 | **33/33** |
+| builtin-trap | trap builtin | 31/33 | 32/33 |
 | builtin-bracket | [[ ]] and [ ] test operators | 49/52 | **52/52** |
 | builtin-misc | Misc builtins (true, false, colon, etc.) | 3/7 | **7/7** |
 | builtin-process | Process builtins (kill, wait, ulimit, etc.) | 18/26 | 24/26 |
 | background | Background jobs (&, wait, jobs) | 24/27 | 26/27 |
 | command-parsing | Command parsing edge cases | 4/5 | **5/5** |
-| var-op-bash | Bash-specific variable operations | 24/27 | 26/27 |
+| var-op-bash | Bash-specific variable operations | 24/27 | **27/27** |
 | var-op-slice | Variable slicing ${var:offset:length} | 19/22 | **22/22** |
 | assign-extended | declare/typeset/local/export | 23/39 | 30/39 |
 
@@ -84,9 +84,9 @@ Tests where gsh fails but bash passes.
 
 | Suite | # | Test | Reason |
 |-------|---|------|--------|
-| word-eval | 4 | Word joining | stdout mismatch |
 | var-op-test | 4 | Unquoted with array as default value | stdout mismatch |
 | var-op-test | 6 | Assign default with array | stdout mismatch |
+| var-op-test | 34 | op-test for ${a[@]} and ${a[*]} | stdout mismatch |
 | var-op-test | 37 | op-test for unquoted ${a[*]:-empty} with IFS= | stdout mismatch |
 
 ### Tier 2 — Builtins & Advanced
@@ -94,8 +94,9 @@ Tests where gsh fails but bash passes.
 | Suite | # | Test | Reason |
 |-------|---|------|--------|
 | builtin-cd | 27 | Survey of getcwd() syscall | stdout mismatch |
+| builtin-trap | 25 | exit codes for traps are isolated | stdout mismatch |
 | builtin-process | 23 | write big file with ulimit | stdout mismatch |
-| background | 27 | Signal message for killed background job | status: expected 0, got 1; stdout mismatch |
+| background | 8 | wait for N parallel jobs and check failure | stdout mismatch |
 | assign-extended | 6 | declare -F with shopt -s extdebug and main file | stdout mismatch |
 
 ## Bonus: Tests where gsh passes but bash fails
@@ -214,6 +215,7 @@ Tests where gsh fails but bash passes.
 | background | 26 | YSH wait --verbose |
 | command-parsing | 1 | Prefix env on assignment |
 | var-op-bash | 20 | ${!A@a} and ${!A[@]@a} |
+| var-op-bash | 25 | Array expansion with nullary var op @Q |
 | var-op-bash | 26 | Array expansion with nullary var op @P |
 | var-op-slice | 10 | Slice undefined |
 | var-op-slice | 12 | Slice string with invalid UTF-8 results in empty string and warning |

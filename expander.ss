@@ -2468,6 +2468,13 @@
         (else
          (loop (+ i 1) in-dq depth brace-depth))))))
 
+;; Expand a word string to a list of IFS-split strings (no globbing)
+;; Used for prefix/suffix parts in @-expansion word joining
+(def (expand-word-parts-split word-str env)
+  (let* ((segments (expand-string-segments word-str env))
+         (split (split-expanded-segments segments env)))
+    (map car split)))
+
 (def (expand-word-with-at word env)
   (let-values (((prefix-raw suffix-raw array-name at-body) (split-word-at-quoted-at word)))
     (let* ((all-elements (cond
@@ -2547,23 +2554,60 @@
                        (map (lambda (p) (apply-parameter-modifier p attr-name modifier arg env))
                             all-elements)))
                    all-elements)))))
-           (expanded-prefix (expand-string prefix-raw env))
-           (expanded-suffix (expand-string suffix-raw env)))
-      (if (null? elements)
-        ;; No elements: "$@"/"${arr[@]}" produces nothing, but prefix/suffix may remain
-        (let ((combined (string-append expanded-prefix expanded-suffix)))
-          (if (string=? combined "") [] [combined]))
-        ;; Has elements
-        (let ((n (length elements)))
-          (if (= n 1)
-            [(string-append expanded-prefix (car elements) expanded-suffix)]
-            (let* ((first (string-append expanded-prefix (car elements)))
-                   (last-val (string-append (last elements) expanded-suffix))
-                   (middle (let mid-loop ((ps (cdr elements)) (acc []))
-                             (if (null? (cdr ps))
-                               (reverse acc)
-                               (mid-loop (cdr ps) (cons (car ps) acc))))))
-              (append [first] middle [last-val]))))))))
+           ;; Expand prefix with IFS splitting (returns list of strings)
+           (prefix-words (expand-word-parts-split prefix-raw env))
+           ;; Expand suffix — recursively handle more @-expansions
+           (suffix-words (if (word-has-quoted-at? suffix-raw)
+                           (expand-word-with-at suffix-raw env)
+                           (expand-word-parts-split suffix-raw env))))
+      ;; Join prefix-words + elements + suffix-words
+      ;; Last of prefix joins with first element; last element joins with first of suffix
+      (let ((butlast (lambda (lst)
+                       (let loop ((l lst) (acc []))
+                         (if (null? (cdr l)) (reverse acc)
+                           (loop (cdr l) (cons (car l) acc)))))))
+        (cond
+          ((null? elements)
+           ;; No elements: $@ or ${arr[@]} is empty
+           ;; Join prefix and suffix directly, but elide if result is all empty
+           (cond
+             ((and (null? prefix-words) (null? suffix-words)) [])
+             ((null? suffix-words)
+              (let ((combined (apply string-append prefix-words)))
+                (if (string=? combined "") [] prefix-words)))
+             ((null? prefix-words)
+              (let ((combined (apply string-append suffix-words)))
+                (if (string=? combined "") [] suffix-words)))
+             (else
+              ;; Join last of prefix with first of suffix
+              (let* ((pfx-init (butlast prefix-words))
+                     (pfx-last (last prefix-words))
+                     (sfx-first (car suffix-words))
+                     (sfx-rest (cdr suffix-words))
+                     (joined (string-append pfx-last sfx-first))
+                     (result (append pfx-init [joined] sfx-rest))
+                     (combined (apply string-append result)))
+                (if (string=? combined "") [] result)))))
+          (else
+           ;; Has elements — do proper word joining
+           (let* ((pfx-last (if (null? prefix-words) "" (last prefix-words)))
+                  (pfx-rest (if (or (null? prefix-words) (null? (cdr prefix-words)))
+                              [] (butlast prefix-words)))
+                  (sfx-first (if (null? suffix-words) "" (car suffix-words)))
+                  (sfx-rest (if (or (null? suffix-words) (null? (cdr suffix-words)))
+                              [] (cdr suffix-words)))
+                  (n (length elements)))
+             (if (= n 1)
+               (append pfx-rest
+                       [(string-append pfx-last (car elements) sfx-first)]
+                       sfx-rest)
+               (let* ((first-elem (string-append pfx-last (car elements)))
+                      (last-elem (string-append (last elements) sfx-first))
+                      (middle (let mid-loop ((ps (cdr elements)) (acc []))
+                                (if (null? (cdr ps))
+                                  (reverse acc)
+                                  (mid-loop (cdr ps) (cons (car ps) acc))))))
+                 (append pfx-rest [first-elem] middle [last-elem] sfx-rest))))))))))
 
 (def (read-single-quote str i)
   (let ((len (string-length str)))
