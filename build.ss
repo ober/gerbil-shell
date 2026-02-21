@@ -26,6 +26,7 @@
     "lineedit"
     "completion"
     "script"
+    "compiler"
     "startup"
     (exe: "main" bin: "gsh" optimize: #t debug: 'env
           "-ld-options" "-lpcre2-8"))

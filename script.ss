@@ -16,6 +16,10 @@
         :gsh/signals
         :gsh/jobs)
 
+;;; --- Meta-command handler (set by main.ss to wire up ,compile etc.) ---
+
+(def *meta-command-handler* (make-parameter #f))
+
 ;;; --- Gerbil Expander (lazy init) ---
 
 (def *gerbil-eval-initialized* #f)
@@ -33,32 +37,37 @@
 (def (eval-scheme-expr expr-str)
   ;; Evaluate a Gerbil Scheme expression string and return (cons result-string status)
   ;; Status: 0 = success, 1 = error
-  (ensure-gerbil-eval!)
-  (with-catch
-   (lambda (e)
-     (cons (call-with-output-string
-            (lambda (port)
-              (display "Scheme error: " port)
-              (display-exception e port)))
-           1))
-   (lambda ()
-     (let* ((expr (call-with-input-string expr-str read))
-            (result (eval expr)))
-       (cons
-        (cond
-          ;; void: no output
-          ((eq? result (void)) "")
-          ;; Multiline results: use pretty-print
-          ((or (pair? result) (vector? result))
-           (call-with-output-string
-            (lambda (port)
-              (pretty-print result port))))
-          ;; Simple values: use write for unambiguous output
-          (else
-           (call-with-output-string
-            (lambda (port)
-              (write result port)))))
-        0)))))
+  ;; Check for meta-commands first (,compile, ,load, ,use, ,exports)
+  (let ((handler (*meta-command-handler*)))
+    (or (and handler (handler expr-str))
+        ;; Normal Scheme eval
+        (begin
+          (ensure-gerbil-eval!)
+          (with-catch
+           (lambda (e)
+             (cons (call-with-output-string
+                    (lambda (port)
+                      (display "Scheme error: " port)
+                      (display-exception e port)))
+                   1))
+           (lambda ()
+             (let* ((expr (call-with-input-string expr-str read))
+                    (result (eval expr)))
+               (cons
+                (cond
+                  ;; void: no output
+                  ((eq? result (void)) "")
+                  ;; Multiline results: use pretty-print
+                  ((or (pair? result) (vector? result))
+                   (call-with-output-string
+                    (lambda (port)
+                      (pretty-print result port))))
+                  ;; Simple values: use write for unambiguous output
+                  (else
+                   (call-with-output-string
+                    (lambda (port)
+                      (write result port)))))
+                0))))))))
 
 (def (scheme-eval-line? line)
   ;; Check if line starts with comma meta-command

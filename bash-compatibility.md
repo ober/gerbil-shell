@@ -6,7 +6,7 @@ Generated: 2026-02-21
 
 | Shell | Pass | Total | Rate |
 |-------|------|-------|------|
-| bash | 1037 | 1179 | 88% |
+| bash | 1036 | 1179 | 88% |
 | gsh | 1163 | 1179 | 99% |
 
 ## Results by Tier
@@ -57,7 +57,7 @@ Generated: 2026-02-21
 | builtin-echo | echo builtin | **27/27** | **27/27** |
 | builtin-printf | printf builtin | 54/63 | 62/63 |
 | builtin-read | read builtin | 58/64 | **64/64** |
-| builtin-cd | cd builtin | 27/30 | 29/30 |
+| builtin-cd | cd builtin | 26/30 | 29/30 |
 | builtin-set | set and shopt builtins | **24/24** | **24/24** |
 | builtin-type | type/command/which builtins | 4/6 | **6/6** |
 | builtin-trap | trap builtin | 31/33 | **33/33** |
@@ -188,6 +188,7 @@ Tests where gsh fails but bash passes.
 | builtin-read | 49 | mapfile from directory (bash doesn't handle errors) |
 | builtin-read | 64 | read bash bug |
 | builtin-cd | 4 | cd with 2 or more args is allowed (strict_arg_parse disabled) |
+| builtin-cd | 5 | cd - without OLDPWD |
 | builtin-cd | 28 | chdir is a synonym for cd - busybox ash |
 | builtin-cd | 30 | pwd errors out on args with strict_arg_parse |
 | builtin-type | 5 | special builtins are called out |

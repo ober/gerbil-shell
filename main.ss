@@ -22,6 +22,7 @@
         :gsh/signals
         :gsh/jobs
         :gsh/script
+        :gsh/compiler
         :gsh/startup
         :gsh/arithmetic
         :gsh/ffi)
@@ -125,7 +126,88 @@
                        result))
                    (source-file! filepath env))))))))
     (builtin-register! "source" source-handler)
-    (builtin-register! "." source-handler)))
+    (builtin-register! "." source-handler))
+
+  ;; gsc-compile — compile a .ss file
+  (builtin-register! "gsc-compile"
+    (lambda (args env)
+      (if (null? args)
+        (begin
+          (fprintf (current-error-port)
+                   "usage: gsc-compile [-v] [-n] <file.ss>~n")
+          2)
+        (let loop ((args args) (verbose #f) (no-gsc #f))
+          (cond
+            ((null? args)
+             (fprintf (current-error-port)
+                      "gsh: gsc-compile: missing file argument~n")
+             2)
+            ((string=? (car args) "-v") (loop (cdr args) #t no-gsc))
+            ((string=? (car args) "-n") (loop (cdr args) verbose #t))
+            (else
+             (with-catch
+              (lambda (e)
+                (fprintf (current-error-port) "gsh: gsc-compile: ~a~n"
+                         (call-with-output-string
+                          (lambda (p) (display-exception e p))))
+                1)
+              (lambda ()
+                (gsh-compile (car args)
+                             invoke-gsc: (if no-gsc #f 'auto)
+                             verbose: verbose)
+                0))))))))
+
+  ;; gsc-load — load a compiled module
+  (builtin-register! "gsc-load"
+    (lambda (args env)
+      (if (null? args)
+        (begin
+          (fprintf (current-error-port)
+                   "usage: gsc-load <modpath> [-L dir]~n")
+          2)
+        (let loop ((args args) (modpath #f) (libdir #f))
+          (cond
+            ((null? args)
+             (if modpath
+               (with-catch
+                (lambda (e)
+                  (fprintf (current-error-port) "gsh: gsc-load: ~a~n"
+                           (call-with-output-string
+                            (lambda (p) (display-exception e p))))
+                  1)
+                (lambda ()
+                  (gsh-load modpath libdir: libdir)
+                  0))
+               (begin
+                 (fprintf (current-error-port)
+                          "gsh: gsc-load: missing module path~n")
+                 2)))
+            ((string=? (car args) "-L")
+             (if (pair? (cdr args))
+               (loop (cddr args) modpath (cadr args))
+               (begin
+                 (fprintf (current-error-port)
+                          "gsh: gsc-load: -L requires directory argument~n")
+                 2)))
+            (else
+             (loop (cdr args) (or modpath (car args)) libdir)))))))
+
+  ;; gsc-exports — show module exports
+  (builtin-register! "gsc-exports"
+    (lambda (args env)
+      (if (null? args)
+        (begin
+          (fprintf (current-error-port)
+                   "usage: gsc-exports <modpath>~n")
+          2)
+        (with-catch
+         (lambda (e)
+           (fprintf (current-error-port) "gsh: gsc-exports: ~a~n"
+                    (call-with-output-string
+                     (lambda (p) (display-exception e p))))
+           1)
+         (lambda ()
+           (gsh-show-exports (car args))))))))
 
 (def (init-shell-env args-hash)
   (let ((env (make-shell-environment)))
@@ -153,6 +235,9 @@
     ;; Errexit mode
     (when (hash-ref args-hash 'errexit?)
       (env-option-set! env "errexit" #t))
+    ;; Wire up meta-command handler so ,compile / ,load / ,use / ,exports
+    ;; work in both REPL and script execution contexts
+    (*meta-command-handler* handle-meta-command)
     ;; Register builtins that need main.ss callbacks
     (register-late-builtins! env)
     env))
@@ -187,32 +272,119 @@
 (def (eval-scheme-expr expr-str)
   ;; Evaluate a Gerbil Scheme expression string and return (cons result-string status)
   ;; Status: 0 = success, 1 = error
-  (ensure-gerbil-eval!)
+  ;; Check for meta-commands first (,compile, ,load, ,use, ,exports)
+  (or (handle-meta-command expr-str)
+      ;; Normal Scheme eval
+      (begin
+        (ensure-gerbil-eval!)
+        (with-catch
+         (lambda (e)
+           (cons (call-with-output-string
+                  (lambda (port)
+                    (display "Scheme error: " port)
+                    (display-exception e port)))
+                 1))
+         (lambda ()
+           (let* ((expr (call-with-input-string expr-str read))
+                  (result (eval expr)))
+             (cons
+              (cond
+                ;; void: no output
+                ((eq? result (void)) "")
+                ;; Multiline results: use pretty-print
+                ((or (pair? result) (vector? result))
+                 (call-with-output-string
+                  (lambda (port)
+                    (pretty-print result port))))
+                ;; Simple values: use write for unambiguous output
+                (else
+                 (call-with-output-string
+                  (lambda (port)
+                    (write result port)))))
+              0)))))))
+
+;;; --- Meta-command dispatch for ,compile / ,load / ,use / ,exports ---
+
+(def (handle-meta-command expr-str)
+  "Handle special meta-commands. Returns (cons result-string status) or #f."
+  (cond
+    ((meta-cmd-match expr-str "compile ")
+     => (lambda (arg)
+          (meta-cmd-wrap
+           (lambda ()
+             (let-values (((path verbose no-gsc) (parse-compile-args arg)))
+               (gsh-compile path
+                            invoke-gsc: (if no-gsc #f 'auto)
+                            verbose: verbose))))))
+    ((meta-cmd-match expr-str "load ")
+     => (lambda (arg)
+          (meta-cmd-wrap
+           (lambda ()
+             (let-values (((modpath libdir) (parse-load-args arg)))
+               (gsh-load modpath libdir: libdir))))))
+    ((meta-cmd-match expr-str "use ")
+     => (lambda (arg)
+          (meta-cmd-wrap
+           (lambda ()
+             (gsh-use (parse-path-arg arg))))))
+    ((meta-cmd-match expr-str "exports ")
+     => (lambda (arg)
+          (meta-cmd-wrap
+           (lambda ()
+             (gsh-show-exports (string-trim-whitespace arg))))))
+    (else #f)))
+
+(def (meta-cmd-match str prefix)
+  (and (>= (string-length str) (string-length prefix))
+       (string=? (substring str 0 (string-length prefix)) prefix)
+       (substring str (string-length prefix) (string-length str))))
+
+(def (meta-cmd-wrap thunk)
   (with-catch
    (lambda (e)
      (cons (call-with-output-string
-            (lambda (port)
-              (display "Scheme error: " port)
-              (display-exception e port)))
+            (lambda (port) (display-exception e port)))
            1))
    (lambda ()
-     (let* ((expr (call-with-input-string expr-str read))
-            (result (eval expr)))
-       (cons
-        (cond
-          ;; void: no output
-          ((eq? result (void)) "")
-          ;; Multiline results: use pretty-print
-          ((or (pair? result) (vector? result))
-           (call-with-output-string
-            (lambda (port)
-              (pretty-print result port))))
-          ;; Simple values: use write for unambiguous output
-          (else
-           (call-with-output-string
-            (lambda (port)
-              (write result port)))))
-        0)))))
+     (thunk)
+     (cons "" 0))))
+
+(def (parse-path-arg arg)
+  "Parse a path argument, stripping surrounding quotes if present."
+  (let ((trimmed (string-trim-whitespace arg)))
+    (if (and (> (string-length trimmed) 1)
+             (char=? (string-ref trimmed 0) #\"))
+      (with-catch
+       (lambda (e) trimmed)
+       (lambda () (call-with-input-string trimmed read)))
+      trimmed)))
+
+(def (parse-compile-args arg)
+  "Parse: [-v] [-n] <path>.  Returns (values path verbose no-gsc)."
+  (let loop ((parts (string-split arg #\space))
+             (verbose #f) (no-gsc #f))
+    (cond
+      ((null? parts) (values "" verbose no-gsc))
+      ((string=? (car parts) "") (loop (cdr parts) verbose no-gsc))
+      ((string=? (car parts) "-v") (loop (cdr parts) #t no-gsc))
+      ((string=? (car parts) "-n") (loop (cdr parts) verbose #t))
+      (else
+       (values (parse-path-arg (string-join parts " "))
+               verbose no-gsc)))))
+
+(def (parse-load-args arg)
+  "Parse: <modpath> [-L dir].  Returns (values modpath libdir)."
+  (let loop ((parts (string-split arg #\space))
+             (modpath #f) (libdir #f))
+    (cond
+      ((null? parts) (values (or modpath "") libdir))
+      ((string=? (car parts) "") (loop (cdr parts) modpath libdir))
+      ((string=? (car parts) "-L")
+       (if (pair? (cdr parts))
+         (loop (cddr parts) modpath (cadr parts))
+         (values (or modpath "") libdir)))
+      (else
+       (loop (cdr parts) (or modpath (car parts)) libdir)))))
 
 (def (scheme-eval-line? input)
   ;; Check if input starts with comma meta-command
