@@ -21,6 +21,7 @@
             ffi-gambit-scheduler-rfd ffi-gambit-scheduler-wfd
             ffi-signal-was-ignored ffi-signal-set-ignore ffi-signal-set-default
             ffi-sigpipe-unblock ffi-sigpipe-block
+            ffi-sigchld-block ffi-sigchld-unblock
             WNOHANG WUNTRACED WCONTINUED
             WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG WIFSTOPPED WSTOPSIG)
 
@@ -89,6 +90,25 @@ static int ffi_sigpipe_block(void) {
     sigemptyset(&set);
     sigaddset(&set, SIGPIPE);
     return sigprocmask(SIG_BLOCK, &set, NULL);
+}
+
+/* Block SIGCHLD to prevent Gambit's SIGCHLD handler from reaping
+   ffi-fork-exec'd children via waitpid(-1, WNOHANG).
+   Must be called before fork; unblock after our waitpid succeeds. */
+static int ffi_sigchld_block(void) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGCHLD);
+    return sigprocmask(SIG_BLOCK, &set, NULL);
+}
+
+/* Unblock SIGCHLD after we've reaped our child.
+   Any pending SIGCHLD will be delivered to Gambit's handler. */
+static int ffi_sigchld_unblock(void) {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGCHLD);
+    return sigprocmask(SIG_UNBLOCK, &set, NULL);
 }
 
 /* We need to store the last waitpid result since we can't easily
@@ -539,8 +559,16 @@ static int ffi_do_fork_exec(const char *path, const char *packed_argv,
                             const char *packed_env, int pgid,
                             int gambit_rfd, int gambit_wfd,
                             const char *packed_keep_fds) {
+    /* Block SIGCHLD before fork to prevent Gambit's SIGCHLD handler
+       from reaping our child via waitpid(-1, WNOHANG).
+       The caller must call ffi_sigchld_unblock() after waiting. */
+    ffi_sigchld_block();
+
     pid_t child = fork();
-    if (child < 0) return -1;
+    if (child < 0) {
+        ffi_sigchld_unblock();
+        return -1;
+    }
 
     if (child > 0) {
         /* ---- Parent ---- */
@@ -653,5 +681,11 @@ END-EXECVE
   (define-c-lambda ffi-sigpipe-unblock () int "ffi_sigpipe_unblock")
   ;; Re-block SIGPIPE after open-process returns.
   (define-c-lambda ffi-sigpipe-block () int "ffi_sigpipe_block")
+
+  ;; Block/unblock SIGCHLD — prevent Gambit's handler from reaping
+  ;; ffi-fork-exec'd children.  ffi_do_fork_exec blocks automatically;
+  ;; callers must unblock after their waitpid succeeds.
+  (define-c-lambda ffi-sigchld-block () int "ffi_sigchld_block")
+  (define-c-lambda ffi-sigchld-unblock () int "ffi_sigchld_unblock")
 
 )

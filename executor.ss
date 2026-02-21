@@ -429,6 +429,8 @@
                  126)
                (let-values (((exit-code stopped?)
                              (wait-for-foreground-process-raw pid)))
+                 ;; Unblock SIGCHLD now that we've reaped the child
+                 (ffi-sigchld-unblock)
                  (if stopped?
                    ;; Ctrl-Z: add to job table as stopped
                    (let ((cmd-text (string-join-words (cons cmd-name args)))
@@ -1138,6 +1140,8 @@
                                      (*gambit-scheduler-rfd*)
                                      (*gambit-scheduler-wfd*)
                                      keep-fds)))
+            ;; Unblock SIGCHLD — background jobs are reaped later via job-wait
+            (ffi-sigchld-unblock)
             (if (< pid 0)
               ;; Fork failed — fall back to thread for error message
               (let* ((fake-pid (next-fake-pid!))

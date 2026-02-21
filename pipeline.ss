@@ -198,6 +198,8 @@
       (mutex-unlock! *pipeline-fd-mutex*)
       ;; Wait for all processes/threads
       (let ((exit-codes (wait-for-all procs)))
+        ;; Unblock SIGCHLD now that all children are reaped
+        (ffi-sigchld-unblock)
         ;; Clean up any process substitution FIFOs
         (run-procsub-cleanups!)
         ;; Return the full list of exit codes (caller sets PIPESTATUS)

@@ -295,12 +295,15 @@
                    (set! (job-process-status proc) 'exited)))))
              (else
               ;; ffi-fork-exec'd process (port=#f): block with waitpid polling
+              ;; Block SIGCHLD to prevent Gambit's handler from reaping our child
+              (ffi-sigchld-block)
               (let ((pid (job-process-pid proc)))
                 (let loop ((delay 0.001))
                   (let ((result (ffi-waitpid-pid pid (bitwise-ior WNOHANG WUNTRACED))))
                     (cond
                       ((> result 0)
                        (let ((raw (ffi-waitpid-status)))
+                         (ffi-sigchld-unblock)
                          (cond
                            ((WIFSTOPPED raw)
                             (set! (job-process-status proc) 'stopped)
@@ -321,6 +324,7 @@
                        (thread-sleep! delay)
                        (loop (min 0.05 (* delay 1.5))))
                       (else
+                       (ffi-sigchld-unblock)
                        (set! (job-process-status proc) 'exited)
                        (set! last-exit-code 0)))))))))))
      (job-processes job))
