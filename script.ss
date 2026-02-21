@@ -4,6 +4,8 @@
 (export #t)
 (import :std/sugar
         :std/format
+        :gerbil/runtime/init
+        :gerbil/expander
         :gsh/util
         :gsh/ast
         :gsh/environment
@@ -14,11 +16,24 @@
         :gsh/signals
         :gsh/jobs)
 
+;;; --- Gerbil Expander (lazy init) ---
+
+(def *gerbil-eval-initialized* #f)
+
+(def (ensure-gerbil-eval!)
+  "Initialize the Gerbil expander on first use so eval supports full
+   Gerbil syntax (def, defstruct, hash, match, import, etc.).
+   Called lazily to avoid ~100ms startup cost for normal shell operations."
+  (unless *gerbil-eval-initialized*
+    (set! *gerbil-eval-initialized* #t)
+    (__load-gxi)))
+
 ;;; --- Scheme Evaluation Helpers ---
 
 (def (eval-scheme-expr expr-str)
   ;; Evaluate a Gerbil Scheme expression string and return (cons result-string status)
   ;; Status: 0 = success, 1 = error
+  (ensure-gerbil-eval!)
   (with-catch
    (lambda (e)
      (cons (call-with-output-string

@@ -187,6 +187,7 @@
 (def (eval-scheme-expr expr-str)
   ;; Evaluate a Gerbil Scheme expression string and return (cons result-string status)
   ;; Status: 0 = success, 1 = error
+  (ensure-gerbil-eval!)
   (with-catch
    (lambda (e)
      (cons (call-with-output-string

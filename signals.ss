@@ -172,9 +172,19 @@
                    (string-upcase signal-name))))
     (hash-get *trap-table* uname)))
 
-;; List all traps as alist of (signal-name . action)
+;; List all traps as alist of (signal-name . action), sorted.
+;; Bash sorts EXIT/ERR/DEBUG/RETURN first, then by signal number.
 (def (trap-list)
-  (hash->list *trap-table*))
+  (sort (hash->list *trap-table*)
+        (lambda (a b)
+          (let ((na (signal-name->number (car a)))
+                (nb (signal-name->number (car b))))
+            (cond
+              ;; Pseudo-signals (EXIT, ERR, etc.) have no number — sort first
+              ((and (not na) nb) #t)
+              ((and na (not nb)) #f)
+              ((and (not na) (not nb)) (string<? (car a) (car b)))
+              (else (< na nb)))))))
 
 ;; Check if any signal command traps are registered (not 'ignore, not EXIT/ERR/DEBUG)
 (def (has-signal-traps?)
