@@ -5,6 +5,13 @@ BASH       := /bin/bash
 
 export GERBIL_BUILD_CORES := $(shell echo $$(( $$(nproc) / 2 )))
 
+# Static binary build variables
+ARCH := $(shell uname -m)
+PWD := $(shell pwd)
+DOCKER_IMAGE := "gerbil/gerbilxx:$(ARCH)-master"
+UID := $(shell id -u)
+GID := $(shell id -g)
+
 # --- Build ---
 
 build:
@@ -98,5 +105,38 @@ clean:
 	gerbil clean
 	rm -rf .gerbil
 
+# --- Static binary (Docker) ---
+
+static: linux-static-docker
+
+clean-docker:
+	-rm -rf .gerbil 2>/dev/null || true
+	docker run --rm -v $(PWD):/src:z alpine rm -rf /src/.gerbil
+
+check-root:
+	@if [ "${UID}" -eq 0 ]; then \
+	  git config --global --add safe.directory /src; \
+	fi
+
+build-static: check-root
+	gxpkg install github.com/ober/gerbil-pcre2
+	gxpkg build
+	mkdir -p .gerbil/bin
+	GERBIL_LOADPATH="$$(pwd)/.gerbil/lib" \
+	gxc -exe -o .gerbil/bin/gsh \
+	  -ld-options "-static -lpcre2-8" \
+	  main.ss
+
+linux-static-docker: clean-docker
+	docker run --rm \
+	  --ulimit nofile=1024:1024 \
+	  -v $(PWD):/src:z \
+	  $(DOCKER_IMAGE) \
+	  sh -c "apk add --no-cache pcre2-dev pcre2-static && \
+	         cd /src && \
+	         make build-static && \
+	         chown -R $(UID):$(GID) .gerbil"
+
 .PHONY: build install clean compat compat-smoke compat-tier0 compat-tier1 compat-tier2 \
-        compat-one compat-range compat-debug vendor-update bench
+        compat-one compat-range compat-debug vendor-update bench \
+        static clean-docker check-root build-static linux-static-docker
