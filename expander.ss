@@ -2528,21 +2528,30 @@
                    ;; Conditional modifiers on arrays: handle empty array case
                    (if (memq modifier '(- :- + :+ = := ? :?))
                      ;; For [@] inside "...", return array elements or modifier result
-                     (let ((is-empty (null? all-elements)))
+                     (let* ((is-empty (null? all-elements))
+                            ;; For colon variants, also treat all-empty-elements as null
+                            (is-null (or is-empty
+                                        (and (memq modifier '(:- :+  := :?))
+                                             (every (lambda (s) (string=? s "")) all-elements)))))
                        (case modifier
-                         ;; ${arr[@]-word}: use default only if array is unset/empty
-                         ;; ${arr[@]:-word}: same for arrays (empty array = unset)
-                         ((- :-)
-                          (if is-empty
-                            (list (parameterize ((*in-dquote-context* #t))
-                                    (expand-string arg env)))
-                            all-elements))
+                         ;; ${arr[@]-word}: use default only if array has no elements
+                         ((-) (if is-empty
+                               (list (parameterize ((*in-dquote-context* #t))
+                                       (expand-string arg env)))
+                               all-elements))
+                         ;; ${arr[@]:-word}: use default if no elements OR all empty
+                         ((:-) (if is-null
+                                 (list (parameterize ((*in-dquote-context* #t))
+                                         (expand-string arg env)))
+                                 all-elements))
                          ;; ${arr[@]+word}: use alternate if array has elements
-                         ;; ${arr[@]:+word}: same for arrays
-                         ((+ :+)
-                          (if is-empty '()
-                            (list (parameterize ((*in-dquote-context* #t))
-                                    (expand-string arg env)))))
+                         ((+) (if is-empty '()
+                               (list (parameterize ((*in-dquote-context* #t))
+                                       (expand-string arg env)))))
+                         ;; ${arr[@]:+word}: use alternate if array has non-empty elements
+                         ((:+) (if is-null '()
+                                 (list (parameterize ((*in-dquote-context* #t))
+                                         (expand-string arg env)))))
                          ;; Other conditionals: delegate
                          (else
                           (let* ((val (if is-empty #f (string-join-with " " all-elements)))
