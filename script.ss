@@ -229,6 +229,8 @@
 ;; Lightweight version for script.ss (avoids circular import with main.ss)
 ;; Traps execute with $? isolated — they don't affect the main script's $?
 (def (process-pending-traps! env)
+  ;; No sleep needed — C-level signal flags are checked synchronously
+  ;; in pending-signals! via ffi-signal-flag-check
   (let ((signals (pending-signals!)))
     (for-each
      (lambda (sig-name)

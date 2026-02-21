@@ -7,7 +7,7 @@ Generated: 2026-02-21
 | Shell | Pass | Total | Rate |
 |-------|------|-------|------|
 | bash | 1037 | 1179 | 88% |
-| gsh | 1155 | 1179 | 98% |
+| gsh | 1156 | 1179 | 98% |
 
 ## Results by Tier
 
@@ -60,13 +60,13 @@ Generated: 2026-02-21
 | builtin-cd | cd builtin | 27/30 | 29/30 |
 | builtin-set | set and shopt builtins | **24/24** | **24/24** |
 | builtin-type | type/command/which builtins | 4/6 | **6/6** |
-| builtin-trap | trap builtin | 31/33 | 32/33 |
+| builtin-trap | trap builtin | 31/33 | **33/33** |
 | builtin-bracket | [[ ]] and [ ] test operators | 49/52 | **52/52** |
 | builtin-misc | Misc builtins (true, false, colon, etc.) | 3/7 | 6/7 |
 | builtin-process | Process builtins (kill, wait, ulimit, etc.) | 18/26 | 24/26 |
-| background | Background jobs (&, wait, jobs) | 24/27 | 26/27 |
+| background | Background jobs (&, wait, jobs) | 24/27 | 25/27 |
 | command-parsing | Command parsing edge cases | 4/5 | **5/5** |
-| var-op-bash | Bash-specific variable operations | 24/27 | 25/27 |
+| var-op-bash | Bash-specific variable operations | 24/27 | 26/27 |
 | var-op-slice | Variable slicing ${var:offset:length} | 19/22 | **22/22** |
 | assign-extended | declare/typeset/local/export | 23/39 | 36/39 |
 
@@ -94,9 +94,9 @@ Tests where gsh fails but bash passes.
 | Suite | # | Test | Reason |
 |-------|---|------|--------|
 | builtin-cd | 27 | Survey of getcwd() syscall | stdout mismatch |
-| builtin-trap | 25 | exit codes for traps are isolated | stdout mismatch |
 | builtin-process | 23 | write big file with ulimit | stdout mismatch |
 | background | 8 | wait for N parallel jobs and check failure | stdout mismatch |
+| background | 27 | Signal message for killed background job | status: expected 0, got 1; stdout mismatch |
 | assign-extended | 22 | declare -p UNDEF (and typeset) -- prints something to stderr | stdout mismatch |
 
 ## Bonus: Tests where gsh passes but bash fails
@@ -214,6 +214,7 @@ Tests where gsh fails but bash passes.
 | background | 26 | YSH wait --verbose |
 | command-parsing | 1 | Prefix env on assignment |
 | var-op-bash | 20 | ${!A@a} and ${!A[@]@a} |
+| var-op-bash | 26 | Array expansion with nullary var op @P |
 | var-op-slice | 10 | Slice undefined |
 | var-op-slice | 12 | Slice string with invalid UTF-8 results in empty string and warning |
 | var-op-slice | 13 | Slice string with invalid UTF-8 with strict_word_eval |

@@ -133,28 +133,36 @@
       ;; Reset to default
       ((or (eq? action 'default) (not action) (string=? (if (string? action) action "") "-"))
        (hash-remove! *trap-table* uname)
+       (hash-remove! *flag-trapped-signals* uname)
        (let ((signum (signal-name->number uname)))
          (when (and signum (not (hash-get *initially-ignored-signals* signum)))
+           (ffi-signal-set-default signum)
            (with-catch (lambda (e) #!void) ;; ignore error if no handler installed
              (lambda () (remove-signal-handler! signum))))))
       ;; Ignore signal
       ((or (eq? action 'ignore) (and (string? action) (string=? action "")))
        (hash-put! *trap-table* uname 'ignore)
+       (hash-remove! *flag-trapped-signals* uname)
        (let ((signum (signal-name->number uname)))
          (when (and signum (not (hash-get *initially-ignored-signals* signum)))
-           (add-signal-handler! signum (lambda () #!void)))))
+           (ffi-signal-set-ignore signum))))
       ;; Set command handler
       ((string? action)
        (hash-put! *trap-table* uname action)
-       ;; For real signals, install a handler that flags for later execution
+       ;; For real signals, install a C-level signal flag handler.
+       ;; This is synchronous (flag set immediately on signal delivery),
+       ;; unlike Gerbil's async signalfd-based add-signal-handler! which
+       ;; has timing issues with signal delivery.
        ;; POSIX: signals that were SIG_IGN at startup cannot be trapped
        (let ((signum (signal-name->number uname)))
          (when (and signum (not (hash-get *initially-ignored-signals* signum)))
-           (add-signal-handler! signum
-             (lambda ()
-               ;; The actual command execution happens in the main loop
-               ;; Here we just record that the signal was received
-               (set! *pending-signals* (cons uname *pending-signals*)))))))
+           ;; Remove any existing Gerbil handler first
+           (with-catch (lambda (e) #!void)
+             (lambda () (remove-signal-handler! signum)))
+           ;; Install C-level flag handler (also unblocks the signal)
+           (ffi-signal-flag-install signum)
+           ;; Track which signals use flag-based handling
+           (hash-put! *flag-trapped-signals* uname signum))))
       (else
        (error (format "trap: invalid action: ~a" action))))))
 
@@ -168,12 +176,35 @@
 (def (trap-list)
   (hash->list *trap-table*))
 
+;; Check if any signal command traps are registered (not 'ignore, not EXIT/ERR/DEBUG)
+(def (has-signal-traps?)
+  (let/cc return
+    (hash-for-each
+     (lambda (name action)
+       (when (and (string? action) (not (string=? action ""))
+                  ;; Only real signals, not pseudo-signals
+                  (signal-name->number name))
+         (return #t)))
+     *trap-table*)
+    #f))
+
 ;;; --- Pending signal queue ---
 
 (def *pending-signals* [])
 
-;; Check and clear pending signals, return list of signal names
+;; Signals using C-level flag handlers (maps signal-name -> signum)
+(def *flag-trapped-signals* (make-hash-table))
+
+;; Check and clear pending signals, return list of signal names.
+;; Checks both the Gerbil signalfd-based queue and C-level signal flags.
 (def (pending-signals!)
+  ;; First, check C-level signal flags (synchronous, no timing issues)
+  (hash-for-each
+   (lambda (name signum)
+     (when (= 1 (ffi-signal-flag-check signum))
+       (set! *pending-signals* (cons name *pending-signals*))))
+   *flag-trapped-signals*)
+  ;; Return combined pending list
   (let ((pending *pending-signals*))
     (set! *pending-signals* [])
     (reverse pending)))

@@ -22,6 +22,7 @@
             ffi-signal-was-ignored ffi-signal-set-ignore ffi-signal-set-default
             ffi-sigpipe-unblock ffi-sigpipe-block
             ffi-sigchld-block ffi-sigchld-unblock
+            ffi-signal-flag-install ffi-signal-flag-check
             WNOHANG WUNTRACED WCONTINUED
             WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG WIFSTOPPED WSTOPSIG)
 
@@ -109,6 +110,44 @@ static int ffi_sigchld_unblock(void) {
     sigemptyset(&set);
     sigaddset(&set, SIGCHLD);
     return sigprocmask(SIG_UNBLOCK, &set, NULL);
+}
+
+/* --- Signal flag mechanism for traps ---
+   C-level signal handler sets a flag; Scheme checks it synchronously.
+   Avoids the timing issues of Gerbil's async signalfd-based handlers. */
+static volatile sig_atomic_t _signal_flags[65] = {0};
+
+static void _signal_flag_handler(int signum) {
+    if (signum >= 0 && signum < 65)
+        _signal_flags[signum] = 1;
+}
+
+/* Install the C-level flag handler for a signal.
+   First unblocks the signal (Gerbil may have blocked it for signalfd). */
+static int ffi_signal_flag_install(int signum) {
+    if (signum < 1 || signum >= 65) return -1;
+    /* Unblock the signal so we get real delivery, not signalfd */
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, signum);
+    sigprocmask(SIG_UNBLOCK, &set, NULL);
+    /* Install our handler */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = _signal_flag_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    return sigaction(signum, &sa, NULL);
+}
+
+/* Check and clear a signal flag. Returns 1 if signal was received. */
+static int ffi_signal_flag_check(int signum) {
+    if (signum < 1 || signum >= 65) return 0;
+    if (_signal_flags[signum]) {
+        _signal_flags[signum] = 0;
+        return 1;
+    }
+    return 0;
 }
 
 /* We need to store the last waitpid result since we can't easily
@@ -703,5 +742,10 @@ END-EXECVE
   ;; callers must unblock after their waitpid succeeds.
   (define-c-lambda ffi-sigchld-block () int "ffi_sigchld_block")
   (define-c-lambda ffi-sigchld-unblock () int "ffi_sigchld_unblock")
+
+  ;; Signal flag mechanism — C-level handler sets flags synchronously.
+  ;; Used for user traps instead of Gerbil's async signalfd handlers.
+  (define-c-lambda ffi-signal-flag-install (int) int "ffi_signal_flag_install")
+  (define-c-lambda ffi-signal-flag-check (int) int "ffi_signal_flag_check")
 
 )
