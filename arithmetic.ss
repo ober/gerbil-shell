@@ -51,6 +51,10 @@
            (char=? (string-ref expr i) #\_))
        (let-values (((name end) (read-name expr i)))
          (loop end (cons (make-arith-token 'name name) tokens))))
+      ;; # is not a valid arithmetic operator — reject it early to prevent
+      ;; side-effects from being committed before the syntax error is detected
+      ((char=? (string-ref expr i) #\#)
+       (error (format "arithmetic: syntax error: unexpected token '#'")))
       ;; Multi-char operators
       (else
        (let-values (((op end) (read-operator expr i)))
@@ -270,9 +274,12 @@
       (let ((val ((arith-state-env-get state) name)))
         (cond
           ((not val)
-           ;; Check nounset
-           (when (arith-state-nounset? state)
-             (error (format "arithmetic: ~a: unbound variable" name)))
+           ;; Check nounset — if nounset? is a procedure, call it (raises exception)
+           ;; If it's #t, raise generic error. If #f, silently return 0.
+           (let ((nu (arith-state-nounset? state)))
+             (cond
+               ((procedure? nu) (nu name))
+               (nu (error (format "arithmetic: ~a: unbound variable" name)))))
            0)
           (else
            (let ((trimmed (string-trim val)))

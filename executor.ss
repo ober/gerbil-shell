@@ -854,7 +854,9 @@
             (result (arith-eval expr
                                 (arith-env-getter env)
                                 (arith-env-setter env)
-                                (env-option? env "nounset"))))
+                                (and (env-option? env "nounset")
+                                     (lambda (name)
+                                       (nounset-error! name env))))))
        (if (= result 0) 1 0)))))
 
 ;; for (( init; test; update )) ; do body ; done

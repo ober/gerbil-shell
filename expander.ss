@@ -1599,7 +1599,10 @@
                         (expand-arith-expr trimmed env))
                       (arith-env-getter env)
                       (arith-env-setter env)
-                      (env-option? env "nounset"))))))
+                      (and (env-option? env "nounset")
+                           (lambda (name)
+                             (nounset-error! name env))))))))
+
 
 ;; Validate an indirect expansion target is a valid variable name, special
 ;; parameter, or array reference like "name[idx]".
@@ -2018,7 +2021,9 @@
          (result (arith-eval expr
                             (arith-env-getter env)
                             (arith-env-setter env)
-                            (env-option? env "nounset"))))
+                            (and (env-option? env "nounset")
+                                 (lambda (name)
+                                   (nounset-error! name env))))))
     (values (number->string result) (+ close 2))))
 
 ;; Expand $var, ${var}, $(cmd) inside an arithmetic expression

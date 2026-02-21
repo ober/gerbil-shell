@@ -7,7 +7,7 @@ Generated: 2026-02-21
 | Shell | Pass | Total | Rate |
 |-------|------|-------|------|
 | bash | 1037 | 1179 | 88% |
-| gsh | 1161 | 1179 | 98% |
+| gsh | 1162 | 1179 | 99% |
 
 ## Results by Tier
 
@@ -45,7 +45,7 @@ Generated: 2026-02-21
 
 | Suite | Description | bash | gsh |
 |-------|-------------|-----|-----|
-| arith | Arithmetic expansion $(( )) and (( )) | 61/74 | 71/74 |
+| arith | Arithmetic expansion $(( )) and (( )) | 61/74 | **74/74** |
 | glob | Filename globbing (*, ?, [...]) | 36/39 | 38/39 |
 | brace-expansion | Brace expansion ({a,b}, {1..5}) | 46/55 | 54/55 |
 | case_ | case statement | **13/13** | **13/13** |
@@ -66,7 +66,7 @@ Generated: 2026-02-21
 | builtin-process | Process builtins (kill, wait, ulimit, etc.) | 18/26 | 24/26 |
 | background | Background jobs (&, wait, jobs) | 24/27 | **27/27** |
 | command-parsing | Command parsing edge cases | 4/5 | **5/5** |
-| var-op-bash | Bash-specific variable operations | 24/27 | **27/27** |
+| var-op-bash | Bash-specific variable operations | 24/27 | 25/27 |
 | var-op-slice | Variable slicing ${var:offset:length} | 19/22 | **22/22** |
 | assign-extended | declare/typeset/local/export | 23/39 | 36/39 |
 
@@ -146,11 +146,14 @@ Tests where gsh fails but bash passes.
 | arith | 12 | Invalid string to int with strict_arith |
 | arith | 21 | Increment undefined variables with nounset |
 | arith | 29 | No floating point |
+| arith | 41 | nounset with arithmetic |
 | arith | 44 | Invalid LValue |
 | arith | 45 | Invalid LValue that looks like array |
 | arith | 46 | Invalid LValue: two sets of brackets |
+| arith | 51 | Comment not allowed in the middle of multiline arithmetic |
 | arith | 66 | Invalid constant |
 | arith | 69 | Negative numbers with bit shift |
+| arith | 71 | undef[0] with nounset |
 | arith | 74 | s[0] with string '12 34' |
 | glob | 20 | : escaped |
 | glob | 24 | set -o noglob |
@@ -210,8 +213,6 @@ Tests where gsh fails but bash passes.
 | background | 26 | YSH wait --verbose |
 | command-parsing | 1 | Prefix env on assignment |
 | var-op-bash | 20 | ${!A@a} and ${!A[@]@a} |
-| var-op-bash | 25 | Array expansion with nullary var op @Q |
-| var-op-bash | 26 | Array expansion with nullary var op @P |
 | var-op-slice | 10 | Slice undefined |
 | var-op-slice | 12 | Slice string with invalid UTF-8 results in empty string and warning |
 | var-op-slice | 13 | Slice string with invalid UTF-8 with strict_word_eval |
