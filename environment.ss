@@ -577,7 +577,58 @@
   (env-shopt-set! env "progcomp" #t)
   (env-shopt-set! env "promptvars" #t)
   (env-shopt-set! env "sourcepath" #t)
-  (env-shopt-set! env "globskipdots" #t))
+  (env-shopt-set! env "globskipdots" #t)
+  ;; Set terminal color variables
+  (set-color-vars! env))
+
+;;; --- Terminal color variables ---
+;;; Pre-defined ANSI escape sequences available as shell variables.
+;;; Usage in ~/.gshrc: PS1='\[$_fg_norm_green\]\u@\h\[$_ansi_reset\]:\w\$ '
+(def (set-color-vars! env)
+  (let* ((esc (string (integer->char 27)))
+         (csi (string-append esc "[")))
+    (def (ansi code) (string-append csi code "m"))
+    (for-each
+      (lambda (pair) (env-set! env (car pair) (cdr pair)))
+      `(;; Reset & attributes
+        ("_ansi_reset" . ,(ansi "0"))
+        ("_ansi_bold"  . ,(ansi "1"))
+        ;; Foreground — normal
+        ("_fg_norm_black_"   . ,(ansi "30"))
+        ("_fg_norm_red"      . ,(ansi "31"))
+        ("_fg_norm_green"    . ,(ansi "32"))
+        ("_fg_norm_yellow"   . ,(ansi "33"))
+        ("_fg_norm_blue"     . ,(ansi "34"))
+        ("_fg_norm_magenta"  . ,(ansi "35"))
+        ("_fg_norm_cyan"     . ,(ansi "36"))
+        ("_fg_norm_white"    . ,(ansi "37"))
+        ;; Foreground — bright
+        ("_fg_bright_black"   . ,(ansi "90"))
+        ("_fg_bright_red"     . ,(ansi "91"))
+        ("_fg_bright_green"   . ,(ansi "92"))
+        ("_fg_bright_yellow"  . ,(ansi "93"))
+        ("_fg_bright_blue"    . ,(ansi "94"))
+        ("_fg_bright_magenta" . ,(ansi "95"))
+        ("_fg_bright_cyan"    . ,(ansi "96"))
+        ("_fg_bright_white"   . ,(ansi "97"))
+        ;; Background — normal
+        ("_bg_norm_black_"   . ,(ansi "40"))
+        ("_bg_norm_red"      . ,(ansi "41"))
+        ("_bg_norm_green"    . ,(ansi "42"))
+        ("_bg_norm_yellow"   . ,(ansi "43"))
+        ("_bg_norm_blue"     . ,(ansi "44"))
+        ("_bg_norm_magenta"  . ,(ansi "45"))
+        ("_bg_norm_cyan"     . ,(ansi "46"))
+        ("_bg_norm_white"    . ,(ansi "47"))
+        ;; Background — bright
+        ("_bg_bright_black"   . ,(ansi "100"))
+        ("_bg_bright_red"     . ,(ansi "101"))
+        ("_bg_bright_green"   . ,(ansi "102"))
+        ("_bg_bright_yellow"  . ,(ansi "103"))
+        ("_bg_bright_blue"    . ,(ansi "104"))
+        ("_bg_bright_magenta" . ,(ansi "105"))
+        ("_bg_bright_cyan"    . ,(ansi "106"))
+        ("_bg_bright_white"   . ,(ansi "107"))))))
 
 ;;; --- Helpers ---
 
