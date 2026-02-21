@@ -14,6 +14,7 @@
    peeked        ;; peeked token or #f
    needs-more?   ;; #t if input is incomplete
    heredoc-queue ;; list of heredoc tokens waiting to be consumed
+   alias-fn      ;; (word -> string-or-#f) alias lookup, or #f to disable
    )
   transparent: #t)
 
@@ -21,9 +22,9 @@
 
 ;; Parse a complete command from input string
 ;; Returns an AST node (command-list, and-or-list, etc.) or #f for empty input
-(def (parse-complete-command input (extglob? #f))
+(def (parse-complete-command input (extglob? #f) (alias-fn #f))
   (let* ((lex (if (string? input) (make-shell-lexer input extglob?) input))
-         (ps (make-parser-state lex #f #f [])))
+         (ps (make-parser-state lex #f #f [] alias-fn)))
     (let ((result (parse-list ps)))
       (when (lexer-needs-more? lex)
         (set! (parser-state-needs-more? ps) #t))
@@ -38,9 +39,9 @@
 
 ;; Parse one "line" — semicolon-separated commands, stopping at newline.
 ;; This allows execution between lines so shopt changes take effect.
-(def (parse-one-line input (extglob? #f))
+(def (parse-one-line input (extglob? #f) (alias-fn #f))
   (let* ((lex (if (string? input) (make-shell-lexer input extglob?) input))
-         (ps (make-parser-state lex #f #f [])))
+         (ps (make-parser-state lex #f #f [] alias-fn)))
     (skip-newlines! ps)
     (let ((first (parse-and-or ps)))
       (if (not first)
@@ -284,58 +285,73 @@
 ;;         | function_def
 ;;         | simple_command
 (def (parse-command ps)
-  (let ((tok (parser-peek ps)))
-    (cond
-      ((not (token? tok)) #f)
-      ((eq? tok 'eof) #f)
-      ;; Compound commands
-      ((parser-check-word? ps "{")
-       (parse-brace-group ps))
-      ((parser-check? ps 'LPAREN)
-       ;; Consume ( and check for (( = arithmetic command
-       (parser-consume! ps)
-       (if (parser-check? ps 'LPAREN)
-         (let ((cmd (parse-arith-command ps))
+  (let command-loop ()
+    (let ((tok (parser-peek ps)))
+      (cond
+        ((not (token? tok)) #f)
+        ((eq? tok 'eof) #f)
+        ;; Compound commands
+        ((parser-check-word? ps "{")
+         (parse-brace-group ps))
+        ((parser-check? ps 'LPAREN)
+         ;; Consume ( and check for (( = arithmetic command
+         (parser-consume! ps)
+         (if (parser-check? ps 'LPAREN)
+           (let ((cmd (parse-arith-command ps))
+                 (redirs (parse-redirect-list ps)))
+             (if (pair? redirs)
+               (make-redirected-command cmd redirs)
+               cmd))
+           ;; Regular subshell — ( already consumed, parse body directly
+           (let ((body (parse-list ps)))
+             (skip-newlines! ps)
+             (unless (parser-check? ps 'RPAREN)
+               (error "parse error: expected ')'"))
+             (parser-consume! ps)
+             (let ((redirs (parse-redirect-list ps)))
+               (if (pair? redirs)
+                 (make-redirected-command (make-subshell body) redirs)
+                 (make-subshell body))))))
+        ((parser-check-word? ps "if")
+         (parse-if ps))
+        ((parser-check-word? ps "while")
+         (parse-while ps))
+        ((parser-check-word? ps "until")
+         (parse-until ps))
+        ((parser-check-word? ps "for")
+         (parse-for ps))
+        ((parser-check-word? ps "case")
+         (parse-case ps))
+        ((parser-check-word? ps "select")
+         (parse-select ps))
+        ((parser-check-word? ps "[[")
+         (let ((cmd (parse-cond-command ps))
                (redirs (parse-redirect-list ps)))
            (if (pair? redirs)
              (make-redirected-command cmd redirs)
-             cmd))
-         ;; Regular subshell — ( already consumed, parse body directly
-         (let ((body (parse-list ps)))
-           (skip-newlines! ps)
-           (unless (parser-check? ps 'RPAREN)
-             (error "parse error: expected ')'"))
-           (parser-consume! ps)
-           (let ((redirs (parse-redirect-list ps)))
-             (if (pair? redirs)
-               (make-redirected-command (make-subshell body) redirs)
-               (make-subshell body))))))
-      ((parser-check-word? ps "if")
-       (parse-if ps))
-      ((parser-check-word? ps "while")
-       (parse-while ps))
-      ((parser-check-word? ps "until")
-       (parse-until ps))
-      ((parser-check-word? ps "for")
-       (parse-for ps))
-      ((parser-check-word? ps "case")
-       (parse-case ps))
-      ((parser-check-word? ps "select")
-       (parse-select ps))
-      ((parser-check-word? ps "[[")
-       (let ((cmd (parse-cond-command ps))
-             (redirs (parse-redirect-list ps)))
-         (if (pair? redirs)
-           (make-redirected-command cmd redirs)
-           cmd)))
-      ((parser-check-word? ps "function")
-       (parse-function-def-keyword ps))
-      ((parser-check-word? ps "coproc")
-       (parse-coproc ps))
-      ;; Check for function def: word ( )
-      ;; (handled in simple-command when we see WORD LPAREN RPAREN)
-      (else
-       (parse-simple-command ps)))))
+             cmd)))
+        ((parser-check-word? ps "function")
+         (parse-function-def-keyword ps))
+        ((parser-check-word? ps "coproc")
+         (parse-coproc ps))
+        ;; Check for function def: word ( )
+        ;; (handled in simple-command when we see WORD LPAREN RPAREN)
+        (else
+         (let ((result (parse-simple-command ps)))
+           ;; If alias expansion changed the token stream and needs
+           ;; re-dispatch (e.g. alias expanded to a reserved word),
+           ;; loop back to check the new first token
+           (if (eq? result 'alias-restart)
+             (command-loop)
+             result)))))))
+
+;;; --- Alias helpers (inlined to avoid circular import with functions.ss) ---
+
+;; Check if alias value ends with space (triggers next-word alias expansion)
+(def (alias-value-continues? value)
+  (and (string? value)
+       (> (string-length value) 0)
+       (char=? (string-ref value (- (string-length value) 1)) #\space)))
 
 ;;; --- Simple command ---
 
@@ -343,10 +359,15 @@
 ;; cmd_prefix : (ASSIGNMENT_WORD | redirect)+
 ;; cmd_suffix : (WORD | redirect)+
 (def (parse-simple-command ps)
-  (let/cc return  ;; early return for function definitions
+  (let/cc return  ;; early return for function definitions and alias restart
   (let ((assignments [])
         (words [])
-        (redirections []))
+        (redirections [])
+        ;; Alias expansion state
+        (alias-fn (parser-state-alias-fn ps))
+        (expanded-aliases (make-hash-table))  ;; cycle detection
+        (check-next-for-alias #f)   ;; trailing-space next-word expansion
+        (alias-text-end #f))        ;; lexer boundary for trailing-space tracking
     ;; Parse prefix: assignments and redirections before command word
     (let prefix-loop ()
       (let ((tok (parser-peek ps)))
@@ -387,10 +408,61 @@
         (when (and (eq? (token-type tok) 'WORD)
                    (or (pair? assignments)
                        (not (reserved-word? (token-value tok)))))
+          ;; --- Alias expansion on first word ---
           (let ((word-tok (parser-next! ps)))
-            (set! words (cons (token-value word-tok) words))
+            (let alias-check ((wtok word-tok))
+              (let* ((word-val (token-value wtok))
+                     (alias-val (and alias-fn
+                                     (not (hash-get expanded-aliases word-val))
+                                     (alias-fn word-val))))
+                (if alias-val
+                  ;; Alias match — expand
+                  (begin
+                    (hash-put! expanded-aliases word-val #t)
+                    (let ((lex (parser-state-lexer ps)))
+                      ;; Prepend alias value text to lexer input
+                      (lexer-prepend-text! lex alias-val)
+                      ;; Track boundary for trailing-space next-word expansion
+                      (set! alias-text-end (string-length alias-val))
+                      (set! check-next-for-alias (alias-value-continues? alias-val))
+                      ;; Clear parser peeked token
+                      (set! (parser-state-peeked ps) #f)
+                      ;; Check what the expansion starts with
+                      (let ((new-tok (parser-peek ps)))
+                        (cond
+                          ;; Expansion starts with a reserved word (and no prefix assignments)
+                          ;; → need to restart from parse-command level
+                          ((and (token? new-tok)
+                                (eq? (token-type new-tok) 'WORD)
+                                (null? assignments)
+                                (null? redirections)
+                                (reserved-word? (token-value new-tok)))
+                           (return 'alias-restart))
+                          ;; Expansion starts with LPAREN — could be subshell or (( ))
+                          ((and (token? new-tok)
+                                (eq? (token-type new-tok) 'LPAREN)
+                                (null? assignments)
+                                (null? redirections))
+                           (return 'alias-restart))
+                          ;; Expansion starts with a regular WORD → recurse alias check
+                          ((and (token? new-tok)
+                                (eq? (token-type new-tok) 'WORD))
+                           (alias-check (parser-next! ps)))
+                          ;; Other token (operator, etc.) → restart from parse-command
+                          ((and (token? new-tok)
+                                (not (eq? (token-type new-tok) 'WORD))
+                                (null? assignments)
+                                (null? redirections))
+                           (return 'alias-restart))
+                          ;; Has prefix assignments/redirections — stay in simple command
+                          (else
+                           ;; Read new first word if it's a WORD
+                           (when (and (token? new-tok) (eq? (token-type new-tok) 'WORD))
+                             (set! words (cons (token-value (parser-next! ps)) words))))))))
+                  ;; Not an alias — use this word as-is
+                  (set! words (cons (token-value wtok) words)))))
             ;; Check for function def
-            (when (parser-check? ps 'LPAREN)
+            (when (and (pair? words) (parser-check? ps 'LPAREN))
               (parser-consume! ps)  ;; (
               (if (parser-check? ps 'RPAREN)
                 (begin
@@ -401,7 +473,7 @@
                         (redirs (parse-redirect-list ps)))
                     (return
                      (make-function-def
-                      (token-value word-tok)
+                      (car words)  ;; function name
                       body
                       redirs))))
                 ;; Bare ( after command word is a syntax error (bash behavior)
@@ -410,6 +482,39 @@
             (let suffix-loop ()
               (let ((tok (parser-peek ps)))
                 (cond
+                  ;; --- Trailing-space alias expansion on next word ---
+                  ((and check-next-for-alias alias-fn
+                        (token? tok) (eq? (token-type tok) 'WORD)
+                        (number? alias-text-end)
+                        (>= (lexer-pos (parser-state-lexer ps)) alias-text-end))
+                   ;; This word is the first one from the original input after alias text.
+                   ;; Check it for alias expansion with FRESH cycle detection
+                   ;; (each expansion position has its own cycle set, per bash behavior).
+                   (set! check-next-for-alias #f)
+                   (let expand-next-alias ((next-seen (make-hash-table)))
+                     (let* ((tok2 (parser-peek ps)))
+                       (if (not (and (token? tok2) (eq? (token-type tok2) 'WORD)))
+                         (suffix-loop)  ;; not a word, continue normally
+                         (let* ((next-tok (parser-next! ps))
+                                (next-val (token-value next-tok))
+                                (next-alias (and (not (hash-get next-seen next-val))
+                                                 (alias-fn next-val))))
+                           (if next-alias
+                             (begin
+                               (hash-put! next-seen next-val #t)
+                               (let ((lex (parser-state-lexer ps)))
+                                 (lexer-prepend-text! lex next-alias)
+                                 ;; If this alias also ends with space, set up for next word
+                                 (when (alias-value-continues? next-alias)
+                                   (set! check-next-for-alias #t)
+                                   (set! alias-text-end (string-length next-alias)))
+                                 (set! (parser-state-peeked ps) #f)
+                                 ;; Recursively check first word of this expansion
+                                 (expand-next-alias next-seen)))
+                             ;; Not an alias — add as regular word
+                             (begin
+                               (set! words (cons next-val words))
+                               (suffix-loop))))))))
                   ;; ASSIGNMENT_WORD as argument to builtins like
                   ;; local, export, readonly, declare
                   ;; Check for compound array: NAME=( ... )

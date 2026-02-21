@@ -954,38 +954,55 @@
 
 ;; alias [name[=value] ...]
 (defbuiltin "alias"
-    (if (null? args)
-      ;; List all aliases
-      (begin
-        (for-each
-         (lambda (pair)
-           (displayln (format "alias ~a='~a'" (car pair) (cdr pair))))
-         (alias-list env))
-        0)
-      (begin
-        (for-each
-         (lambda (arg)
-           (let ((eq-pos (string-find-char* arg #\=)))
-             (if eq-pos
-               (alias-set! env
-                          (substring arg 0 eq-pos)
-                          (substring arg (+ eq-pos 1) (string-length arg)))
-               ;; Show single alias
-               (let ((val (alias-get env arg)))
-                 (if val
-                   (displayln (format "alias ~a='~a'" arg val))
-                   (fprintf (current-error-port) "alias: ~a: not found~n" arg))))))
-         args)
-        0)))
+    (let ((real-args (if (and (pair? args) (string=? (car args) "--"))
+                       (cdr args) args)))
+      (if (null? real-args)
+        ;; List all aliases
+        (begin
+          (for-each
+           (lambda (pair)
+             (displayln (format "alias ~a='~a'" (car pair) (cdr pair))))
+           (sort (alias-list env) (lambda (a b) (string<? (car a) (car b)))))
+          0)
+        (let ((status 0))
+          (for-each
+           (lambda (arg)
+             (let ((eq-pos (string-find-char* arg #\=)))
+               (if eq-pos
+                 (alias-set! env
+                            (substring arg 0 eq-pos)
+                            (substring arg (+ eq-pos 1) (string-length arg)))
+                 ;; Show single alias
+                 (let ((val (alias-get env arg)))
+                   (if val
+                     (displayln (format "alias ~a='~a'" arg val))
+                     (begin
+                       (fprintf (current-error-port) "alias: ~a: not found~n" arg)
+                       (set! status 1)))))))
+           real-args)
+          status))))
 
 ;; unalias [-a] name...
 (defbuiltin "unalias"
     (cond
+      ((null? args)
+       (fprintf (current-error-port) "unalias: usage: unalias [-a] name [name ...]~n")
+       2)
       ((and (pair? args) (string=? (car args) "-a"))
        (alias-clear! env) 0)
       (else
-       (for-each (lambda (name) (alias-unset! env name)) args)
-       0)))
+       (let ((real-args (if (and (pair? args) (string=? (car args) "--"))
+                           (cdr args) args))
+             (status 0))
+         (for-each
+          (lambda (name)
+            (if (alias-get env name)
+              (alias-unset! env name)
+              (begin
+                (fprintf (current-error-port) "unalias: ~a: not found~n" name)
+                (set! status 1))))
+          real-args)
+         status))))
 
 ;; read [-r] [-p prompt] [-t timeout] [-d delim] [-n count] [-N count] [-s] [-a arr] [-u fd] var...
 (defbuiltin "read"

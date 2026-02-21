@@ -170,10 +170,19 @@
                   (lambda ()
                     ;; Update lexer extglob flag in case shopt changed it
                     (set! (lexer-extglob? lexer) (env-shopt? env "extglob"))
-                    (parse-one-line lexer (env-shopt? env "extglob"))))))
+                    ;; Build alias lookup: checks expand_aliases shopt, returns value or #f
+                    (let ((alias-fn (and (env-shopt? env "expand_aliases")
+                                        (lambda (word) (alias-get env word)))))
+                      (parse-one-line lexer (env-shopt? env "extglob") alias-fn))))))
         (cond
           ((eq? cmd 'error) 2)  ;; syntax error
           ((not cmd) status)     ;; end of input
+          ;; Unterminated quote/construct after parsing — syntax error
+          ((lexer-want-more? lexer)
+           (fprintf (current-error-port)
+                    "gsh: syntax error: unexpected end of file~n")
+           (env-set-last-status! env 2)
+           2)
           (else
            (let ((new-status
                   (with-catch

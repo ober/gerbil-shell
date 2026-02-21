@@ -1917,18 +1917,20 @@
                                (string-append "/dev/fd/" (number->string 1)))))
                (current-output-port pipe-port)
                ;; Execute in subshell context so exit doesn't terminate parent.
+               ;; Clone env so changes (aliases, variables) don't leak back.
                ;; Clear pipeline fd params so execute-external won't override
                ;; fd 0/1 with pipeline pipe fds — we already redirected fd 1
                ;; to the capture pipe above.
-               (with-catch
-                (lambda (e)
-                  (when (subshell-exit-exception? e)
-                    (env-set-last-status! env (subshell-exit-exception-status e))))
-                (lambda ()
-                  (parameterize ((*in-subshell* #t)
-                                 (*pipeline-stdin-fd* #f)
-                                 (*pipeline-stdout-fd* #f))
-                    (exec-fn cmd env))))
+               (let ((sub-env (env-clone env)))
+                 (with-catch
+                  (lambda (e)
+                    (when (subshell-exit-exception? e)
+                      (env-set-last-status! env (subshell-exit-exception-status e))))
+                  (lambda ()
+                    (parameterize ((*in-subshell* #t)
+                                   (*pipeline-stdin-fd* #f)
+                                   (*pipeline-stdout-fd* #f))
+                      (exec-fn cmd sub-env)))))
                ;; Flush and close the pipe port
                (force-output pipe-port)
                (close-port pipe-port))

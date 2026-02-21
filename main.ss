@@ -86,8 +86,10 @@
 ;; Register builtins that need main.ss-level callbacks
 ;; (can't be defined in builtins.ss due to circular imports)
 (def (register-late-builtins! env)
-  ;; Set the execute-input callback for eval and command substitution
-  (*execute-input* (lambda (input env) (execute-input input env)))
+  ;; Set the execute-input callback for eval and command substitution.
+  ;; Uses execute-string (line-by-line) so alias/shopt changes within
+  ;; the input take effect between lines (e.g. eval "alias x=echo\nx hi").
+  (*execute-input* (lambda (input env) (execute-string input env)))
   ;; Set the arithmetic evaluation callback for integer variable attributes
   (*arith-eval-fn* arith-eval)
   ;; Set the execute-external callback for 'command' builtin
@@ -378,7 +380,9 @@
                               (exception-message e))
                      'error)
                    (lambda ()
-                     (parse-complete-command input (env-shopt? env "extglob"))))))
+                     (let ((alias-fn (and (env-shopt? env "expand_aliases")
+                                          (lambda (word) (alias-get env word)))))
+                       (parse-complete-command input (env-shopt? env "extglob") alias-fn))))))
          (cond
            ((eq? cmd 'error) 2)
            ((not cmd) 0)
@@ -459,18 +463,10 @@
          (setup-noninteractive-signal-handlers!)
          ;; Load non-interactive startup
          (load-startup-files! env login? #f)
-         ;; Try parse-complete-command first (handles here-docs correctly).
-         ;; If parse fails, fall back to execute-string for line-by-line
-         ;; execution so earlier commands run before later parse errors
-         ;; (e.g. "trap 'echo bye' EXIT; for" — trap must execute).
+         ;; Always use line-by-line execution (execute-string) for -c commands.
+         ;; This allows shopt changes (expand_aliases, extglob) and alias
+         ;; definitions to take effect between lines, matching bash behavior.
          (let* ((interactive? (hash-ref args-hash 'interactive?))
-                ;; Interactive -c: always use line-by-line execution so nounset
-                ;; errors only abort the current line (bash behavior)
-                (parse-ok? (and (not interactive?)
-                                (with-catch (lambda (e) #f)
-                                  (lambda ()
-                                    (parse-complete-command command (env-shopt? env "extglob"))
-                                    #t))))
                 (status (with-catch
                          (lambda (e)
                            (cond
@@ -491,9 +487,7 @@
                                              (string-prefix? "bad substitution: unclosed" msg)))
                                   2 1)))))
                          (lambda ()
-                           (if parse-ok?
-                             (execute-input command env)
-                             (execute-string command env interactive?))))))
+                           (execute-string command env interactive?)))))
            ;; Process any pending signals before exit
            (process-traps! env)
            (run-exit-trap! env)
@@ -515,7 +509,9 @@
                                  (lambda ()
                                    (= (ffi-isatty 0) 1))))))
          (when interactive?
-           (hash-put! args-hash 'interactive? #t))
+           (hash-put! args-hash 'interactive? #t)
+           ;; Enable alias expansion by default for interactive shells (bash behavior)
+           (env-shopt-set! env "expand_aliases" #t))
          ;; Load startup files
          (load-startup-files! env login? interactive?)
          (if interactive?

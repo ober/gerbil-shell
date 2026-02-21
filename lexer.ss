@@ -48,6 +48,17 @@
 (def (lexer-needs-more? lex)
   (lexer-want-more? lex))
 
+;; Prepend text to the lexer's input stream (used for alias expansion).
+;; Inserts text at the current read position, so it will be tokenized next.
+(def (lexer-prepend-text! lex text)
+  (let* ((remaining (substring (lexer-input lex) (lexer-pos lex) (lexer-len lex)))
+         (new-input (string-append text remaining)))
+    (set! (lexer-input lex) new-input)
+    (set! (lexer-pos lex) 0)
+    (set! (lexer-len lex) (string-length new-input))
+    ;; Clear any peeked token since the input has changed
+    (set! (lexer-peeked lex) #f)))
+
 ;; Tokenize an entire input string, return list of tokens
 (def (tokenize input)
   (let ((lex (make-shell-lexer input)))
@@ -371,8 +382,16 @@
             ;; Word delimiters
             ((or (char-whitespace? ch)
                  (and (operator-start? ch)
-                      ;; Don't break on ! inside a word
+                      ;; Don't break on ! inside a word (already has content)
                       (not (and (char=? ch #\!) has-content?))
+                      ;; Don't break on ! at word start when followed by non-delimiter
+                      ;; (e.g. "!!!" should be a single word, not three BANGs)
+                      (not (and (char=? ch #\!)
+                                (not has-content?)
+                                (< (+ (lexer-pos lex) 1) (lexer-len lex))
+                                (let ((next (char-at lex (+ (lexer-pos lex) 1))))
+                                  (not (or (char-whitespace? next)
+                                           (memq next '(#\; #\| #\& #\( #\) #\< #\> #\newline)))))))
                       ;; Don't break on !( when extglob is enabled
                       (not (and (lexer-extglob? lex)
                                 (char=? ch #\!)
@@ -532,6 +551,17 @@
                 (char=? ch #\!)
                 (< (+ (lexer-pos lex) 1) (lexer-len lex))
                 (char=? (char-at lex (+ (lexer-pos lex) 1)) #\())
+           (read-word! lex))
+          ;; ! is only BANG (pipeline negation) when followed by whitespace,
+          ;; EOF, or a delimiter. Otherwise it's part of a word (e.g. "!!!")
+          ((and (char=? ch #\!)
+                (or (>= (+ (lexer-pos lex) 1) (lexer-len lex))
+                    (let ((next (char-at lex (+ (lexer-pos lex) 1))))
+                      (or (char-whitespace? next)
+                          (memq next '(#\; #\| #\& #\( #\) #\< #\> #\newline))))))
+           (read-operator! lex))
+          ((and (char=? ch #\!) ;; ! followed by non-delimiter → word
+                (< (+ (lexer-pos lex) 1) (lexer-len lex)))
            (read-word! lex))
           ((operator-start? ch) (read-operator! lex))
           ((char=? ch #\') (read-word! lex))
