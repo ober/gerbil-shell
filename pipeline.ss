@@ -229,7 +229,7 @@
          ;; External command — inherits real fds 0/1 directly
          ((and cmd-name (which cmd-name))
           (let* ((path (which cmd-name))
-                 ;; Resolve relative paths to absolute for open-process
+                 ;; Resolve relative paths to absolute
                  (exec-path (if (string-contains? path "/")
                               (path-expand path) path))
                  (args (if (pair? words) (cdr words) []))
@@ -243,17 +243,24 @@
                                  (lambda (e) #f)
                                  (lambda () (apply-redirections redirections cmd-env)))
                                 []))
-                 (proc (open-process-with-sigpipe
-                        [path: (string->c-safe exec-path)
-                         arguments: (map string->c-safe args)
-                         environment: (map string->c-safe (env-exported-alist cmd-env))
-                         stdin-redirection: #f
-                         stdout-redirection: #f
-                         stderr-redirection: #f])))
+                 (packed-argv (pack-with-soh
+                               (map string->c-safe (cons cmd-name args))))
+                 (packed-env (pack-with-soh
+                              (map string->c-safe (env-exported-alist cmd-env))))
+                 (keep-fds (pack-fds-with-soh (*active-redirect-fds*)))
+                 (pid (ffi-fork-exec (string->c-safe exec-path)
+                                     packed-argv packed-env
+                                     0  ;; foreground pipeline component
+                                     (*gambit-scheduler-rfd*)
+                                     (*gambit-scheduler-wfd*)
+                                     keep-fds)))
             ;; Restore redirections in parent (child already inherited the fds)
             (when (pair? redir-saved)
               (restore-redirections redir-saved))
-            proc))
+            (if (< pid 0)
+              ;; Fork failed — fall back to thread
+              (launch-thread-piped cmd child-env execute-fn has-pipe-in? has-pipe-out?)
+              (list 'process pid))))
          ;; Shell function or unknown — run in thread
          (else
           (launch-thread-piped cmd child-env execute-fn has-pipe-in? has-pipe-out?)))))
@@ -334,6 +341,20 @@
                  (let ((raw-status (process-status proc)))
                    (close-port proc)
                    (status->exit-code raw-status))))))))
+       ((and (list? proc) (eq? (car proc) 'process))
+        ;; ffi-fork-exec'd child: poll with waitpid (no Gambit port)
+        (let ((pid (cadr proc)))
+          (let loop ((delay 0.001))
+            (let ((result (ffi-waitpid-pid pid WNOHANG)))
+              (cond
+                ((> result 0)
+                 (status->exit-code (ffi-waitpid-status)))
+                ((= result 0)
+                 (thread-sleep! delay)
+                 (loop (min 0.05 (* delay 1.5))))
+                (else
+                 ;; ECHILD — shouldn't happen for ffi-fork-exec children
+                 0))))))
        ((and (list? proc) (eq? (car proc) 'direct))
         ;; lastpipe: already executed directly, return stored status
         (cadr proc))

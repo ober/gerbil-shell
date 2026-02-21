@@ -55,6 +55,24 @@
     (ffi-sigpipe-block)
     proc))
 
+;;; --- SOH packing for ffi-execve / ffi-fork-exec ---
+
+;; Pack a list of strings with SOH (char 1) delimiter
+(def *soh* (make-string 1 (integer->char 1)))
+(def (pack-with-soh strs)
+  (if (null? strs) ""
+      (call-with-output-string
+        (lambda (port)
+          (display (car strs) port)
+          (for-each (lambda (s)
+                      (display *soh* port)
+                      (display s port))
+                    (cdr strs))))))
+
+;; Pack a list of integers as SOH-delimited string of their decimal representations
+(def (pack-fds-with-soh fds)
+  (pack-with-soh (map number->string fds)))
+
 ;;; --- String utilities ---
 
 ;; Split string by any character in charset (a string of delimiters)
@@ -344,3 +362,51 @@
    (lambda () (= (ffi-access path 2) 0))))  ;; W_OK = 2
 
 ;; Note: file-executable? is already defined above as executable?
+
+;;; --- Raw byte encoding for $'...' byte escapes ---
+;;
+;; Gerbil strings are Unicode. Byte values 128-255 from $'\NNN' and $'\xNN'
+;; would be UTF-8 encoded on output (2 bytes instead of 1). We use Unicode
+;; Private Use Area (U+E000-U+E0FF) to mark these as raw bytes. Output
+;; functions detect PUA chars and write single bytes via write-u8.
+
+(def raw-byte-base #xE000)
+
+;; Encode a byte value (0-255) as a PUA character for raw byte output.
+;; Values < 128 are returned as-is since UTF-8 encoding matches raw byte.
+(def (byte->raw-char val)
+  (if (>= val #x80)
+    (integer->char (+ raw-byte-base val))
+    (integer->char val)))
+
+;; Check if a character is a PUA raw byte marker
+(def (raw-byte-char? ch)
+  (let ((code (char->integer ch)))
+    (and (>= code raw-byte-base) (<= code (+ raw-byte-base #xFF)))))
+
+;; Display a shell string, converting PUA raw byte markers to actual bytes.
+;; Fast path: if no PUA chars, use regular display.
+(def (shell-display str)
+  (let ((len (string-length str)))
+    (let scan ((i 0))
+      (cond
+        ((>= i len) (display str))  ;; no PUA chars found, fast path
+        ((raw-byte-char? (string-ref str i))
+         ;; Found PUA char, use slow path for whole string
+         (shell-display-raw str))
+        (else (scan (+ i 1)))))))
+
+;; Slow path: display string with PUA chars converted to raw bytes
+(def (shell-display-raw str)
+  (let ((len (string-length str)))
+    (let loop ((i 0))
+      (when (< i len)
+        (let* ((ch (string-ref str i))
+               (code (char->integer ch)))
+          (if (and (>= code raw-byte-base) (<= code (+ raw-byte-base #xFF)))
+            (begin
+              (force-output)
+              (write-u8 (- code raw-byte-base))
+              (force-output))
+            (display ch)))
+        (loop (+ i 1))))))

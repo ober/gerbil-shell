@@ -408,43 +408,49 @@
            ;; doesn't interleave with pending parent output
            (force-output)
            (force-output (current-error-port))
-           (let* ((proc (open-process-with-sigpipe
-                         [path: (string->c-safe exec-path)
-                          arguments: (map string->c-safe args)
-                          environment: (map string->c-safe (env-exported-alist env))
-                          stdin-redirection: #f
-                          stdout-redirection: #f
-                          stderr-redirection: #f]))
-                  (pid (process-pid proc)))
+           (let* ((packed-argv (pack-with-soh
+                                (map string->c-safe (cons cmd-name args))))
+                  (packed-env (pack-with-soh
+                               (map string->c-safe (env-exported-alist env))))
+                  (keep-fds (pack-fds-with-soh (*active-redirect-fds*)))
+                  (pid (ffi-fork-exec (string->c-safe exec-path)
+                                      packed-argv packed-env
+                                      0  ;; pgid=0: foreground
+                                      (*gambit-scheduler-rfd*)
+                                      (*gambit-scheduler-wfd*)
+                                      keep-fds)))
              ;; Restore fds immediately after fork
              (when saved-1 (ffi-dup2 saved-1 1) (ffi-close-fd saved-1))
              (when saved-0 (ffi-dup2 saved-0 0) (ffi-close-fd saved-0))
              (when in-pipeline? (mutex-unlock! *pipeline-fd-mutex*))
-             (let-values (((exit-code stopped?)
-                           (wait-for-foreground-process pid proc)))
-               (if stopped?
-                 ;; Ctrl-Z: add to job table as stopped
-                 (let ((cmd-text (string-join-words (cons cmd-name args)))
-                       (job (job-table-add! [(cons pid proc)] "" pid)))
-                   (set! (job-command-text job) cmd-text)
-                   (set! (job-status job) 'stopped)
-                   (for-each (lambda (p) (set! (job-process-status p) 'stopped))
-                             (job-processes job))
-                   (fprintf (current-error-port) "~n[~a]+  Stopped                 ~a~n"
-                            (job-id job) cmd-text)
-                   (+ 128 20))  ;; 148 = 128 + SIGTSTP(20)
-                 ;; Normal exit
-                 (begin
-                   (close-port proc)
-                   ;; If child was killed by a signal (exit >= 128), clear the
-                   ;; corresponding pending signal so the shell doesn't run the
-                   ;; trap for it (bash behavior: trap only fires for signals
-                   ;; received directly by the shell, not relayed from children)
-                   (when (>= exit-code 128)
-                     (let ((sig-name (signal-number->name (- exit-code 128))))
-                       (when sig-name
-                         (clear-pending-signal! sig-name))))
-                   exit-code))))))))))
+             (if (< pid 0)
+               (begin
+                 (fprintf (current-error-port) "gsh: ~a: fork failed~n" cmd-name)
+                 126)
+               (let-values (((exit-code stopped?)
+                             (wait-for-foreground-process-raw pid)))
+                 (if stopped?
+                   ;; Ctrl-Z: add to job table as stopped
+                   (let ((cmd-text (string-join-words (cons cmd-name args)))
+                         (job (job-table-add! [(cons pid #f)] "" pid)))
+                     (set! (job-command-text job) cmd-text)
+                     (set! (job-status job) 'stopped)
+                     (for-each (lambda (p) (set! (job-process-status p) 'stopped))
+                               (job-processes job))
+                     (fprintf (current-error-port) "~n[~a]+  Stopped                 ~a~n"
+                              (job-id job) cmd-text)
+                     (+ 128 20))  ;; 148 = 128 + SIGTSTP(20)
+                   ;; Normal exit
+                   (begin
+                     ;; If child was killed by a signal (exit >= 128), clear the
+                     ;; corresponding pending signal so the shell doesn't run the
+                     ;; trap for it (bash behavior: trap only fires for signals
+                     ;; received directly by the shell, not relayed from children)
+                     (when (>= exit-code 128)
+                       (let ((sig-name (signal-number->name (- exit-code 128))))
+                         (when sig-name
+                           (clear-pending-signal! sig-name))))
+                     exit-code)))))))))))
 
 ;;; --- exec builtin ---
 
@@ -966,18 +972,6 @@
 
 ;;; --- Helpers ---
 
-;; Pack a list of strings with SOH (char 1) delimiter for ffi-execve (O(n) via output port)
-(def *soh* (make-string 1 (integer->char 1)))
-(def (pack-with-soh strs)
-  (if (null? strs) ""
-      (call-with-output-string
-        (lambda (port)
-          (display (car strs) port)
-          (for-each (lambda (s)
-                      (display *soh* port)
-                      (display s port))
-                    (cdr strs))))))
-
 (def (return-status env status)
   (env-set-last-status! env status)
   status)
@@ -1133,18 +1127,25 @@
                  (exec-path (if (string-contains? path "/")
                               (path-expand path) path))
                  (_flush (begin (force-output) (force-output (current-error-port))))
-                 (proc (open-process-with-sigpipe
-                        [path: (string->c-safe exec-path)
-                         arguments: (map string->c-safe actual-args)
-                         environment: (map string->c-safe (env-exported-alist temp-env))
-                         stdin-redirection: #f
-                         stdout-redirection: #f
-                         stderr-redirection: #f]))
-                 (pid (process-pid proc)))
-            ;; Put background process in its own process group
-            (with-catch (lambda (e) #!void)
-              (lambda () (ffi-setpgid pid pid)))
-            (cons pid [(cons pid proc)]))
+                 (packed-argv (pack-with-soh
+                               (map string->c-safe (cons cmd-name actual-args))))
+                 (packed-env (pack-with-soh
+                              (map string->c-safe (env-exported-alist temp-env))))
+                 (keep-fds (pack-fds-with-soh (*active-redirect-fds*)))
+                 (pid (ffi-fork-exec (string->c-safe exec-path)
+                                     packed-argv packed-env
+                                     -1  ;; pgid=-1: own process group
+                                     (*gambit-scheduler-rfd*)
+                                     (*gambit-scheduler-wfd*)
+                                     keep-fds)))
+            (if (< pid 0)
+              ;; Fork failed — fall back to thread for error message
+              (let* ((fake-pid (next-fake-pid!))
+                     (th (spawn (lambda ()
+                                  (fprintf (current-error-port) "gsh: ~a: fork failed~n" cmd-name)
+                                  126))))
+                (cons fake-pid [(cons fake-pid th)]))
+              (cons pid [(cons pid #f)])))
           ;; Command not found — still launch in thread for error message
           (let* ((fake-pid (next-fake-pid!))
                  (child-env (env-clone env))

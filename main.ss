@@ -233,6 +233,7 @@
     (history-init! histfile histsize))
   ;; Set up signal handlers
   (setup-default-signal-handlers!)
+  (release-user-fds!)
   ;; Save terminal state (slot 0) so we can restore after foreground commands
   ;; that corrupt terminal settings (e.g. top, vim)
   (when (= (ffi-isatty 0) 1)
@@ -441,11 +442,35 @@
 (def (move-internal-fds-high!)
   (ffi-move-gambit-fds 255))
 
+;; Reserve fds 3-9 with /dev/null so system services (Gerbil signalfd)
+;; don't occupy them.  Without this, signalfd gets fd 3 (lowest available
+;; after Gambit fds move to 255+) and here-doc redirects on fd 3 break.
+(def *reserved-user-fds* [])
+
+(def (reserve-user-fds!)
+  (let loop ((fds []))
+    (let ((fd (ffi-open-raw "/dev/null" 0 0)))  ;; O_RDONLY
+      (if (<= fd 9)
+        (loop (cons fd fds))
+        (begin
+          (ffi-close-fd fd)
+          (set! *reserved-user-fds* fds))))))
+
+(def (release-user-fds!)
+  (for-each ffi-close-fd *reserved-user-fds*)
+  (set! *reserved-user-fds* []))
+
 ;;; --- Entry point ---
 
 (def (main . args)
   ;; Move Gambit's internal fds (3-9) to high numbers so user can use exec 3>, etc.
   (move-internal-fds-high!)
+  ;; Reserve fds 3-9 so signalfd (created by add-signal-handler!) doesn't get fd 3.
+  ;; Released after signal handlers are set up.
+  (reserve-user-fds!)
+  ;; Cache Gambit's scheduler pipe fds for ffi-fork-exec (must close in child)
+  (*gambit-scheduler-rfd* (ffi-gambit-scheduler-rfd))
+  (*gambit-scheduler-wfd* (ffi-gambit-scheduler-wfd))
   (let* ((args-hash (parse-args args))
          (command (hash-ref args-hash 'command))
          (script (hash-ref args-hash 'script))
@@ -461,6 +486,7 @@
          ;; Set up signal handlers so signals are queued (not fatal)
          ;; and EXIT traps can fire on signal-driven exit
          (setup-noninteractive-signal-handlers!)
+         (release-user-fds!)
          ;; Load non-interactive startup
          (load-startup-files! env login? #f)
          ;; Always use line-by-line execution (execute-string) for -c commands.
@@ -497,6 +523,7 @@
        (let ((script-args (hash-ref args-hash 'args)))
          ;; Set up signal handlers so signals are queued (not fatal)
          (setup-noninteractive-signal-handlers!)
+         (release-user-fds!)
          ;; Load non-interactive startup
          (load-startup-files! env login? #f)
          (let ((status (execute-script script script-args env)))

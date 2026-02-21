@@ -37,7 +37,11 @@
 (def (apply-redirections redirs env)
   (let loop ((redirs redirs) (saved []))
     (if (null? redirs)
-      (reverse saved)
+      (let ((result (reverse saved)))
+        ;; Track which fds are active redirects so ffi-fork-exec can preserve them
+        (*active-redirect-fds*
+         (append (map car result) (*active-redirect-fds*)))
+        result)
       (let* ((redir (car redirs))
              (result (with-catch
                       (lambda (e)
@@ -61,6 +65,11 @@
 ;; Restore redirections from saved state
 ;; Each entry: (fd saved-real-fd saved-port) or (fd saved-real-fd saved-port new-port)
 (def (restore-redirections saved)
+  ;; Remove these fds from the active-redirect tracking
+  (let ((restored-fds (map car saved)))
+    (*active-redirect-fds*
+     (filter (lambda (fd) (not (member fd restored-fds)))
+             (*active-redirect-fds*))))
   (for-each
    (lambda (entry)
      (let ((fd (car entry))

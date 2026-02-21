@@ -96,7 +96,7 @@
                    (when (cdr result)  ;; \c encountered — stop all output
                      (force-output)
                      (stop 0)))
-                 (display (car rest)))
+                 (shell-display (car rest)))
                (arg-loop (cdr rest) #f)))
            (when newline? (newline))
            (force-output)
@@ -3361,8 +3361,14 @@
              ((#\c) (cons (reverse (flush-buf! acc)) #t))  ;; \c = stop all output
              (else (display "\\" buf) (display (string next) buf) (loop (+ i 2) acc)))))
         (else
-         (display (string-ref str i) buf)
-         (loop (+ i 1) acc))))))
+         (let* ((ch (string-ref str i))
+                (code (char->integer ch)))
+           (if (and (>= code raw-byte-base) (<= code (+ raw-byte-base #xFF)))
+             ;; PUA raw byte from $'...' — emit as fixnum for raw byte output
+             (loop (+ i 1) (cons (- code raw-byte-base) (flush-buf! acc)))
+             (begin
+               (display ch buf)
+               (loop (+ i 1) acc)))))))))
 
 ;;; --- Full printf implementation ---
 

@@ -176,6 +176,46 @@
     (filter (lambda (j) (not (memq (job-status j) '(done killed))))
             *job-table*)))
 
+;; Wait for a foreground process launched via ffi-fork-exec (raw PID, no Gambit port).
+;; Same polling logic as wait-for-foreground-process but without ECHILD fallback
+;; (Gambit doesn't know about these children so there's no reaping race).
+;; Returns (values exit-code stopped?)
+(def (wait-for-foreground-process-raw pid)
+  (let loop ((delay 0.001))
+    (let ((result (ffi-waitpid-pid pid (bitwise-ior WNOHANG WUNTRACED))))
+      (cond
+        ((> result 0)
+         (let ((raw (ffi-waitpid-status)))
+           (cond
+             ((WIFSTOPPED raw)
+              (values (+ 128 (WSTOPSIG raw)) #t))
+             ((WIFEXITED raw)
+              (values (WEXITSTATUS raw) #f))
+             ((WIFSIGNALED raw)
+              (values (+ 128 (WTERMSIG raw)) #f))
+             (else
+              (values 0 #f)))))
+        ((= result 0)
+         ;; Still running — sleep and poll again
+         (thread-sleep! delay)
+         (thread-yield!)
+         (let ((pending (pending-signals!)))
+           (for-each
+            (lambda (sig-name)
+              (cond
+                ((or (string=? sig-name "TERM") (string=? sig-name "INT"))
+                 (let ((signum (signal-name->number sig-name)))
+                   (when signum
+                     (kill (- pid) signum))))
+                (else
+                 (set! *pending-signals* (cons sig-name *pending-signals*)))))
+            pending))
+         (loop (min 0.05 (* delay 1.5))))
+        (else
+         ;; ECHILD — should not happen for ffi-fork-exec children
+         ;; but handle gracefully
+         (values 0 #f))))))
+
 ;; Wait for a foreground process, supporting Ctrl-Z (SIGTSTP detection).
 ;; Uses polling waitpid with WUNTRACED since Gambit's process-status
 ;; doesn't report stopped processes.
@@ -231,30 +271,58 @@
      (lambda (proc)
        (when (eq? (job-process-status proc) 'running)
          (let ((port (job-process-port proc)))
-           (when port
-             (if (thread? port)
-               ;; Thread-based job (builtin/function/compound command)
-               (let ((result (with-catch (lambda (e) 1)
-                               (lambda () (thread-join! port)))))
-                 (set! last-exit-code (if (integer? result) result 0))
-                 (set! (job-process-status proc) 'exited))
-               ;; Process-based job (external command)
-               (let ((raw (with-catch (lambda (e) 0)
-                            (lambda () (process-status port)))))
-                 ;; process-status blocks until exit, so mark directly
-                 ;; (ffi-waitpid won't find it — Gambit already reaped it)
-                 (set! last-exit-code (status->exit-code raw))
-                 (cond
-                   ((WIFEXITED raw)
-                    (set! (job-process-status proc) 'exited))
-                   ((WIFSIGNALED raw)
-                    (set! (job-process-status proc) 'signaled)
-                    ;; Print signal description to stderr (like bash)
-                    (let ((desc (signal-description (WTERMSIG raw))))
-                      (when desc
-                        (fprintf (current-error-port) "~a~n" desc))))
-                   (else
-                    (set! (job-process-status proc) 'exited)))))))))
+           (cond
+             ((and port (thread? port))
+              ;; Thread-based job (builtin/function/compound command)
+              (let ((result (with-catch (lambda (e) 1)
+                              (lambda () (thread-join! port)))))
+                (set! last-exit-code (if (integer? result) result 0))
+                (set! (job-process-status proc) 'exited)))
+             ((and port (port? port))
+              ;; Process-based job via open-process (Gambit port)
+              (let ((raw (with-catch (lambda (e) 0)
+                           (lambda () (process-status port)))))
+                (set! last-exit-code (status->exit-code raw))
+                (cond
+                  ((WIFEXITED raw)
+                   (set! (job-process-status proc) 'exited))
+                  ((WIFSIGNALED raw)
+                   (set! (job-process-status proc) 'signaled)
+                   (let ((desc (signal-description (WTERMSIG raw))))
+                     (when desc
+                       (fprintf (current-error-port) "~a~n" desc))))
+                  (else
+                   (set! (job-process-status proc) 'exited)))))
+             (else
+              ;; ffi-fork-exec'd process (port=#f): block with waitpid polling
+              (let ((pid (job-process-pid proc)))
+                (let loop ((delay 0.001))
+                  (let ((result (ffi-waitpid-pid pid (bitwise-ior WNOHANG WUNTRACED))))
+                    (cond
+                      ((> result 0)
+                       (let ((raw (ffi-waitpid-status)))
+                         (cond
+                           ((WIFSTOPPED raw)
+                            (set! (job-process-status proc) 'stopped)
+                            (set! last-exit-code (+ 128 (WSTOPSIG raw))))
+                           ((WIFEXITED raw)
+                            (set! (job-process-status proc) 'exited)
+                            (set! last-exit-code (WEXITSTATUS raw)))
+                           ((WIFSIGNALED raw)
+                            (set! (job-process-status proc) 'signaled)
+                            (set! last-exit-code (+ 128 (WTERMSIG raw)))
+                            (let ((desc (signal-description (WTERMSIG raw))))
+                              (when desc
+                                (fprintf (current-error-port) "~a~n" desc))))
+                           (else
+                            (set! (job-process-status proc) 'exited)
+                            (set! last-exit-code 0)))))
+                      ((= result 0)
+                       (thread-sleep! delay)
+                       (loop (min 0.05 (* delay 1.5))))
+                      (else
+                       (set! (job-process-status proc) 'exited)
+                       (set! last-exit-code 0)))))))))))
      (job-processes job))
     ;; Update overall job status
     (let ((procs (job-processes job)))
@@ -309,26 +377,39 @@
           (lambda (proc)
             (or (memq (job-process-status proc) '(exited signaled))
                 (let ((port (job-process-port proc)))
-                  (and port
-                       (if (thread? port)
-                         ;; Thread: check if terminated
-                         (let ((st (thread-state port)))
-                           (or (thread-state-normally-terminated? st)
-                               (thread-state-abnormally-terminated? st)))
-                         ;; External process: try non-blocking waitpid
-                         (let* ((pid (process-pid port))
-                                (result (ffi-waitpid-pid pid WNOHANG)))
-                           (cond
-                             ((> result 0)
-                              (let ((raw-status (ffi-waitpid-status)))
-                                (set! (job-process-status proc)
-                                  (if (WIFSIGNALED raw-status) 'signaled 'exited))
-                                #t))
-                             ((< result 0)
-                              ;; ECHILD: Gambit already reaped. Mark as finished;
-                              ;; job-wait will use process-status to get exit code.
-                              #t)
-                             (else #f))))))))
+                  (cond
+                    ((and port (thread? port))
+                     ;; Thread: check if terminated
+                     (let ((st (thread-state port)))
+                       (or (thread-state-normally-terminated? st)
+                           (thread-state-abnormally-terminated? st))))
+                    ((and port (port? port))
+                     ;; External process via open-process: try non-blocking waitpid
+                     (let* ((pid (process-pid port))
+                            (result (ffi-waitpid-pid pid WNOHANG)))
+                       (cond
+                         ((> result 0)
+                          (let ((raw-status (ffi-waitpid-status)))
+                            (set! (job-process-status proc)
+                              (if (WIFSIGNALED raw-status) 'signaled 'exited))
+                            #t))
+                         ((< result 0)
+                          ;; ECHILD: Gambit already reaped. Mark as finished;
+                          ;; job-wait will use process-status to get exit code.
+                          #t)
+                         (else #f))))
+                    (else
+                     ;; ffi-fork-exec'd process (port=#f): use PID directly
+                     (let* ((pid (job-process-pid proc))
+                            (result (ffi-waitpid-pid pid WNOHANG)))
+                       (cond
+                         ((> result 0)
+                          (let ((raw-status (ffi-waitpid-status)))
+                            (set! (job-process-status proc)
+                              (if (WIFSIGNALED raw-status) 'signaled 'exited))
+                            #t))
+                         ((< result 0) #t)  ;; ECHILD
+                         (else #f))))))))
           procs))))
 
 ;; Bring a job to the foreground

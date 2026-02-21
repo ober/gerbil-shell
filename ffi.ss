@@ -17,7 +17,8 @@
             ffi-termios-save ffi-termios-restore ffi-set-raw-mode
             ffi-read-byte ffi-byte-ready?
             ffi-terminal-columns ffi-terminal-rows
-            ffi-execve
+            ffi-execve ffi-fork-exec
+            ffi-gambit-scheduler-rfd ffi-gambit-scheduler-wfd
             ffi-signal-was-ignored ffi-signal-set-ignore ffi-signal-set-default
             ffi-sigpipe-unblock ffi-sigpipe-block
             WNOHANG WUNTRACED WCONTINUED
@@ -33,6 +34,7 @@
 #include <time.h>
 #include <signal.h>
 #include <string.h>
+#include <dirent.h>
 
 /* Record which signals were SIG_IGN at process startup, BEFORE Gambit
    installs its own handlers.  POSIX: non-interactive shells must not
@@ -446,60 +448,194 @@ END-WINSIZE
   (define (ffi-terminal-rows fd)
     (if (= (_ffi_get_winsize fd) 0) (_ffi_ws_row) 24))
 
-  ;; execve — replace current process image
-  ;; packed_argv and packed_env are SOH (\x01) delimited strings
+  ;; Shared SOH-delimited string unpacker, execve, and fork+exec
   (c-declare #<<END-EXECVE
-static int ffi_do_execve(const char *path, const char *packed_argv, const char *packed_env) {
-    /* Count delimiters to determine array sizes */
-    int argc = 1, envc = 0;
+/* Unpack a SOH-delimited string into a NULL-terminated char** array.
+   Returns the array (caller must free both array and copy).
+   Sets *out_copy to the strdup'd working copy.
+   If packed is empty, returns a 1-element array with just NULL. */
+static char** unpack_soh(const char *packed, char **out_copy, int *out_count) {
+    if (!packed[0]) {
+        *out_copy = NULL;
+        *out_count = 0;
+        char **arr = (char **)malloc(sizeof(char *));
+        if (arr) arr[0] = NULL;
+        return arr;
+    }
+    int count = 1;
     const char *p;
-    for (p = packed_argv; *p; p++) if (*p == '\x01') argc++;
-    if (packed_env[0]) { envc = 1; for (p = packed_env; *p; p++) if (*p == '\x01') envc++; }
-
-    /* Build argv array */
-    char **argv = (char **)malloc((argc + 1) * sizeof(char *));
-    if (!argv) return errno;
-    /* Copy and split packed_argv */
-    char *argv_copy = strdup(packed_argv);
-    if (!argv_copy) { free(argv); return errno; }
-    argv[0] = argv_copy;
-    int ai = 1;
-    for (p = argv_copy; *p; p++) {
-        if (*((char*)p) == '\x01') { *((char*)p) = '\0'; argv[ai++] = (char*)p + 1; }
+    for (p = packed; *p; p++) if (*p == '\x01') count++;
+    char **arr = (char **)malloc((count + 1) * sizeof(char *));
+    char *copy = strdup(packed);
+    if (!arr || !copy) { free(arr); free(copy); *out_copy = NULL; *out_count = 0; return NULL; }
+    arr[0] = copy;
+    int i = 1;
+    for (char *q = copy; *q; q++) {
+        if (*q == '\x01') { *q = '\0'; arr[i++] = q + 1; }
     }
-    argv[argc] = NULL;
+    arr[count] = NULL;
+    *out_copy = copy;
+    *out_count = count;
+    return arr;
+}
 
-    /* Build envp array */
-    char **envp = NULL;
-    char *env_copy = NULL;
-    if (envc > 0) {
-        envp = (char **)malloc((envc + 1) * sizeof(char *));
-        env_copy = strdup(packed_env);
-        if (envp && env_copy) {
-            envp[0] = env_copy;
-            int ei = 1;
-            for (p = env_copy; *p; p++) {
-                if (*((char*)p) == '\x01') { *((char*)p) = '\0'; envp[ei++] = (char*)p + 1; }
-            }
-            envp[envc] = NULL;
-        }
-    } else {
-        envp = (char **)malloc(sizeof(char *));
-        if (envp) envp[0] = NULL;
-    }
+static int ffi_do_execve(const char *path, const char *packed_argv, const char *packed_env) {
+    char *argv_copy, *env_copy;
+    int argc, envc;
+    char **argv = unpack_soh(packed_argv, &argv_copy, &argc);
+    char **envp = unpack_soh(packed_env, &env_copy, &envc);
+    if (!argv || !envp) return ENOMEM;
 
     execve(path, argv, envp);
     /* Only reaches here on failure */
     int err = errno;
     free(argv_copy); free(argv);
-    if (env_copy) free(env_copy);
-    if (envp) free(envp);
+    free(env_copy); free(envp);
     return err;
+}
+
+/* fork+exec in one C function.  After fork(), the child is in a fragile
+   state (Gambit runtime is not fork-safe), so ALL child-side work is
+   pure C — no Scheme code can run.
+
+   pgid semantics:
+     0  = foreground (no setpgid)
+    -1  = background, own process group (setpgid(0,0))
+    >0  = join existing group (setpgid(0,pgid))
+
+   gambit_rfd/gambit_wfd = Gambit's scheduler select_abort pipe fds,
+   which must be closed in the child so they don't leak.
+
+   Returns child PID on success, -1 on fork failure. */
+/* Close all fds > 2 in the child, except those in keep_fds[0..n_keep-1].
+   Uses /proc/self/fd for efficiency, falls back to brute-force. */
+static void close_fds_except(const int *keep_fds, int n_keep) {
+    DIR *d = opendir("/proc/self/fd");
+    if (d) {
+        struct dirent *entry;
+        int dir_fd = dirfd(d);
+        while ((entry = readdir(d)) != NULL) {
+            int fd = atoi(entry->d_name);
+            if (fd <= 2 || fd == dir_fd) continue;
+            int keep = 0;
+            for (int i = 0; i < n_keep; i++) {
+                if (fd == keep_fds[i]) { keep = 1; break; }
+            }
+            if (!keep) close(fd);
+        }
+        closedir(d);
+    } else {
+        for (int fd = 3; fd < 1024; fd++) {
+            int keep = 0;
+            for (int i = 0; i < n_keep; i++) {
+                if (fd == keep_fds[i]) { keep = 1; break; }
+            }
+            if (!keep) close(fd);
+        }
+    }
+}
+
+static int ffi_do_fork_exec(const char *path, const char *packed_argv,
+                            const char *packed_env, int pgid,
+                            int gambit_rfd, int gambit_wfd,
+                            const char *packed_keep_fds) {
+    pid_t child = fork();
+    if (child < 0) return -1;
+
+    if (child > 0) {
+        /* ---- Parent ---- */
+        /* Set child's pgid from parent side too (race prevention) */
+        if (pgid == -1) {
+            setpgid(child, child);
+        } else if (pgid > 0) {
+            setpgid(child, pgid);
+        }
+        return (int)child;
+    }
+
+    /* ---- Child (pure C, no Scheme) ---- */
+
+    /* 1. Reset signals to SIG_DFL */
+    int sigs[] = {SIGINT, SIGQUIT, SIGTERM, SIGHUP, SIGPIPE,
+                  SIGTSTP, SIGTTIN, SIGTTOU, SIGCHLD, 0};
+    for (int i = 0; sigs[i]; i++) {
+        signal(sigs[i], SIG_DFL);
+    }
+
+    /* 2. Unblock all signals */
+    sigset_t all;
+    sigfillset(&all);
+    sigprocmask(SIG_UNBLOCK, &all, NULL);
+
+    /* 3. Process group */
+    if (pgid == -1) {
+        setpgid(0, 0);
+    } else if (pgid > 0) {
+        setpgid(0, pgid);
+    }
+
+    /* 4. Close all fds > 2 except those the child needs.
+       packed_keep_fds is a SOH-delimited string of fd numbers to preserve
+       (e.g. redirect fds like "8" for 8<<EOF).  Empty string = close all > 2. */
+    {
+        int keep[64];
+        int n_keep = 0;
+        if (packed_keep_fds && packed_keep_fds[0]) {
+            /* Parse SOH-delimited fd numbers */
+            const char *p = packed_keep_fds;
+            while (*p && n_keep < 64) {
+                keep[n_keep++] = atoi(p);
+                while (*p && *p != '\001') p++;
+                if (*p == '\001') p++;
+            }
+        }
+        close_fds_except(keep, n_keep);
+    }
+
+    /* 5. Unpack argv and envp */
+    char *argv_copy, *env_copy;
+    int argc, envc;
+    char **argv = unpack_soh(packed_argv, &argv_copy, &argc);
+    char **envp = unpack_soh(packed_env, &env_copy, &envc);
+    if (!argv || !envp) _exit(126);
+
+    /* 6. exec */
+    execve(path, argv, envp);
+
+    /* 7. exec failed */
+    _exit(errno == ENOENT ? 127 : 126);
+    return -1; /* unreachable */
+}
+
+/* Accessors for Gambit's scheduler select_abort pipe fds.
+   These are the fds that Gambit uses internally for its I/O scheduler;
+   we need to close them in the child after fork. */
+static int ffi_gambit_scheduler_rfd(void) {
+    ___processor_state ___ps = ___PSTATE;
+    return ___ps->os.select_abort.reading_fd;
+}
+static int ffi_gambit_scheduler_wfd(void) {
+    ___processor_state ___ps = ___PSTATE;
+    return ___ps->os.select_abort.writing_fd;
 }
 END-EXECVE
   )
   (define-c-lambda _ffi_execve (char-string char-string char-string) int "ffi_do_execve")
   (define (ffi-execve path packed-argv packed-env) (_ffi_execve path packed-argv packed-env))
+
+  ;; fork+exec — fork and exec in one C call (child does no Scheme)
+  ;; Returns child PID on success, -1 on fork failure
+  ;; packed-keep-fds: SOH-delimited string of fd numbers to preserve in child
+  ;;                  (for redirect fds like fd 8 from 8<<EOF). "" = close all > 2.
+  (define-c-lambda _ffi_fork_exec (char-string char-string char-string int int int char-string) int
+    "ffi_do_fork_exec")
+  (define (ffi-fork-exec path packed-argv packed-env pgid gambit-rfd gambit-wfd
+                         #!optional (packed-keep-fds ""))
+    (_ffi_fork_exec path packed-argv packed-env pgid gambit-rfd gambit-wfd packed-keep-fds))
+
+  ;; Gambit scheduler fd accessors (for closing in fork-exec child)
+  (define-c-lambda ffi-gambit-scheduler-rfd () int "ffi_gambit_scheduler_rfd")
+  (define-c-lambda ffi-gambit-scheduler-wfd () int "ffi_gambit_scheduler_wfd")
 
   ;; Check if a signal was SIG_IGN when the process started (before Gambit).
   ;; Returns 1 if ignored, 0 otherwise.

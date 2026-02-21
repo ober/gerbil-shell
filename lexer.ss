@@ -692,10 +692,10 @@
                ((#\') (display "'" buf))  ;; ' is safe inside "..."
                ((#\") (display "\\\"" buf))
                ((#\x)
-                ;; Hex escape
+                ;; Hex escape — byte value, use raw byte encoding for >= 128
                 (let-values (((val cnt) (read-hex-digits lex 2)))
                   (if (> cnt 0)
-                    (ansi-c-emit-char! (integer->char val) buf)
+                    (ansi-c-emit-char! (byte->raw-char (bitwise-and val #xff)) buf)
                     (begin (display "\\\\x" buf)))))
                ((#\u #\U)
                 ;; Unicode escape
@@ -715,10 +715,10 @@
                      buf))))
                ((#\0 #\1 #\2 #\3 #\4 #\5 #\6 #\7)
                 ;; Octal escape: \nnn (up to 3 total digits)
-                ;; esc is the first digit, read up to 2 more
+                ;; esc is the first digit, read up to 2 more — use raw byte encoding
                 (let* ((first-digit (- (char->integer esc) (char->integer #\0)))
                        (more (read-octal-digits-with-init lex 2 first-digit)))
-                  (ansi-c-emit-char! (integer->char (bitwise-and more #xff)) buf)))
+                  (ansi-c-emit-char! (byte->raw-char (bitwise-and more #xff)) buf)))
                (else
                 ;; Unknown escape — keep literal
                 (display "\\" buf)

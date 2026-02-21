@@ -121,10 +121,10 @@ These failures require array variable support (`declare -a`, `${arr[@]}`, etc.).
 
 ### Category 7: Background Job Wait
 
-| # | Suite | Test | Description | Root Cause |
-|---|-------|------|-------------|------------|
-| 14 | background | #8 | Wait for N parallel jobs, check failure | Thread output ordering — background jobs running as threads produce output in non-deterministic order |
-| 15 | background | #18 | `wait -n` | FFI thread-safety issue — `_waitpid_last_status` and `_waitpid_last_pid` are global C statics that race between threads |
+| #  | Suite      | Test | Description                             | Root Cause                                                                                                              |
+|----|------------|------|-----------------------------------------|-------------------------------------------------------------------------------------------------------------------------|
+| 14 | background | #8   | Wait for N parallel jobs, check failure | Thread output ordering — background jobs running as threads produce output in non-deterministic order                   |
+| 15 | background | #18  | `wait -n`                               | FFI thread-safety issue — `_waitpid_last_status` and `_waitpid_last_pid` are global C statics that race between threads |
 
 **Fix approach:**
 - #8: Background builtins/functions run as Gambit threads, so their output interleaves non-deterministically. May need to buffer output per-job or use mutexes for output ordering.
@@ -148,16 +148,16 @@ These failures require array variable support (`declare -a`, `${arr[@]}`, etc.).
 
 ## Priority Order (by impact and effort)
 
-| Priority | Category | Tests Fixed | Effort | Notes |
-|----------|----------|-------------|--------|-------|
-| 1 | Here-doc multi-fd (#5-8) | 4 | M | Parser/redirect work, no new subsystems |
-| 2 | Quote escapes (#12) | 1 | S | Quick lexer fix |
-| 3 | getcwd behavior (#16) | 1 | S | Quick builtin fix |
-| 4 | declare -p/-F (#9-10) | 2 | M | Builtin formatting |
-| 5 | Named pipe <> (#11) | 1 | M | Redirect fix |
-| 6 | Background wait (#14-15) | 2 | M-L | FFI thread safety |
-| 7 | ulimit (#13) | 1 | L | New FFI + builtin |
-| 8 | Arrays (#1-4) | 4 | XL | Major new subsystem |
+| Priority | Category                 | Tests Fixed | Effort | Notes                                   |
+|----------|--------------------------|-------------|--------|-----------------------------------------|
+| 1        | Here-doc multi-fd (#5-8) | 4           | M      | Parser/redirect work, no new subsystems |
+| 2        | Quote escapes (#12)      | 1           | S      | Quick lexer fix                         |
+| 3        | getcwd behavior (#16)    | 1           | S      | Quick builtin fix                       |
+| 4        | declare -p/-F (#9-10)    | 2           | M      | Builtin formatting                      |
+| 5        | Named pipe <> (#11)      | 1           | M      | Redirect fix                            |
+| 6        | Background wait (#14-15) | 2           | M-L    | FFI thread safety                       |
+| 7        | ulimit (#13)             | 1           | L      | New FFI + builtin                       |
+| 8        | Arrays (#1-4)            | 4           | XL     | Major new subsystem                     |
 
 **Total: 16 tests across 8 categories**
 

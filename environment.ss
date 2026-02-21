@@ -47,6 +47,16 @@
 ;;; so external commands in pipeline threads write to the pipe.
 (def *pipeline-stdout-fd* (make-parameter #f))
 
+;;; --- Gambit scheduler pipe fds ---
+;;; Cached after move-internal-fds-high! so ffi-fork-exec can close them in child.
+(def *gambit-scheduler-rfd* (make-parameter -1))
+(def *gambit-scheduler-wfd* (make-parameter -1))
+
+;;; --- Active redirect fds ---
+;;; List of fd numbers that are currently active redirections.
+;;; ffi-fork-exec uses this to know which fds the child needs to keep.
+(def *active-redirect-fds* (make-parameter []))
+
 ;;; --- Internal logical PWD ---
 ;;; Tracks the shell's logical working directory independently of $PWD.
 ;;; This ensures that `pwd` returns the correct path even if the user
