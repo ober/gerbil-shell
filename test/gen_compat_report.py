@@ -2,9 +2,9 @@
 """Generate bash-compatibility.md from compat test results.
 
 Runs all spec tests and produces a markdown report with per-test pass/fail
-for both bash and gsh.
+for any number of shells. The first shell is always treated as the reference.
 
-Usage: python3 test/gen_compat_report.py [--output FILE] OILS_DIR BASH GSH
+Usage: python3 test/gen_compat_report.py [--output FILE] OILS_DIR SHELL1 SHELL2 [SHELL3 ...]
 """
 
 import json
@@ -126,17 +126,19 @@ def main():
         args = args[:idx] + args[idx + 2:]
 
     if len(args) < 3:
-        print(f'Usage: {sys.argv[0]} [--output FILE] OILS_DIR BASH GSH',
+        print(f'Usage: {sys.argv[0]} [--output FILE] OILS_DIR SHELL1 SHELL2 [SHELL3 ...]',
               file=sys.stderr)
         sys.exit(1)
 
     oils_dir = args[0]
     shells = [os.path.abspath(s) for s in args[1:]]
+    shell_names = [os.path.basename(s) for s in shells]
+    ref_name = shell_names[0]  # first shell is the reference
     spec_dir = oils_dir
 
     # Collect all results
     all_results = {}  # suite_name -> list of test results
-    grand_totals = {'bash': [0, 0], 'gsh': [0, 0]}  # [pass, total]
+    grand_totals = {sn: [0, 0] for sn in shell_names}  # [pass, total]
 
     for tier_name, suites in TIERS.items():
         for suite in suites:
@@ -156,21 +158,19 @@ def main():
 
     # Generate markdown
     lines = []
-    bp, bt = grand_totals['bash']
-    gp, gt = grand_totals['gsh']
-    bpct = (bp / bt * 100) if bt else 0
-    gpct = (gp / gt * 100) if gt else 0
 
-    lines.append('# Bash Compatibility Report')
+    lines.append('# Shell Compatibility Report')
     lines.append('')
     lines.append(f'Generated: {datetime.date.today().isoformat()}')
     lines.append('')
     lines.append('## Summary')
     lines.append('')
-    lines.append(f'| Shell | Pass | Total | Rate |')
-    lines.append(f'|-------|------|-------|------|')
-    lines.append(f'| bash  | {bp} | {bt} | {bpct:.0f}% |')
-    lines.append(f'| gsh   | {gp} | {gt} | {gpct:.0f}% |')
+    lines.append('| Shell | Pass | Total | Rate |')
+    lines.append('|-------|------|-------|------|')
+    for sn in shell_names:
+        p, t = grand_totals[sn]
+        pct = (p / t * 100) if t else 0
+        lines.append(f'| {sn} | {p} | {t} | {pct:.0f}% |')
     lines.append('')
 
     # Per-tier summary
@@ -180,77 +180,86 @@ def main():
     for tier_name, suites in TIERS.items():
         lines.append(f'### {tier_name}')
         lines.append('')
-        lines.append(f'| Suite | Description | bash | gsh |')
-        lines.append(f'|-------|-------------|------|-----|')
+        # Build header dynamically
+        hdr = '| Suite | Description |'
+        sep = '|-------|-------------|'
+        for sn in shell_names:
+            hdr += f' {sn} |'
+            sep += '-----|'
+        lines.append(hdr)
+        lines.append(sep)
 
         for suite in suites:
             if suite not in all_results:
                 continue
             results = all_results[suite]
             desc = SUITE_DESCRIPTIONS.get(suite, '')
-            b_pass = sum(1 for r in results
-                         if r['shells'].get('bash', {}).get('passed'))
-            g_pass = sum(1 for r in results
-                         if r['shells'].get('gsh', {}).get('passed'))
             total = len(results)
-            b_str = f'{b_pass}/{total}' if b_pass < total else f'**{total}/{total}**'
-            g_str = f'{g_pass}/{total}' if g_pass < total else f'**{total}/{total}**'
-            lines.append(f'| {suite} | {desc} | {b_str} | {g_str} |')
+            row = f'| {suite} | {desc} |'
+            for sn in shell_names:
+                s_pass = sum(1 for r in results
+                             if r['shells'].get(sn, {}).get('passed'))
+                s_str = f'{s_pass}/{total}' if s_pass < total else f'**{total}/{total}**'
+                row += f' {s_str} |'
+            lines.append(row)
 
         lines.append('')
 
-    # Detailed failures section
-    lines.append('## Failing Tests')
-    lines.append('')
-    lines.append('Tests where gsh fails but bash passes.')
-    lines.append('')
-
-    has_failures = False
-    for tier_name, suites in TIERS.items():
-        tier_failures = []
-        for suite in suites:
-            if suite not in all_results:
-                continue
-            for r in all_results[suite]:
-                bash_ok = r['shells'].get('bash', {}).get('passed', False)
-                gsh_ok = r['shells'].get('gsh', {}).get('passed', False)
-                if bash_ok and not gsh_ok:
-                    reason = r['shells']['gsh'].get('reason', '')
-                    tier_failures.append((suite, r['num'], r['name'], reason))
-
-        if tier_failures:
-            has_failures = True
-            lines.append(f'### {tier_name}')
-            lines.append('')
-            lines.append(f'| Suite | # | Test | Reason |')
-            lines.append(f'|-------|---|------|--------|')
-            for suite, num, name, reason in tier_failures:
-                reason_short = reason[:80] + '...' if len(reason) > 80 else reason
-                lines.append(f'| {suite} | {num} | {name} | {reason_short} |')
-            lines.append('')
-
-    if not has_failures:
-        lines.append('*None — gsh passes all tests that bash passes.*')
+    # Detailed failures: for each non-reference shell, show tests where
+    # reference passes but that shell fails
+    for sn in shell_names[1:]:
+        lines.append(f'## Failing Tests — {sn}')
+        lines.append('')
+        lines.append(f'Tests where {sn} fails but {ref_name} passes.')
         lines.append('')
 
-    # Tests where gsh passes but bash fails
-    lines.append('## Bonus: Tests where gsh passes but bash fails')
-    lines.append('')
-    bonus = []
-    for suite, results in all_results.items():
-        for r in results:
-            bash_ok = r['shells'].get('bash', {}).get('passed', False)
-            gsh_ok = r['shells'].get('gsh', {}).get('passed', False)
-            if gsh_ok and not bash_ok:
-                bonus.append((suite, r['num'], r['name']))
-    if bonus:
-        lines.append(f'| Suite | # | Test |')
-        lines.append(f'|-------|---|------|')
-        for suite, num, name in bonus:
-            lines.append(f'| {suite} | {num} | {name} |')
-    else:
-        lines.append('*None.*')
-    lines.append('')
+        has_failures = False
+        for tier_name, suites in TIERS.items():
+            tier_failures = []
+            for suite in suites:
+                if suite not in all_results:
+                    continue
+                for r in all_results[suite]:
+                    ref_ok = r['shells'].get(ref_name, {}).get('passed', False)
+                    sn_ok = r['shells'].get(sn, {}).get('passed', False)
+                    if ref_ok and not sn_ok:
+                        reason = r['shells'][sn].get('reason', '')
+                        tier_failures.append((suite, r['num'], r['name'], reason))
+
+            if tier_failures:
+                has_failures = True
+                lines.append(f'### {tier_name}')
+                lines.append('')
+                lines.append('| Suite | # | Test | Reason |')
+                lines.append('|-------|---|------|--------|')
+                for suite, num, name, reason in tier_failures:
+                    reason_short = reason[:80] + '...' if len(reason) > 80 else reason
+                    lines.append(f'| {suite} | {num} | {name} | {reason_short} |')
+                lines.append('')
+
+        if not has_failures:
+            lines.append(f'*None — {sn} passes all tests that {ref_name} passes.*')
+            lines.append('')
+
+    # Bonus: tests where non-reference shells pass but reference fails
+    for sn in shell_names[1:]:
+        lines.append(f'## Bonus: Tests where {sn} passes but {ref_name} fails')
+        lines.append('')
+        bonus = []
+        for suite, results in all_results.items():
+            for r in results:
+                ref_ok = r['shells'].get(ref_name, {}).get('passed', False)
+                sn_ok = r['shells'].get(sn, {}).get('passed', False)
+                if sn_ok and not ref_ok:
+                    bonus.append((suite, r['num'], r['name']))
+        if bonus:
+            lines.append('| Suite | # | Test |')
+            lines.append('|-------|---|------|')
+            for suite, num, name in bonus:
+                lines.append(f'| {suite} | {num} | {name} |')
+        else:
+            lines.append('*None.*')
+        lines.append('')
 
     md = '\n'.join(lines)
 
