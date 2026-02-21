@@ -1152,8 +1152,20 @@
                    (let* ((ifs (or (env-get env "IFS") " \t\n"))
                           (sep (if (> (string-length ifs) 0) (string (string-ref ifs 0)) ""))
                           (joined (string-join-with sep vals)))
-                     (apply-parameter-modifier (if (null? vals) #f joined)
-                                              name modifier arg env)))))))
+                     ;; For colon variants with 2+ elements in UNQUOTED context:
+                     ;; array is non-null even if joined result is "" (analogous to
+                     ;; $* with 2+ params being non-null). Convert colon to non-colon
+                     ;; so only truly unset triggers default.
+                     ;; In QUOTED context, check the joined string value as-is.
+                     (let ((effective-modifier
+                            (if (and (not (*in-dquote-context*))
+                                     (>= (length vals) 2))
+                              (case modifier
+                                ((:-)  '-) ((:+)  '+) ((:=)  '=) ((:?)  '?)
+                                (else modifier))
+                              modifier)))
+                       (apply-parameter-modifier (if (null? vals) #f joined)
+                                                name effective-modifier arg env))))))))
           ;; ${name[idx]} — single element access
           (else
            (let ((expanded-idx
@@ -2529,10 +2541,12 @@
                    (if (memq modifier '(- :- + :+ = := ? :?))
                      ;; For [@] inside "...", return array elements or modifier result
                      (let* ((is-empty (null? all-elements))
-                            ;; For colon variants, also treat all-empty-elements as null
+                            ;; For colon variants: null if 0 elements, or exactly 1 empty element.
+                            ;; 2+ elements always produce word breaks, so result is non-null.
                             (is-null (or is-empty
-                                        (and (memq modifier '(:- :+  := :?))
-                                             (every (lambda (s) (string=? s "")) all-elements)))))
+                                        (and (memq modifier '(:- :+ := :?))
+                                             (= (length all-elements) 1)
+                                             (string=? (car all-elements) "")))))
                        (case modifier
                          ;; ${arr[@]-word}: use default only if array has no elements
                          ((-) (if is-empty

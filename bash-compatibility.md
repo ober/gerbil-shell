@@ -7,7 +7,7 @@ Generated: 2026-02-21
 | Shell | Pass | Total | Rate |
 |-------|------|-------|------|
 | bash | 1037 | 1179 | 88% |
-| gsh | 1157 | 1179 | 98% |
+| gsh | 1161 | 1179 | 98% |
 
 ## Results by Tier
 
@@ -35,7 +35,7 @@ Generated: 2026-02-21
 | var-sub | Variable substitution ($var, ${var}) | 5/6 | **6/6** |
 | var-sub-quote | Variable substitution in quoting contexts | 40/41 | **41/41** |
 | var-num | Numeric/special variables ($#, $?, $$, etc.) | **7/7** | **7/7** |
-| var-op-test | Variable operators (${var:-default}, etc.) | 33/37 | 33/37 |
+| var-op-test | Variable operators (${var:-default}, etc.) | 33/37 | 35/37 |
 | var-op-strip | Variable pattern stripping (${var#pat}, etc.) | 28/29 | **29/29** |
 | var-op-len | Variable length ${#var} | 5/9 | 7/9 |
 | assign | Variable assignment | 36/48 | **48/48** |
@@ -66,7 +66,7 @@ Generated: 2026-02-21
 | builtin-process | Process builtins (kill, wait, ulimit, etc.) | 18/26 | 24/26 |
 | background | Background jobs (&, wait, jobs) | 24/27 | **27/27** |
 | command-parsing | Command parsing edge cases | 4/5 | **5/5** |
-| var-op-bash | Bash-specific variable operations | 24/27 | 25/27 |
+| var-op-bash | Bash-specific variable operations | 24/27 | **27/27** |
 | var-op-slice | Variable slicing ${var:offset:length} | 19/22 | **22/22** |
 | assign-extended | declare/typeset/local/export | 23/39 | 36/39 |
 
@@ -86,8 +86,6 @@ Tests where gsh fails but bash passes.
 |-------|---|------|--------|
 | var-op-test | 4 | Unquoted with array as default value | stdout mismatch |
 | var-op-test | 6 | Assign default with array | stdout mismatch |
-| var-op-test | 34 | op-test for ${a[@]} and ${a[*]} | stdout mismatch |
-| var-op-test | 37 | op-test for unquoted ${a[*]:-empty} with IFS= | stdout mismatch |
 
 ### Tier 2 — Builtins & Advanced
 
@@ -212,6 +210,8 @@ Tests where gsh fails but bash passes.
 | background | 26 | YSH wait --verbose |
 | command-parsing | 1 | Prefix env on assignment |
 | var-op-bash | 20 | ${!A@a} and ${!A[@]@a} |
+| var-op-bash | 25 | Array expansion with nullary var op @Q |
+| var-op-bash | 26 | Array expansion with nullary var op @P |
 | var-op-slice | 10 | Slice undefined |
 | var-op-slice | 12 | Slice string with invalid UTF-8 results in empty string and warning |
 | var-op-slice | 13 | Slice string with invalid UTF-8 with strict_word_eval |
