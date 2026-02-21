@@ -7,7 +7,7 @@ Generated: 2026-02-21
 | Shell | Pass | Total | Rate |
 |-------|------|-------|------|
 | bash | 1037 | 1179 | 88% |
-| gsh | 1162 | 1179 | 99% |
+| gsh | 1163 | 1179 | 99% |
 
 ## Results by Tier
 
@@ -63,7 +63,7 @@ Generated: 2026-02-21
 | builtin-trap | trap builtin | 31/33 | **33/33** |
 | builtin-bracket | [[ ]] and [ ] test operators | 49/52 | **52/52** |
 | builtin-misc | Misc builtins (true, false, colon, etc.) | 3/7 | 6/7 |
-| builtin-process | Process builtins (kill, wait, ulimit, etc.) | 18/26 | 24/26 |
+| builtin-process | Process builtins (kill, wait, ulimit, etc.) | 18/26 | 25/26 |
 | background | Background jobs (&, wait, jobs) | 24/27 | **27/27** |
 | command-parsing | Command parsing edge cases | 4/5 | **5/5** |
 | var-op-bash | Bash-specific variable operations | 24/27 | 25/27 |
@@ -92,7 +92,6 @@ Tests where gsh fails but bash passes.
 | Suite | # | Test | Reason |
 |-------|---|------|--------|
 | builtin-cd | 27 | Survey of getcwd() syscall | stdout mismatch |
-| builtin-process | 23 | write big file with ulimit | stdout mismatch |
 | assign-extended | 22 | declare -p UNDEF (and typeset) -- prints something to stderr | stdout mismatch |
 
 ## Bonus: Tests where gsh passes but bash fails

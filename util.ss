@@ -221,7 +221,10 @@
     ((error-exception? e)
      (error-exception-message e))
     ((string? e) e)
-    (else (call-with-output-string (lambda (p) (display e p))))))
+    ;; os-exception from Gambit (e.g. write failure, EFBIG)
+    ((os-exception? e)
+     (call-with-output-string (lambda (p) (display-exception e p))))
+    (else (call-with-output-string (lambda (p) (display-exception e p))))))
 
 ;; Run thunk, return result or #f on exception
 (def (try-or-false thunk)

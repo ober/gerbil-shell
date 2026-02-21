@@ -243,6 +243,10 @@
   (add-signal-handler! SIGTSTP (lambda () #!void))
   ;; SIGPIPE: ignore (let write fail with error)
   (add-signal-handler! SIGPIPE (lambda () #!void))
+  ;; SIGXFSZ: install flag handler so write fails instead of killing process,
+  ;; and the signal is recorded for script termination (exit 153 = 128+25)
+  (ffi-signal-flag-install SIGXFSZ)
+  (hash-put! *flag-trapped-signals* "XFSZ" SIGXFSZ)
   ;; SIGWINCH: record for terminal resize
   (add-signal-handler! SIGWINCH
     (lambda ()
@@ -277,7 +281,10 @@
       (lambda ()
         (set! *pending-signals* (cons "TERM" *pending-signals*)))))
   ;; SIGPIPE: ignore (always, regardless of initial state)
-  (add-signal-handler! SIGPIPE (lambda () #!void)))
+  (add-signal-handler! SIGPIPE (lambda () #!void))
+  ;; SIGXFSZ: install flag handler for proper handling (exit 153)
+  (ffi-signal-flag-install SIGXFSZ)
+  (hash-put! *flag-trapped-signals* "XFSZ" SIGXFSZ))
 
 ;;; --- Signal context for command execution ---
 

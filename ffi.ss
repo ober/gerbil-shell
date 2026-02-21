@@ -6,7 +6,7 @@
 (import :std/foreign)
 
 (begin-ffi (ffi-waitpid-pid ffi-waitpid-status
-            ffi-dup ffi-dup-above ffi-dup2 ffi-move-gambit-fds ffi-setpgid ffi-getpgid
+            ffi-dup ffi-dup-above ffi-dup2 ffi-lseek-end ffi-move-gambit-fds ffi-setpgid ffi-getpgid
             ffi-tcsetpgrp ffi-tcgetpgrp ffi-umask ffi-getuid ffi-geteuid
             ffi-getegid ffi-access
             ffi-isatty ffi-setsid ffi-pipe-raw ffi-close-fd
@@ -251,6 +251,11 @@ END-C
 
   ;; dup2 — duplicate fd onto target fd
   (define-c-lambda ffi-dup2 (int int) int "dup2")
+
+  ;; lseek fd to end of file — returns new offset or -1 on error
+  ;; Used to sync fd 1's offset with Gambit port's after flushing
+  (define-c-lambda ffi-lseek-end (int) int
+    "___return((int)lseek(___arg1, 0, SEEK_END));")
 
   ;; Move Gambit's internal scheduler pipe fds (select_abort) to high fds.
   ;; This frees fds 3-9 for user shell redirects (exec 3>, etc.)

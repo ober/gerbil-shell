@@ -76,6 +76,8 @@
        (cond
          ((break-exception? e) 0)
          ((continue-exception? e) 0)
+         ((subshell-exit-exception? e) (subshell-exit-exception-status e))
+         ((nounset-exception? e) (nounset-exception-status e))
          (else
           (fprintf (current-error-port) "gsh: ~a: ~a~n" filename (exception-message e))
           1)))
@@ -204,7 +206,9 @@
                        (else
                         ;; Catch-all: print error and continue
                         (let ((msg (exception-message e)))
-                          (fprintf (current-error-port) "gsh: ~a~n" msg)
+                          (with-catch (lambda (_) #!void)
+                            (lambda ()
+                              (fprintf (current-error-port) "gsh: ~a~n" msg)))
                           ;; POSIX: syntax errors / unclosed bad substitution → exit code 2
                           (if (and (string? msg)
                                    (or (string-prefix? "parse error" msg)
@@ -213,8 +217,10 @@
                    (lambda ()
                      (execute-command cmd env)))))
              ;; Flush stdout/stderr so builtin output appears before next command
-             (force-output (current-output-port))
-             (force-output (current-error-port))
+             (with-catch (lambda (_) #!void)
+               (lambda ()
+                 (force-output (current-output-port))
+                 (force-output (current-error-port))))
              (env-set-last-status! env new-status)
              ;; Process pending signals between commands
              (process-pending-traps! env)
@@ -250,9 +256,9 @@
                 (exec-fn action env))
               (env-set-last-status! env saved-status)))
            ;; Fatal signal with no trap — exit the script
-           ;; (POSIX: default action for INT/TERM is to terminate)
+           ;; (POSIX: default action for INT/TERM/HUP/XFSZ is to terminate)
            ((and (not action)
-                 (member sig-name '("INT" "TERM" "HUP")))
+                 (member sig-name '("INT" "TERM" "HUP" "XFSZ")))
             (let ((signum (signal-name->number sig-name)))
               (raise (make-subshell-exit-exception (+ 128 (or signum 2)))))))))
      signals)))

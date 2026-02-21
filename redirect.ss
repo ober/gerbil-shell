@@ -664,6 +664,10 @@
       (ffi-close-fd raw-fd))))
 
 ;; Set Gambit port parameter for an output fd. Returns the new port.
+;; Opens the file directly to create a character port for builtins.
+;; Note: this creates an independent file description with its own offset.
+;; External commands writing to fd 1 may have a different offset — the caller
+;; must sync offsets before forking (see execute-external's ffi-lseek-end).
 (def (set-port-for-fd! fd filename mode)
   (let ((port (case mode
                 ((truncate) (open-output-file [path: filename truncate: #t]))

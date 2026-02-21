@@ -408,6 +408,12 @@
            ;; doesn't interleave with pending parent output
            (force-output)
            (force-output (current-error-port))
+           ;; Sync fd 1/2 offsets to end-of-file after flushing.
+           ;; The Gambit port may use a separate file description (independent
+           ;; offset) from fd 1. After flushing, seek fd 1 to EOF so the
+           ;; child process writes after the flushed data, not at offset 0.
+           (ffi-lseek-end 1)
+           (ffi-lseek-end 2)
            (let* ((packed-argv (pack-with-soh
                                 (map string->c-safe (cons cmd-name args))))
                   (packed-env (pack-with-soh
@@ -453,6 +459,17 @@
                        (let ((sig-name (signal-number->name (- exit-code 128))))
                          (when sig-name
                            (clear-pending-signal! sig-name))))
+                     ;; Sync Gambit port position with fd 1 after child wrote.
+                     ;; The child may have written via fd 1 (separate file
+                     ;; description from the Gambit port), advancing fd 1's
+                     ;; offset. Seek the Gambit port to EOF so subsequent
+                     ;; builtins write after the child's output.
+                     (let ((end-pos (ffi-lseek-end 1)))
+                       (when (> end-pos 0)
+                         (with-catch void
+                           (lambda ()
+                             (output-port-byte-position
+                              (current-output-port) end-pos)))))
                      exit-code)))))))))))
 
 ;;; --- exec builtin ---
