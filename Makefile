@@ -19,7 +19,8 @@ build:
 	LIBRARY_PATH="$$(brew --prefix openssl@3 2>/dev/null)/lib:$$LIBRARY_PATH" \
 	gerbil build
 
-install: build
+install:
+	@if [ ! -f $(GSH) ]; then $(MAKE) build; fi
 	@echo "Cleaning old gsh artifacts from ~/.gerbil/ and ~/.local/bin/..."
 	@rm -f ~/.gerbil/bin/gsh
 	@rm -f ~/.local/bin/gsh
