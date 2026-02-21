@@ -255,7 +255,8 @@
                                      0  ;; foreground pipeline component
                                      (*gambit-scheduler-rfd*)
                                      (*gambit-scheduler-wfd*)
-                                     keep-fds)))
+                                     keep-fds
+                                     (current-directory))))
             ;; Restore redirections in parent (child already inherited the fds)
             (when (pair? redir-saved)
               (restore-redirections redir-saved))

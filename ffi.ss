@@ -558,7 +558,8 @@ static void close_fds_except(const int *keep_fds, int n_keep) {
 static int ffi_do_fork_exec(const char *path, const char *packed_argv,
                             const char *packed_env, int pgid,
                             int gambit_rfd, int gambit_wfd,
-                            const char *packed_keep_fds) {
+                            const char *packed_keep_fds,
+                            const char *cwd) {
     /* Block SIGCHLD before fork to prevent Gambit's SIGCHLD handler
        from reaping our child via waitpid(-1, WNOHANG).
        The caller must call ffi_sigchld_unblock() after waiting. */
@@ -620,17 +621,23 @@ static int ffi_do_fork_exec(const char *path, const char *packed_argv,
         close_fds_except(keep, n_keep);
     }
 
-    /* 5. Unpack argv and envp */
+    /* 5. Set child CWD — Gambit's per-thread current-directory may have
+       restored the OS CWD to the wrong path between cd and fork */
+    if (cwd && cwd[0]) {
+        chdir(cwd);
+    }
+
+    /* 6. Unpack argv and envp */
     char *argv_copy, *env_copy;
     int argc, envc;
     char **argv = unpack_soh(packed_argv, &argv_copy, &argc);
     char **envp = unpack_soh(packed_env, &env_copy, &envc);
     if (!argv || !envp) _exit(126);
 
-    /* 6. exec */
+    /* 7. exec */
     execve(path, argv, envp);
 
-    /* 7. exec failed */
+    /* 8. exec failed */
     _exit(errno == ENOENT ? 127 : 126);
     return -1; /* unreachable */
 }
@@ -655,11 +662,12 @@ END-EXECVE
   ;; Returns child PID on success, -1 on fork failure
   ;; packed-keep-fds: SOH-delimited string of fd numbers to preserve in child
   ;;                  (for redirect fds like fd 8 from 8<<EOF). "" = close all > 2.
-  (define-c-lambda _ffi_fork_exec (char-string char-string char-string int int int char-string) int
+  ;; cwd: working directory for child (Gambit may have restored OS CWD)
+  (define-c-lambda _ffi_fork_exec (char-string char-string char-string int int int char-string char-string) int
     "ffi_do_fork_exec")
   (define (ffi-fork-exec path packed-argv packed-env pgid gambit-rfd gambit-wfd
-                         #!optional (packed-keep-fds ""))
-    (_ffi_fork_exec path packed-argv packed-env pgid gambit-rfd gambit-wfd packed-keep-fds))
+                         #!optional (packed-keep-fds "") (cwd ""))
+    (_ffi_fork_exec path packed-argv packed-env pgid gambit-rfd gambit-wfd packed-keep-fds cwd))
 
   ;; Gambit scheduler fd accessors (for closing in fork-exec child)
   (define-c-lambda ffi-gambit-scheduler-rfd () int "ffi_gambit_scheduler_rfd")

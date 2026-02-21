@@ -418,7 +418,8 @@
                                       0  ;; pgid=0: foreground
                                       (*gambit-scheduler-rfd*)
                                       (*gambit-scheduler-wfd*)
-                                      keep-fds)))
+                                      keep-fds
+                                      (current-directory))))
              ;; Restore fds immediately after fork
              (when saved-1 (ffi-dup2 saved-1 1) (ffi-close-fd saved-1))
              (when saved-0 (ffi-dup2 saved-0 0) (ffi-close-fd saved-0))
@@ -1139,7 +1140,8 @@
                                      -1  ;; pgid=-1: own process group
                                      (*gambit-scheduler-rfd*)
                                      (*gambit-scheduler-wfd*)
-                                     keep-fds)))
+                                     keep-fds
+                                     (current-directory))))
             ;; Unblock SIGCHLD — background jobs are reaped later via job-wait
             (ffi-sigchld-unblock)
             (if (< pid 0)
