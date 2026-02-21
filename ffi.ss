@@ -637,7 +637,15 @@ static int ffi_do_fork_exec(const char *path, const char *packed_argv,
     /* 7. exec */
     execve(path, argv, envp);
 
-    /* 8. exec failed */
+    /* 8. exec failed — try /bin/sh for scripts without shebang (ENOEXEC) */
+    if (errno == ENOEXEC) {
+        char **new_argv = (char **)alloca((argc + 2) * sizeof(char*));
+        new_argv[0] = "/bin/sh";
+        for (int i = 0; i <= argc; i++) new_argv[i + 1] = argv[i];
+        execve("/bin/sh", new_argv, envp);
+    }
+
+    /* 9. exec failed */
     _exit(errno == ENOENT ? 127 : 126);
     return -1; /* unreachable */
 }
