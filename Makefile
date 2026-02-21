@@ -76,8 +76,11 @@ compat-one: build $(OILS_DIR)
 compat-range: build $(OILS_DIR)
 	$(SH_SPEC) --range $(RANGE) $(OILS_DIR)/spec/$(SPEC).test.sh $(BASH) $(GSH)
 
-# Run all tiers combined
+# Run all tiers combined and update the compatibility report
 compat: compat-tier0 compat-tier1 compat-tier2
+	@python3 $(CURDIR)/test/gen_compat_report.py --output $(CURDIR)/bash-compatibility.md \
+	  $(OILS_DIR) $(BASH) $(GSH) 2>&1 | grep -v "^  Running"
+	@echo "Updated bash-compatibility.md"
 
 # Verbose single spec: make compat-debug SPEC=smoke
 compat-debug: build $(OILS_DIR)
@@ -139,5 +142,5 @@ linux-static-docker: clean-docker
 	         chown -R $(UID):$(GID) .gerbil"
 
 .PHONY: build install clean compat compat-smoke compat-tier0 compat-tier1 compat-tier2 \
-        compat-one compat-range compat-debug vendor-update bench \
+        compat-one compat-range compat-debug compat-report vendor-update bench \
         static clean-docker check-root build-static linux-static-docker
