@@ -11,7 +11,13 @@
 
 set -eu
 
-GSH="${1:-.gerbil/bin/gsh}"
+if [ -n "${1:-}" ]; then
+  GSH="$1"
+elif [ -x static/gsh ]; then
+  GSH=static/gsh
+else
+  GSH=.gerbil/bin/gsh
+fi
 BENCH="$(cd "$(dirname "$0")/.." && pwd)/bench.ss"
 
 if [ ! -x "$GSH" ]; then
