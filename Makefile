@@ -108,6 +108,9 @@ vendor-update: $(OILS_DIR)
 clean:
 	gerbil clean
 	rm -rf .gerbil
+	rm -f ~/.gerbil/bin/gsh
+	rm -rf ~/.gerbil/lib/gsh/
+	rm -f ~/.gerbil/lib/static/gsh__*.scm
 
 # --- Static binary (Docker) ---
 
