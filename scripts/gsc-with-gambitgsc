@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # gsc wrapper that injects gambitgsc .c files into gsc -link calls.
 # This ensures the gambitgsc modules appear in the initialization chain,
 # making compile-file available at runtime in the linked binary.
@@ -7,7 +7,7 @@
 #
 # CRITICAL: gambitgsc .c files must be injected BEFORE the last argument
 # of gsc -link, because gsc derives the output linkfile name from the
-# last input file (e.g., gsh__exe.scm → gsh__exe_.c).
+# last input file (e.g., gsh__exe.scm -> gsh__exe_.c).
 #
 # CRITICAL: modules must be listed in dependency order (from LINK_ORDER),
 # NOT alphabetical. Wrong order causes segfaults during module init.
@@ -43,21 +43,27 @@ for arg in "$@"; do
   fi
 done
 
-if $is_link && [ -d "$GAMBITGSC_DIR" ]; then
+if $is_link && [ -d "$GAMBITGSC_DIR" ] && [ -f "$GAMBITGSC_DIR/LINK_ORDER" ]; then
   # Build ordered list of gambitgsc .c files from LINK_ORDER
-  gambitgsc_files=()
+  gambitgsc_files=""
   while IFS= read -r f; do
-    [[ -z "$f" || "$f" == \#* ]] && continue
-    gambitgsc_files+=("$GAMBITGSC_DIR/$f")
+    case "$f" in ''|'#'*) continue ;; esac
+    gambitgsc_files="$gambitgsc_files $GAMBITGSC_DIR/$f"
   done < "$GAMBITGSC_DIR/LINK_ORDER"
 
-  # Insert gambitgsc .c files before the last argument
-  args=("$@")
-  last_idx=$(( ${#args[@]} - 1 ))
-  last_arg="${args[$last_idx]}"
-  head_args=("${args[@]:0:$last_idx}")
+  # Separate head args (all but last) and last arg.
+  # gsc -link args are flags and file paths (no spaces), so word splitting is safe.
+  last_arg=
+  prev_args=
+  for arg in "$@"; do
+    if [ -n "$last_arg" ]; then
+      prev_args="$prev_args $last_arg"
+    fi
+    last_arg="$arg"
+  done
 
-  "$REAL_GSC" "${head_args[@]}" "${gambitgsc_files[@]}" "$last_arg"
+  # shellcheck disable=SC2086
+  "$REAL_GSC" $prev_args $gambitgsc_files "$last_arg"
   rc=$?
 
   # Clean up sub-linkfiles generated in the gambitgsc directory

@@ -2,6 +2,10 @@
 .gerbil/
 .gerbil-lsp-cache/
 
+# Generated gambitgsc files (run scripts/generate-gambitgsc to regenerate)
+_vendor/gambitgsc/
+_vendor/.gambit-src/
+
 # Test temp files
 _tmp/
 __pycache__/

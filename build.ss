@@ -14,6 +14,10 @@
           ""))
       "")))
 
+;; GSH_STATIC=1 adds -static for static binary builds
+(def static-ld-opts
+  (if (getenv "GSH_STATIC" #f) "-static " ""))
+
 (defbuild-script
   `("ffi"
     "util"
@@ -43,5 +47,5 @@
     "compiler"
     "startup"
     (exe: "main" bin: "gsh" optimize: #t debug: 'env
-          "-ld-options" ,(string-append "-lpcre2-8 " gambitgsc-ld-opts)))
+          "-ld-options" ,(string-append static-ld-opts "-lpcre2-8 " gambitgsc-ld-opts)))
   parallelize: (max 1 (quotient (##cpu-count) 2)))

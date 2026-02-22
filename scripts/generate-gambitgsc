@@ -1,0 +1,157 @@
+#!/bin/sh
+# Generate _vendor/gambitgsc/ contents from the user's installed Gerbil/Gambit.
+#
+# This script:
+# 1. Detects the Gambit version/commit from gsc -v
+# 2. Clones the Gambit repo (cached) and checks out the matching commit
+# 3. Generates .c files from .scm sources using gsc -c
+# 4. Extracts .o files from libgambitgsc.a (shipped with every Gerbil install)
+# 5. Generates LINK_ORDER from the .a archive order
+# 6. Writes a version stamp to skip regeneration when up-to-date
+#
+# The generated files enable embedding the Gambit compiler (compile-file)
+# directly in the gsh binary.
+
+set -eu
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+GAMBITGSC_DIR="$PROJECT_DIR/_vendor/gambitgsc"
+CACHE_DIR="$PROJECT_DIR/_vendor/.gambit-src"
+VERSION_STAMP="$GAMBITGSC_DIR/.gambit-version"
+
+# Module list in dependency order (from libgambitgsc.a)
+MODULES="_host _utils _source _parms _env _ptree1 _ptree2 _gvm _back _front
+  _prims _assert _asm _x86 _arm _riscv _codegen
+  _t-univ-1 _t-univ-2 _t-univ-3 _t-univ-4
+  _t-cpu-abstract-machine _t-cpu-primitives _t-cpu-object-desc _t-cpu-utils
+  _t-cpu-backend-x86 _t-cpu-backend-arm _t-cpu-backend-riscv _t-cpu
+  _t-c-1 _t-c-2 _t-c-3 _gsclib"
+
+# --- Detect Gambit version ---
+
+if [ -n "${GERBIL_HOME:-}" ]; then
+  GSC="$GERBIL_HOME/bin/gsc"
+else
+  GSC="$(which gsc 2>/dev/null || true)"
+fi
+
+if [ -z "$GSC" ] || [ ! -x "$GSC" ]; then
+  echo "generate-gambitgsc: cannot find gsc" >&2
+  exit 1
+fi
+
+GSC_VERSION=$("$GSC" -v 2>&1)
+# Extract first word like "v4.9.7-6-g64f4d369", then strip up to "-g" to get commit
+FULL_VERSION=$(echo "$GSC_VERSION" | awk '{print $1}')
+# Strip everything up to and including the last "-g" to get the commit hash
+COMMIT_HASH=$(echo "$FULL_VERSION" | sed 's/.*-g//')
+
+if [ -z "$COMMIT_HASH" ] || [ "$COMMIT_HASH" = "$FULL_VERSION" ]; then
+  echo "generate-gambitgsc: cannot parse Gambit commit from: $GSC_VERSION" >&2
+  exit 1
+fi
+
+echo "Gambit version: $FULL_VERSION (commit $COMMIT_HASH)"
+
+# --- Locate libgambitgsc.a ---
+
+LIBGSC=$("$GSC" -e '(display (path-expand "~~lib/libgambitgsc.a"))')
+if [ ! -f "$LIBGSC" ]; then
+  echo "generate-gambitgsc: libgambitgsc.a not found at $LIBGSC" >&2
+  exit 1
+fi
+echo "Found libgambitgsc.a: $LIBGSC"
+
+# --- Check if already generated ---
+# Include LIBGSC path in stamp so different installs (host vs Docker) regenerate
+
+STAMP_VALUE="$COMMIT_HASH $LIBGSC"
+if [ -f "$VERSION_STAMP" ] && [ "$(cat "$VERSION_STAMP")" = "$STAMP_VALUE" ]; then
+  # Verify .o files exist too
+  if ls "$GAMBITGSC_DIR"/*.o >/dev/null 2>&1; then
+    echo "gambitgsc already up-to-date for $COMMIT_HASH"
+    exit 0
+  fi
+fi
+
+# --- Clone/update Gambit source ---
+
+# Allow root to operate on repo owned by another user (Docker bind mounts)
+git config --global --add safe.directory "$CACHE_DIR" 2>/dev/null || true
+
+if [ -d "$CACHE_DIR/.git" ]; then
+  echo "Fetching latest from Gambit repo..."
+  git -C "$CACHE_DIR" fetch --depth 1 origin "$COMMIT_HASH" 2>/dev/null || \
+    git -C "$CACHE_DIR" fetch --unshallow 2>/dev/null || \
+    git -C "$CACHE_DIR" fetch origin
+else
+  echo "Cloning Gambit repo (this is a one-time operation)..."
+  mkdir -p "$CACHE_DIR"
+  git clone --filter=blob:none --no-checkout https://github.com/gambit/gambit.git "$CACHE_DIR"
+fi
+
+echo "Checking out commit $COMMIT_HASH..."
+git -C "$CACHE_DIR" checkout "$COMMIT_HASH" -- gsc lib 2>/dev/null || {
+  # If sparse checkout fails, try full checkout
+  git -C "$CACHE_DIR" checkout "$COMMIT_HASH"
+}
+
+GAMBIT_SRC="$CACHE_DIR"
+
+# --- Prepare output directory ---
+
+mkdir -p "$GAMBITGSC_DIR"
+rm -f "$GAMBITGSC_DIR"/*.c "$GAMBITGSC_DIR"/*.o "$GAMBITGSC_DIR"/LINK_ORDER "$VERSION_STAMP"
+
+# --- Generate .c files from .scm sources ---
+
+MODULE_COUNT=0
+for mod in $MODULES; do MODULE_COUNT=$((MODULE_COUNT + 1)); done
+echo "Generating .c files from Gambit source ($MODULE_COUNT modules)..."
+
+FAIL=0
+for mod in $MODULES; do
+  src="$GAMBIT_SRC/gsc/${mod}.scm"
+  out="$GAMBITGSC_DIR/${mod}.c"
+  if [ ! -f "$src" ]; then
+    echo "  ERROR: source not found: $src" >&2
+    FAIL=1
+    continue
+  fi
+  printf "  %s..." "$mod"
+  if "$GSC" "-:~~=$GAMBIT_SRC" -c \
+    -prelude '(##namespace ("c#"))(##include "~~lib/header.scm")' \
+    -o "$out" "$src" 2>&1; then
+    echo " ok"
+  else
+    echo " FAILED" >&2
+    FAIL=1
+  fi
+done
+
+if [ "$FAIL" -ne 0 ]; then
+  echo "generate-gambitgsc: some modules failed to compile" >&2
+  exit 1
+fi
+
+# --- Extract .o files from libgambitgsc.a ---
+
+echo "Extracting .o files from libgambitgsc.a..."
+(cd "$GAMBITGSC_DIR" && ar x "$LIBGSC")
+
+# Remove the library init .o (we don't need it — gsc -link generates its own)
+rm -f "$GAMBITGSC_DIR/_gambitgsc.o"
+
+# --- Generate LINK_ORDER ---
+
+echo "Generating LINK_ORDER..."
+for mod in $MODULES; do
+  echo "${mod}.c"
+done > "$GAMBITGSC_DIR/LINK_ORDER"
+
+# --- Write version stamp ---
+
+echo "$STAMP_VALUE" > "$VERSION_STAMP"
+
+echo "Done. Generated $MODULE_COUNT .c + .o files in $GAMBITGSC_DIR"

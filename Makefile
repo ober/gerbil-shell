@@ -15,17 +15,13 @@ GID := $(shell id -g)
 # --- Gambitgsc (embedded compiler) ---
 
 GAMBITGSC_DIR := _vendor/gambitgsc
-GAMBITGSC_C   := $(wildcard $(GAMBITGSC_DIR)/*.c)
-GAMBITGSC_O   := $(GAMBITGSC_C:.c=.o)
 
-$(GAMBITGSC_DIR)/%.o: $(GAMBITGSC_DIR)/%.c
-	gsc -obj -cc-options "-D___LIBRARY" -o $@ $<
-
-gambitgsc: $(GAMBITGSC_O)
+gambitgsc:
+	$(CURDIR)/scripts/generate-gambitgsc
 
 # --- Build ---
 
-build: $(GAMBITGSC_O)
+build: gambitgsc
 	GERBIL_GSC=$(CURDIR)/scripts/gsc-with-gambitgsc \
 	GERBIL_LOADPATH="$$HOME/.gerbil/pkg/gerbil-pcre/.gerbil/lib:$$GERBIL_LOADPATH" \
 	LIBRARY_PATH="$$(brew --prefix openssl@3 2>/dev/null)/lib:$$LIBRARY_PATH" \
@@ -123,7 +119,7 @@ clean:
 	rm -f ~/.gerbil/bin/gsh
 	rm -rf ~/.gerbil/lib/gsh/
 	rm -f ~/.gerbil/lib/static/gsh__*.scm
-	rm -f $(GAMBITGSC_DIR)/*.o
+	rm -f $(GAMBITGSC_DIR)/*.o $(GAMBITGSC_DIR)/*.c $(GAMBITGSC_DIR)/LINK_ORDER $(GAMBITGSC_DIR)/.gambit-version
 
 # --- Static binary (Docker) ---
 
@@ -138,14 +134,12 @@ check-root:
 	  git config --global --add safe.directory /src; \
 	fi
 
-build-static: check-root
+build-static: check-root gambitgsc
 	gxpkg install github.com/ober/gerbil-pcre2
-	gxpkg build
-	mkdir -p .gerbil/bin
-	GERBIL_LOADPATH="$$(pwd)/.gerbil/lib" \
-	gxc -exe -o .gerbil/bin/gsh \
-	  -ld-options "-static -lpcre2-8" \
-	  main.ss
+	GSH_STATIC=1 \
+	GERBIL_GSC=$(CURDIR)/scripts/gsc-with-gambitgsc \
+	GERBIL_LOADPATH="$$(pwd)/.gerbil/lib:$$GERBIL_LOADPATH" \
+	gerbil build
 
 linux-static-docker: clean-docker
 	docker run --rm \
