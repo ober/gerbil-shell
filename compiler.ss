@@ -2,11 +2,13 @@
 ;;; Embeds the Gerbil compiler so users can compile and load .ss modules
 ;;; from within the shell, without needing a separate gxc installation.
 ;;;
-;;; When gsc (Gambit compiler) is available, full native compilation to .oN works.
-;;; When gsc is absent, an interpreted fallback loads the generated .scm directly.
+;;; When gambitgsc is linked in, compile-file runs in-process (no external gsc).
+;;; When gambitgsc is absent but external gsc exists, delegates to it.
+;;; When neither is available, generates .scm/.ssi only (no native .o1).
 
 (export ensure-gerbil-compiler!
         gsc-available?
+        embedded-compile-file?
         gsh-compile
         gsh-load
         gsh-use
@@ -28,19 +30,45 @@
    Called lazily to avoid startup cost for normal shell operations."
   (unless *gerbil-compiler-initialized*
     (set! *gerbil-compiler-initialized* #t)
-    ;; __load-gxi sets up the expander, readtables, and eval hooks.
-    ;; Safe to call even if script.ss already called it — guarded by our flag.
     (__load-gxi)))
 
-;;; --- gsc detection ---
+;;; --- Compiler detection ---
+
+(def *embedded-compile-file-cached* 'unchecked)
+
+(def (embedded-compile-file?)
+  "Check if compile-file is available in-process (gambitgsc linked in)."
+  (when (eq? *embedded-compile-file-cached* 'unchecked)
+    (set! *embedded-compile-file-cached*
+      (with-catch (lambda (e) #f)
+        (lambda () (procedure? (eval 'compile-file))))))
+  *embedded-compile-file-cached*)
 
 (def (gsc-available?)
-  "Check if the Gambit compiler (gsc) is available for native compilation."
-  (let ((gsc-env (getenv "GERBIL_GSC" #f)))
-    (if gsc-env
-      (file-exists? gsc-env)
-      (file-exists?
-       (path-expand "gsc" (path-expand "bin" (path-expand "~~")))))))
+  "Check if native compilation is available (embedded or external gsc)."
+  (or (embedded-compile-file?)
+      (let ((gsc-env (getenv "GERBIL_GSC" #f)))
+        (if gsc-env
+          (file-exists? gsc-env)
+          (file-exists?
+           (path-expand "gsc" (path-expand "bin" (path-expand "~~"))))))))
+
+;;; --- In-process .scm → .o1 compilation ---
+
+(def (compile-scm-files outdir basename)
+  "Compile generated .scm files to .o1 using in-process compile-file.
+   Compiles basename.scm and all basename~N.scm parts."
+  (let ((cf (eval 'compile-file)))
+    ;; Compile the main .scm
+    (let ((main-scm (path-expand (string-append basename ".scm") outdir)))
+      (when (file-exists? main-scm)
+        (cf main-scm)))
+    ;; Compile ~N parts
+    (let loop ((n 0))
+      (let ((part-scm (path-expand (string-append basename "~" (number->string n) ".scm") outdir)))
+        (when (file-exists? part-scm)
+          (cf part-scm)
+          (loop (+ n 1)))))))
 
 ;;; --- Compile ---
 
@@ -49,103 +77,49 @@
                   invoke-gsc: (invoke-gsc 'auto)
                   verbose: (verbose #f))
   "Compile a Gerbil source file (.ss).
-   Returns (values outdir use-gsc?)."
+   Returns (values outdir native?)."
   (ensure-gerbil-compiler!)
   (let* ((srcpath (path-normalize srcpath))
          (outdir (or output-dir (path-directory srcpath)))
-         (use-gsc? (if (eq? invoke-gsc 'auto) (gsc-available?) invoke-gsc))
+         (has-embedded? (embedded-compile-file?))
+         (use-external-gsc?
+           (if (eq? invoke-gsc 'auto)
+             ;; If we have embedded compile-file, don't invoke external gsc
+             (if has-embedded? #f
+               (let ((gsc-env (getenv "GERBIL_GSC" #f)))
+                 (if gsc-env
+                   (file-exists? gsc-env)
+                   (file-exists?
+                    (path-expand "gsc" (path-expand "bin" (path-expand "~~")))))))
+             invoke-gsc))
          (opts [output-dir: outdir
-                invoke-gsc: use-gsc?
+                invoke-gsc: use-external-gsc?
                 keep-scm: #t
                 verbose: verbose
-                generate-ssxi: #f]))
+                generate-ssxi: #f])
+         (basename (path-strip-extension (path-strip-directory srcpath))))
     (compile-module srcpath opts)
-    (fprintf (current-error-port) "compiled: ~a~n" srcpath)
-    (values outdir use-gsc?)))
-
-;;; --- Interpreted .scm loader ---
-;;; When gsc is unavailable, .scm/.ssi files are generated but can't be loaded
-;;; normally because the Gerbil expander rewrites (declare ...) to (%#declare ...)
-;;; which the evaluator rejects. This loader reads .scm with Gambit's read,
-;;; skips declare forms, and eval's the rest.
-
-(def (load-scm-interpreted filepath load-dir)
-  "Load a generated .scm file by reading forms and eval-ing them,
-   skipping (declare ...) forms and handling (load-module ...) calls."
-  (let ((port (open-input-file filepath)))
-    (let loop ()
-      (let ((form (read port)))
-        (if (eof-object? form)
-          (close-port port)
-          (begin
-            (cond
-              ;; Skip (declare ...) — optimizer hints for native compilation
-              ((and (pair? form) (eq? (car form) 'declare))
-               #f)
-              ;; Handle (begin ...) which may contain (load-module "name~N")
-              ((and (pair? form) (eq? (car form) 'begin))
-               (for-each
-                (lambda (subform)
-                  (cond
-                    ;; (begin) — empty, skip
-                    ((and (pair? subform) (eq? (car subform) 'begin)
-                          (null? (cdr subform)))
-                     #f)
-                    ;; (load-module "modname~N") — load the referenced file
-                    ((and (pair? subform) (eq? (car subform) 'load-module)
-                          (pair? (cdr subform)) (string? (cadr subform)))
-                     (let ((mod-file (string-append load-dir "/"
-                                                    (cadr subform) ".scm")))
-                       (load-scm-interpreted mod-file load-dir)))
-                    (else
-                     (eval subform))))
-                (cdr form)))
-              (else
-               (eval form)))
-            (loop)))))))
-
-(def (gsh-load-interpreted modpath)
-  "Load a module's .scm files interpretively from the load path.
-   Finds the main .scm and all ~N.scm files, loads them via eval."
-  (let ((scm-file (find-scm-in-load-path modpath)))
-    (if scm-file
-      (let ((load-dir (path-directory scm-file)))
-        (load-scm-interpreted scm-file load-dir)
-        #t)
-      #f)))
-
-(def (find-scm-in-load-path modpath)
-  "Search load-path for modpath.scm, return full path or #f."
-  (let loop ((dirs (load-path)))
-    (if (null? dirs)
-      #f
-      (let ((candidate (string-append (car dirs) "/" modpath ".scm")))
-        (if (file-exists? candidate)
-          candidate
-          (loop (cdr dirs)))))))
+    ;; If embedded compile-file and we didn't use external gsc, compile .scm → .o1
+    (when (and has-embedded? (not use-external-gsc?))
+      (compile-scm-files outdir basename))
+    (let ((native? (or has-embedded? use-external-gsc?)))
+      (fprintf (current-error-port) "compiled: ~a~a~n"
+               srcpath (if native? "" " (scm only)"))
+      (values outdir native?))))
 
 ;;; --- Load ---
 
 (def (gsh-load modpath libdir: (libdir #f))
   "Load a compiled Gerbil module and import into the eval context.
-   modpath is like \"test-mod\" or \"mylib/foo\".
-   Tries native import first; falls back to interpreted .scm loading."
+   modpath is like \"test-mod\" or \"mylib/foo\"."
   (ensure-gerbil-compiler!)
   (when libdir
     (let ((dir (path-normalize libdir)))
       (unless (member dir (load-path))
         (add-load-path! dir))))
-  ;; Try native import first (works when .o1 files exist)
   (let ((mod-sym (string->symbol (string-append ":" modpath))))
-    (with-catch
-     (lambda (e)
-       ;; Native import failed — try interpreted .scm loading
-       (if (gsh-load-interpreted modpath)
-         (fprintf (current-error-port) "loaded: ~a (interpreted)~n" modpath)
-         (raise e)))
-     (lambda ()
-       (eval `(import ,mod-sym))
-       (fprintf (current-error-port) "loaded: ~a~n" modpath)))))
+    (eval `(import ,mod-sym))
+    (fprintf (current-error-port) "loaded: ~a~n" modpath)))
 
 ;;; --- Use (compile + load) ---
 
@@ -156,17 +130,14 @@
    Returns the module path string."
   (ensure-gerbil-compiler!)
   (let* ((srcpath (path-normalize srcpath)))
-    (let-values (((outdir use-gsc?) (gsh-compile srcpath
+    (let-values (((outdir native?) (gsh-compile srcpath
                                                   output-dir: output-dir
                                                   verbose: verbose)))
-      ;; Add output dir to load path
       (unless (member outdir (load-path))
         (add-load-path! outdir))
-      ;; Derive the module path from the compiled module context
       (let ((modpath
              (with-catch
               (lambda (e)
-                ;; Fallback: derive from filename
                 (path-strip-extension (path-strip-directory srcpath)))
               (lambda ()
                 (let ((ctx (import-module srcpath)))

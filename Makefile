@@ -12,9 +12,21 @@ DOCKER_IMAGE := "gerbil/gerbilxx:$(ARCH)-master"
 UID := $(shell id -u)
 GID := $(shell id -g)
 
+# --- Gambitgsc (embedded compiler) ---
+
+GAMBITGSC_DIR := _vendor/gambitgsc
+GAMBITGSC_C   := $(wildcard $(GAMBITGSC_DIR)/*.c)
+GAMBITGSC_O   := $(GAMBITGSC_C:.c=.o)
+
+$(GAMBITGSC_DIR)/%.o: $(GAMBITGSC_DIR)/%.c
+	gsc -obj -cc-options "-D___LIBRARY" -o $@ $<
+
+gambitgsc: $(GAMBITGSC_O)
+
 # --- Build ---
 
-build:
+build: $(GAMBITGSC_O)
+	GERBIL_GSC=$(CURDIR)/scripts/gsc-with-gambitgsc \
 	GERBIL_LOADPATH="$$HOME/.gerbil/pkg/gerbil-pcre/.gerbil/lib:$$GERBIL_LOADPATH" \
 	LIBRARY_PATH="$$(brew --prefix openssl@3 2>/dev/null)/lib:$$LIBRARY_PATH" \
 	gerbil build
@@ -111,6 +123,7 @@ clean:
 	rm -f ~/.gerbil/bin/gsh
 	rm -rf ~/.gerbil/lib/gsh/
 	rm -f ~/.gerbil/lib/static/gsh__*.scm
+	rm -f $(GAMBITGSC_DIR)/*.o
 
 # --- Static binary (Docker) ---
 
@@ -146,4 +159,4 @@ linux-static-docker: clean-docker
 
 .PHONY: build install clean compat compat-smoke compat-tier0 compat-tier1 compat-tier2 \
         compat-one compat-range compat-debug compat-report vendor-update bench \
-        static clean-docker check-root build-static linux-static-docker
+        static clean-docker check-root build-static linux-static-docker gambitgsc
