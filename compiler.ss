@@ -55,17 +55,21 @@
 
 ;;; --- In-process .scm → .o1 compilation ---
 
-(def (compile-scm-files outdir basename)
+(def (compile-scm-files outdir modpath)
   "Compile generated .scm files to .o1 using in-process compile-file.
-   Compiles basename.scm and all basename~N.scm parts."
-  (let ((cf (eval 'compile-file)))
+   modpath is the module path (e.g. \"gsh/bench\") — may include package prefix.
+   Compiles modpath.scm and all modpath~N.scm parts."
+  (let* ((cf (eval 'compile-file))
+         ;; Module path uses / separator, maps to directory structure
+         (scm-dir (path-expand (path-directory modpath) outdir))
+         (basename (path-strip-directory modpath)))
     ;; Compile the main .scm
-    (let ((main-scm (path-expand (string-append basename ".scm") outdir)))
+    (let ((main-scm (path-expand (string-append basename ".scm") scm-dir)))
       (when (file-exists? main-scm)
         (cf main-scm)))
     ;; Compile ~N parts
     (let loop ((n 0))
-      (let ((part-scm (path-expand (string-append basename "~" (number->string n) ".scm") outdir)))
+      (let ((part-scm (path-expand (string-append basename "~" (number->string n) ".scm") scm-dir)))
         (when (file-exists? part-scm)
           (cf part-scm)
           (loop (+ n 1)))))))
@@ -101,7 +105,13 @@
     (compile-module srcpath opts)
     ;; If embedded compile-file and we didn't use external gsc, compile .scm → .o1
     (when (and has-embedded? (not use-external-gsc?))
-      (compile-scm-files outdir basename))
+      ;; Derive module path from expander context (includes package prefix)
+      (let ((modpath (with-catch
+                      (lambda (e) basename)
+                      (lambda ()
+                        (let ((ctx (import-module srcpath)))
+                          (symbol->string (expander-context-id ctx)))))))
+        (compile-scm-files outdir modpath)))
     (let ((native? (or has-embedded? use-external-gsc?)))
       (fprintf (current-error-port) "compiled: ~a~a~n"
                srcpath (if native? "" " (scm only)"))
