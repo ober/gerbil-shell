@@ -6,6 +6,9 @@
 _vendor/gambitgsc/
 _vendor/.gambit-src/
 
+# Static binary output
+static/
+
 # Test temp files
 _tmp/
 __pycache__/

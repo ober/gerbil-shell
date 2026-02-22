@@ -149,7 +149,15 @@ linux-static-docker: clean-docker
 	  sh -c "apk add --no-cache pcre2-dev pcre2-static && \
 	         cd /src && \
 	         make build-static && \
-	         chown -R $(UID):$(GID) .gerbil"
+	         mkdir -p static && \
+	         cp .gerbil/bin/gsh static/gsh && \
+	         chown -R $(UID):$(GID) static"
+	@# Clean ALL Docker artifacts so local builds are never corrupted
+	-rm -rf .gerbil 2>/dev/null || true
+	docker run --rm -v $(PWD):/src:z alpine sh -c \
+	  "rm -rf /src/.gerbil /src/$(GAMBITGSC_DIR)/*.o /src/$(GAMBITGSC_DIR)/*.c \
+	   /src/$(GAMBITGSC_DIR)/LINK_ORDER /src/$(GAMBITGSC_DIR)/.gambit-version"
+	@echo "Static binary: static/gsh"
 
 .PHONY: build install clean compat compat-smoke compat-tier0 compat-tier1 compat-tier2 \
         compat-one compat-range compat-debug compat-report vendor-update bench \
