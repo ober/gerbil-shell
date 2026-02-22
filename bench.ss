@@ -1,7 +1,7 @@
 (export run-benchmarks)
 
 (import :std/sugar
-        :std/format
+:std/format
         :std/srfi/1)
 
 ;; --- Timing ---

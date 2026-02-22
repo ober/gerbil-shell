@@ -43,6 +43,7 @@
     "prompt"
     "lineedit"
     "completion"
+    "static-compat"
     "script"
     "compiler"
     "startup"

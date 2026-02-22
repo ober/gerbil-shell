@@ -5,7 +5,6 @@
 (import :std/sugar
         :std/format
         :gerbil/runtime/init
-        :gerbil/expander
         :gsh/util
         :gsh/ast
         :gsh/environment
@@ -14,7 +13,8 @@
         :gsh/parser
         :gsh/executor
         :gsh/signals
-        :gsh/jobs)
+        :gsh/jobs
+        :gsh/static-compat)
 
 ;;; --- Meta-command handler (set by main.ss to wire up ,compile etc.) ---
 
@@ -30,7 +30,11 @@
    Called lazily to avoid ~100ms startup cost for normal shell operations."
   (unless *gerbil-eval-initialized*
     (set! *gerbil-eval-initialized* #t)
-    (__load-gxi)))
+    (ensure-static-compat!)
+    (__load-gxi)
+    ;; After __load-gxi, re-patch load-module for the Gerbil expander context
+    (when (scm-only-load-module-active?)
+      (patch-loader-post-gxi!))))
 
 ;;; --- Scheme Evaluation Helpers ---
 

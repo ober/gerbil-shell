@@ -24,7 +24,8 @@
             ffi-sigchld-block ffi-sigchld-unblock
             ffi-signal-flag-install ffi-signal-flag-check
             WNOHANG WUNTRACED WCONTINUED
-            WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG WIFSTOPPED WSTOPSIG)
+            WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG WIFSTOPPED WSTOPSIG
+            ffi-static-binary?)
 
   (c-declare #<<END-C
 #include <sys/types.h>
@@ -37,6 +38,7 @@
 #include <signal.h>
 #include <string.h>
 #include <dirent.h>
+#include <dlfcn.h>
 
 /* Record which signals were SIG_IGN at process startup, BEFORE Gambit
    installs its own handlers.  POSIX: non-interactive shells must not
@@ -752,5 +754,19 @@ END-EXECVE
   ;; Used for user traps instead of Gerbil's async signalfd handlers.
   (define-c-lambda ffi-signal-flag-install (int) int "ffi_signal_flag_install")
   (define-c-lambda ffi-signal-flag-check (int) int "ffi_signal_flag_check")
+
+  ;; Detect statically-linked binary (dlopen unavailable for .o1 files)
+  ;; On musl static, dlopen(NULL) succeeds but dlopen(path) fails with
+  ;; "Dynamic loading not supported". Test with a non-NULL path to detect this.
+  (define-c-lambda ffi-static-binary? () scheme-object
+    "void *h = dlopen(\"__gsh_dlopen_test__\", RTLD_LAZY);
+     if (h) { dlclose(h); ___result = ___FAL; }
+     else {
+       const char *err = dlerror();
+       if (err && strstr(err, \"not supported\"))
+         ___result = ___TRU;
+       else
+         ___result = ___FAL;
+     }")
 
 )

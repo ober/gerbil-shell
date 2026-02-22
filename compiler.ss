@@ -19,7 +19,8 @@
         :gerbil/runtime/init
         :gerbil/runtime/loader
         :gerbil/expander
-        :gerbil/compiler)
+        :gerbil/compiler
+        :gsh/static-compat)
 
 ;;; --- Lazy initialization ---
 
@@ -30,7 +31,10 @@
    Called lazily to avoid startup cost for normal shell operations."
   (unless *gerbil-compiler-initialized*
     (set! *gerbil-compiler-initialized* #t)
-    (__load-gxi)))
+    (ensure-static-compat!)
+    (__load-gxi)
+    (when (scm-only-load-module-active?)
+      (patch-loader-post-gxi!))))
 
 ;;; --- Compiler detection ---
 

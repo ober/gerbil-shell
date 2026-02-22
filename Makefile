@@ -8,7 +8,7 @@ export GERBIL_BUILD_CORES := $(shell echo $$(( $$(nproc) / 2 )))
 # Static binary build variables
 ARCH := $(shell uname -m)
 PWD := $(shell pwd)
-DOCKER_IMAGE := "gerbil/gerbilxx:$(ARCH)-master"
+DOCKER_IMAGE := "gerbil/gerbil:$(ARCH)-master"
 UID := $(shell id -u)
 GID := $(shell id -g)
 
