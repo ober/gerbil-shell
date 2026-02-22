@@ -61,11 +61,11 @@
 
 (def (run-benchmarks)
   (fprintf (current-error-port) "~n=== bench ===~n")
-  (time-thunk "fib(35)      " (lambda () (fib 35)))
-  (time-thunk "ack(3,9)     " (lambda () (ack 3 9)))
-  (time-thunk "str-build 50k" (lambda () (string-build 50000)))
-  (time-thunk "hash-churn 1M" (lambda () (hash-churn 1000000)))
-  (time-thunk "list-ops 500k" (lambda () (list-ops 500000)))
+  (time-thunk "fib(40)      " (lambda () (fib 40)))
+  (time-thunk "ack(3,11)    " (lambda () (ack 3 11)))
+  (time-thunk "str-build 80k" (lambda () (string-build 80000)))
+  (time-thunk "hash-churn 3M" (lambda () (hash-churn 3000000)))
+  (time-thunk "list-ops 2M  " (lambda () (list-ops 2000000)))
   (fprintf (current-error-port) "=== done ===~n"))
 
 ;; Auto-run on load
