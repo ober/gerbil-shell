@@ -1,4 +1,8 @@
 ;;; history.ss — Command history for gsh
+;;;
+;;; Entries stored as 3-element vectors: #(timestamp cwd command)
+;;; File format: EPOCH\tCWD\tCOMMAND  (tab-separated, one per line)
+;;; Backward-compatible: plain text lines loaded as #(0 "" command)
 
 (export #t)
 (import :std/sugar
@@ -6,10 +10,25 @@
         ./pregexp-compat
         :gsh/util)
 
+;;; --- History entry accessors ---
+;;; Entries are 3-element vectors: #(timestamp cwd command)
+
+(def (make-history-entry timestamp cwd command)
+  (vector timestamp cwd command))
+
+(def (history-entry-timestamp entry)
+  (vector-ref entry 0))
+
+(def (history-entry-cwd entry)
+  (vector-ref entry 1))
+
+(def (history-entry-command entry)
+  (vector-ref entry 2))
+
 ;;; --- History state ---
 
 (defstruct history-state
-  (entries       ;; vector of strings (ring buffer)
+  (entries       ;; vector of history-entry (ring buffer)
    count         ;; number of entries added
    max-size      ;; $HISTSIZE
    file          ;; $HISTFILE path
@@ -36,7 +55,7 @@
       []))  ;; ignore patterns
   (history-load!))
 
-;; Add a line to history
+;; Add a line to history (with timestamp and CWD)
 (def (history-add! line)
   (when (and *history* (> (string-length (string-trim line)) 0))
     (let ((trimmed (string-trim line)))
@@ -44,39 +63,53 @@
       (unless (history-should-ignore? trimmed)
         (let* ((h *history*)
                (idx (modulo (history-state-count h)
-                            (history-state-max-size h))))
-          (vector-set! (history-state-entries h) idx trimmed)
+                            (history-state-max-size h)))
+               (entry (make-history-entry
+                        (inexact->exact (floor (current-second)))
+                        (with-catch (lambda (e) "") current-directory)
+                        trimmed)))
+          (vector-set! (history-state-entries h) idx entry)
           (set! (history-state-count h) (+ 1 (history-state-count h))))))))
 
-;; Get entry by absolute number (1-based)
-(def (history-get n)
+;; Get raw entry by absolute number (1-based) — returns history-entry vector or #f
+(def (history-get-entry n)
   (when *history*
     (let* ((h *history*)
            (total (history-state-count h))
            (max-sz (history-state-max-size h)))
       (if (and (> n 0) (<= n total))
-        (let ((idx (modulo (- n 1) max-sz)))
-          (vector-ref (history-state-entries h) idx))
+        (let ((raw (vector-ref (history-state-entries h) (modulo (- n 1) max-sz))))
+          (and raw (if (vector? raw) raw (make-history-entry 0 "" raw))))
         #f))))
 
-;; Get entry by offset from end (0 = most recent)
-(def (history-get-relative offset)
+;; Get command string by absolute number (1-based) — backward compatible
+(def (history-get n)
+  (let ((entry (history-get-entry n)))
+    (and entry (history-entry-command entry))))
+
+;; Get raw entry by offset from end (0 = most recent)
+(def (history-get-entry-relative offset)
   (when *history*
     (let* ((h *history*)
            (total (history-state-count h)))
-      (history-get (- total offset)))))
+      (history-get-entry (- total offset)))))
 
-;; Search history for entries starting with prefix
+;; Get command string by offset from end (0 = most recent) — backward compatible
+(def (history-get-relative offset)
+  (let ((entry (history-get-entry-relative offset)))
+    (and entry (history-entry-command entry))))
+
+;; Search history for entries starting with prefix (returns list of command strings)
 (def (history-search prefix)
   (if (not *history*) []
       (let* ((h *history*)
              (entries (history-list)))
-        (filter (lambda (entry)
-                  (and (>= (string-length entry) (string-length prefix))
-                       (string=? (substring entry 0 (string-length prefix)) prefix)))
+        (filter (lambda (cmd)
+                  (and (>= (string-length cmd) (string-length prefix))
+                       (string=? (substring cmd 0 (string-length prefix)) prefix)))
                 entries))))
 
-;; Reverse search for entry containing substring
+;; Reverse search for entry containing substring (returns command string or #f)
 (def (history-search-reverse substr)
   (if (not *history*) #f
       (let* ((h *history*)
@@ -86,13 +119,16 @@
         (let loop ((i (- start 1)))
           (if (< i 0) #f
               (let* ((idx (modulo (- total 1 (- (- start 1) i)) max-sz))
-                     (entry (vector-ref (history-state-entries h) idx)))
-                (if (and entry (string-contains? entry substr))
-                  entry
+                     (raw (vector-ref (history-state-entries h) idx))
+                     (cmd (cond ((not raw) #f)
+                                ((vector? raw) (history-entry-command raw))
+                                (else raw))))
+                (if (and cmd (string-contains? cmd substr))
+                  cmd
                   (loop (- i 1)))))))))
 
-;; Get all history entries as a list (oldest first)
-(def (history-list)
+;; Get all history entries as entry vectors (oldest first)
+(def (history-entries)
   (if (not *history*) []
       (let* ((h *history*)
              (total (history-state-count h))
@@ -103,8 +139,16 @@
             (reverse result)
             (let* ((abs-num (+ (max 1 (- total max-sz -1)) i))
                    (idx (modulo (- abs-num 1) max-sz))
-                   (entry (vector-ref (history-state-entries h) idx)))
-              (loop (+ i 1) (if entry (cons entry result) result))))))))
+                   (raw (vector-ref (history-state-entries h) idx)))
+              (loop (+ i 1)
+                    (cond
+                      ((not raw) result)
+                      ((vector? raw) (cons raw result))
+                      (else (cons (make-history-entry 0 "" raw) result))))))))))
+
+;; Get all history command strings as a list (oldest first) — backward compatible
+(def (history-list)
+  (map history-entry-command (history-entries)))
 
 ;; Total number of history entries
 (def (history-count)
@@ -515,18 +559,25 @@
       line)))
 
 ;;; --- File I/O ---
+;;; Format: EPOCH\tCWD\tCOMMAND  (tab-separated)
+;;; Backward-compatible: plain text lines (no tabs) loaded as timestamp=0, cwd=""
 
 (def (history-save!)
   (when *history*
-    (let ((entries (history-list))
+    (let ((entries (history-entries))
           (file (history-state-file *history*)))
       (with-catch
        (lambda (e) #!void)  ;; silently fail
        (lambda ()
          (call-with-output-file file
            (lambda (port)
-             (for-each (lambda (entry) (display entry port) (newline port))
-                       entries))))))))
+             (for-each
+               (lambda (entry)
+                 (fprintf port "~a\t~a\t~a~n"
+                          (history-entry-timestamp entry)
+                          (history-entry-cwd entry)
+                          (history-entry-command entry)))
+               entries))))))))
 
 (def (history-load!)
   (when *history*
@@ -536,7 +587,36 @@
        (lambda ()
          (when (file-exists? file)
            (let ((lines (read-file-lines file)))
-             (for-each history-add! lines))))))))
+             (for-each
+               (lambda (line)
+                 (when (> (string-length line) 0)
+                   ;; Parse tab-separated format or fall back to plain text
+                   (let ((tab1 (string-index-of line #\tab 0)))
+                     (if tab1
+                       (let ((tab2 (string-index-of line #\tab (+ tab1 1))))
+                         (if tab2
+                           ;; Full format: EPOCH\tCWD\tCOMMAND
+                           (let* ((ts-str (substring line 0 tab1))
+                                  (cwd (substring line (+ tab1 1) tab2))
+                                  (cmd (substring line (+ tab2 1) (string-length line)))
+                                  (ts (or (string->number ts-str) 0)))
+                             (history-add-raw! ts cwd cmd))
+                           ;; One tab: treat as plain text
+                           (history-add-raw! 0 "" line)))
+                       ;; No tabs: plain text (old format)
+                       (history-add-raw! 0 "" line)))))
+               lines))))))))
+
+;; Internal: add a pre-parsed entry without timestamping
+(def (history-add-raw! timestamp cwd command)
+  (when (and *history* (> (string-length command) 0))
+    (unless (history-should-ignore? command)
+      (let* ((h *history*)
+             (idx (modulo (history-state-count h)
+                          (history-state-max-size h)))
+             (entry (make-history-entry timestamp cwd command)))
+        (vector-set! (history-state-entries h) idx entry)
+        (set! (history-state-count h) (+ 1 (history-state-count h)))))))
 
 ;;; --- HISTCONTROL ---
 
@@ -551,10 +631,27 @@
      (and (memq 'ignorespace controls)
           (> (string-length line) 0)
           (char=? (string-ref line 0) #\space))
-     ;; ignoredups: same as previous
+     ;; ignoredups: same as previous command
      (and (memq 'ignoredups controls)
           (let ((prev (history-get-relative 0)))
             (and prev (string=? prev line)))))))
+
+;;; --- Deduplication for history display ---
+
+;; Return history command strings deduplicated (most recent wins), newest first.
+;; Used for fzf history search to avoid showing the same command many times.
+(def (history-unique-commands)
+  (let ((entries (history-entries))
+        (seen (make-hash-table)))
+    (let loop ((es (reverse entries)) (result []))
+      (if (null? es)
+        result
+        (let ((cmd (history-entry-command (car es))))
+          (if (hash-get seen cmd)
+            (loop (cdr es) result)
+            (begin
+              (hash-put! seen cmd #t)
+              (loop (cdr es) (cons cmd result)))))))))
 
 ;;; --- Helpers ---
 

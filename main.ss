@@ -17,7 +17,9 @@
         :gsh/builtins
         :gsh/history
         :gsh/prompt
+        :gsh/fuzzy
         :gsh/lineedit
+        :gsh/fzf
         :gsh/completion
         :gsh/signals
         :gsh/jobs
@@ -718,6 +720,7 @@
            ;; Interactive REPL
            (begin
              (*interactive-shell* #t)
+             (fzf-init!)  ;; Register fzf keybinding handlers
              (repl env)
              ;; Run logout for login shells
              (when login?

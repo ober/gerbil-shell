@@ -8,6 +8,13 @@
         :gsh/history
         :gsh/ffi)
 
+;;; --- fzf callback hooks (set by fzf.ss at startup) ---
+;;; These are set to actual functions after fzf.ss loads.
+;;; Initialized to make-parameter so the compiler sees them as procedures.
+(def *fzf-history-fn* (make-parameter #f))   ;; parameter: (lambda (commands) -> string or #f) or #f
+(def *fzf-files-fn* (make-parameter #f))     ;; parameter: (lambda () -> string or #f) or #f
+(def *fzf-dirs-fn* (make-parameter #f))      ;; parameter: (lambda () -> string or #f) or #f
+
 ;;; --- Constants ---
 
 (def ESC #\escape)
@@ -567,7 +574,16 @@
          (buf-insert-string state text)
          (refresh-line state out-port))))
     ((and (char? key) (= (char->integer key) CTRL-T))
-     (buf-transpose-chars state)
+     ;; Fuzzy file finder via fzf (if available), else transpose chars
+     (let ((fn (*fzf-files-fn*)))
+       (if fn
+         (begin
+           (term-cooked! (current-input-port))
+           (let ((result (with-catch (lambda (e) #f) (lambda () (fn)))))
+             (term-raw! (current-input-port))
+             (when result
+               (buf-insert-string state result))))
+         (buf-transpose-chars state)))
      (refresh-line state out-port))
     ((and (char? key) (= (char->integer key) CTRL-L))
      ;; Clear screen
@@ -580,8 +596,21 @@
      (history-next state)
      (refresh-line state out-port))
     ((and (char? key) (= (char->integer key) CTRL-R))
-     (search-start state 'reverse)
-     (refresh-search state out-port))
+     ;; Fuzzy history search via fzf (if available), else fallback to substring search
+     (let ((fn (*fzf-history-fn*)))
+       (if fn
+         (let ((commands (history-unique-commands)))
+           (when (pair? commands)
+             (term-cooked! (current-input-port))
+             (let ((result (with-catch (lambda (e) #f) (lambda () (fn commands)))))
+               (term-raw! (current-input-port))
+               (when result
+                 (save-undo! state)
+                 (set! (line-state-buffer state) (string-copy result))
+                 (set! (line-state-cursor state) (string-length result))))))
+         ;; Fallback: legacy substring search
+         (search-start state 'reverse)))
+     (refresh-line state out-port))
     ((and (char? key) (= (char->integer key) CTRL-S))
      (search-start state 'forward)
      (refresh-search state out-port))
@@ -660,9 +689,19 @@
     ((or (char=? ch #\l) (char=? ch #\L))
      (word-transform! state char-downcase)
      (refresh-line state out-port))
-    ;; Alt-C: capitalize word
+    ;; Alt-C: fuzzy directory jump via fzf (if available), else capitalize word
     ((or (char=? ch #\c) (char=? ch #\C))
-     (word-capitalize! state)
+     (let ((fn (*fzf-dirs-fn*)))
+       (if fn
+         (begin
+           (term-cooked! (current-input-port))
+           (let ((result (with-catch (lambda (e) #f) (lambda () (fn)))))
+             (term-raw! (current-input-port))
+             (when result
+               (save-undo! state)
+               (set! (line-state-buffer state) (string-append "cd " result))
+               (set! (line-state-cursor state) (+ 3 (string-length result))))))
+         (word-capitalize! state)))
      (refresh-line state out-port))
     ;; Alt-<: beginning of history
     ((char=? ch #\<)
