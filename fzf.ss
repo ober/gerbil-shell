@@ -416,9 +416,9 @@
 ;;;============================================================================
 
 (def (fzf-select candidates
-                  (prompt "> ")
-                  (multi? #f)
-                  (initial-query ""))
+                  prompt: (prompt "> ")
+                  multi?: (multi? #f)
+                  initial-query: (initial-query ""))
   "Run interactive fuzzy finder on a list of strings.
    Returns: selected string (single mode), list of strings (multi mode), or #f on cancel."
   (let ((in-port (current-input-port))
