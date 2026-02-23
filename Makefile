@@ -31,7 +31,7 @@ gsh-dlopen:
 
 build: gambitgsc gerbil-runtime gsh-dlopen
 	GERBIL_GSC=$(CURDIR)/scripts/gsc-with-gambitgsc \
-	GERBIL_LOADPATH="$$HOME/.gerbil/pkg/gerbil-pcre/.gerbil/lib:$$GERBIL_LOADPATH" \
+	GERBIL_LOADPATH="$$HOME/.gerbil/lib:$$HOME/.gerbil/pkg/gerbil-pcre/.gerbil/lib:$$GERBIL_LOADPATH" \
 	LIBRARY_PATH="$$(brew --prefix openssl@3 2>/dev/null)/lib:$$LIBRARY_PATH" \
 	gerbil build
 
@@ -153,9 +153,10 @@ check-root:
 
 build-static: check-root gambitgsc gerbil-runtime gsh-dlopen
 	gxpkg install github.com/ober/gerbil-pcre2
+	gxpkg install github.com/ober/gerbil-coreutils
 	GSH_STATIC=1 \
 	GERBIL_GSC=$(CURDIR)/scripts/gsc-with-gambitgsc \
-	GERBIL_LOADPATH="$$(pwd)/.gerbil/lib:$$GERBIL_LOADPATH" \
+	GERBIL_LOADPATH="$$HOME/.gerbil/lib:$$(pwd)/.gerbil/lib:$$GERBIL_LOADPATH" \
 	gerbil build
 
 linux-static-docker: clean-docker

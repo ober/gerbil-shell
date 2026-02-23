@@ -27,7 +27,8 @@
         :gsh/compiler
         :gsh/startup
         :gsh/arithmetic
-        :gsh/ffi)
+        :gsh/ffi
+        :gsh/coreutils)
 
 ;;; --- CLI argument parsing ---
 
@@ -242,6 +243,8 @@
     (*meta-command-handler* handle-meta-command)
     ;; Register builtins that need main.ss callbacks
     (register-late-builtins! env)
+    ;; Register gerbil-coreutils as builtins (cat, sort, wc, etc.)
+    (register-coreutils!)
     env))
 
 ;;; --- Scheme Evaluation (Meta-Command) ---

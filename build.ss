@@ -66,6 +66,7 @@
     "completion"
     "static-compat"
     "script"
+    "coreutils"
     "compiler"
     "startup"
     (exe: "main" bin: "gsh" optimize: #t debug: 'env
