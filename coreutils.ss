@@ -1,11 +1,6 @@
 ;;; -*- Gerbil -*-
 ;;; gerbil-coreutils integration — register coreutils commands as shell builtins
 ;;;
-;;; Commands are registered as "fallback builtins": they only activate when no
-;;; external command with the same name exists in PATH. This preserves system
-;;; command behavior on full systems while providing builtins in minimal environments
-;;; (e.g., the static binary without /usr/bin).
-;;;
 ;;; The coreutils main functions call `exit` on errors (via `die` and `call-with-getopt`).
 ;;; Since Gambit's `exit` hard-terminates the process, we intercept it by temporarily
 ;;; overriding the global `exit` binding with a continuation escape during each invocation.
@@ -43,14 +38,6 @@
         (rename-in :gerbil-coreutils/logname  (main cu-logname))
         (rename-in :gerbil-coreutils/yes      (main cu-yes)))
 
-;;; Check if a command name exists as an external command in PATH.
-(def (command-in-path? name)
-  (let ((path (getenv "PATH" "")))
-    (let loop ((dirs (string-split path #\:)))
-      (and (pair? dirs)
-           (or (file-exists? (string-append (car dirs) "/" name))
-               (loop (cdr dirs)))))))
-
 ;;; Wrap a coreutils `main` function as a shell builtin handler.
 ;;; The handler signature is (lambda (args env) ...) returning an integer exit status.
 ;;;
@@ -80,16 +67,13 @@
         (if (fixnum? status) status 0)))))
 
 ;;; Register all coreutils commands as shell builtins.
-;;; Only registers commands that:
-;;;   1. gsh doesn't already implement natively (true, false, echo, pwd, printf, test, read)
-;;;   2. Don't exist as external commands in PATH (fallback behavior)
+;;; Skips commands gsh already implements natively (true, false, echo, pwd, printf, test, read).
 (def (register-coreutils!)
   (for-each
    (lambda (entry)
      (let ((name (car entry))
            (main-fn (cdr entry)))
-       (unless (command-in-path? name)
-         (builtin-register! name (make-coreutils-builtin name main-fn)))))
+       (builtin-register! name (make-coreutils-builtin name main-fn))))
    `(;; path utilities
      ("basename"  . ,cu-basename)
      ("dirname"   . ,cu-dirname)
