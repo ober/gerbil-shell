@@ -6,7 +6,7 @@
 # Runs bench.ss under:
 #   1. gxi — interpreted (no compilation)
 #   2. gsh ,use — compiles to .o1 via embedded compile-file, then runs native
-#   3. static gsh ,use — compiles to .o1 but loads .scm (no dlopen)
+#   3. static gsh ,use — self-contained, loads .scm (no dlopen)
 #
 # Parses wall-clock times from stderr and prints a side-by-side comparison.
 
@@ -25,9 +25,6 @@ elif command -v gsh >/dev/null 2>&1; then
 else
   GSH=""
 fi
-
-# Auto-detect Gerbil home for static binary's -:~~ flag
-GERBIL_HOME_PATH="${GERBIL_HOME:-$(gxi -e '(display (path-expand "~~"))' 2>/dev/null || echo "")}"
 
 if [ -z "$GSH" ] && [ ! -x "$STATIC_GSH" ]; then
   echo "error: no gsh found (run 'make build' or 'make static')" >&2
@@ -59,17 +56,13 @@ fi
 
 # --- Run static gsh ,use (.scm interpreted) ---
 HAS_STATIC=false
-if [ -x "$STATIC_GSH" ] && [ -n "$GERBIL_HOME_PATH" ]; then
+if [ -x "$STATIC_GSH" ]; then
   HAS_STATIC=true
   echo "Running static gsh ,use (.scm eval)..." >&2
   printf ',use %s\n' "$BENCH" \
-    | "$STATIC_GSH" "-:~~=$GERBIL_HOME_PATH" 2>"$TMPDIR/static.txt" || true
+    | "$STATIC_GSH" 2>"$TMPDIR/static.txt" || true
 else
-  if [ ! -x "$STATIC_GSH" ]; then
-    echo "Skipping static gsh (not found at $STATIC_GSH)" >&2
-  else
-    echo "Skipping static gsh (cannot detect GERBIL_HOME for -:~~ flag)" >&2
-  fi
+  echo "Skipping static gsh (not found at $STATIC_GSH)" >&2
 fi
 
 # --- Parse and compare ---

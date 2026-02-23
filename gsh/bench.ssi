@@ -1,0 +1,15 @@
+prelude: :gerbil/core
+package: gsh
+namespace: gsh/bench
+
+(%#begin (%#export (spec: 0 run-benchmarks run-benchmarks))
+         (%#import :std/sugar :std/format :std/srfi/1)
+         (%#define-runtime fmt-secs gsh/bench#fmt-secs)
+         (%#define-runtime time-thunk gsh/bench#time-thunk)
+         (%#define-runtime fib gsh/bench#fib)
+         (%#define-runtime ack gsh/bench#ack)
+         (%#define-runtime string-build gsh/bench#string-build)
+         (%#define-runtime hash-churn gsh/bench#hash-churn)
+         (%#define-runtime list-ops gsh/bench#list-ops)
+         (%#define-runtime run-benchmarks gsh/bench#run-benchmarks))
+(%#call (%#ref load-module) (%#quote "gsh/bench~0"))

@@ -107,19 +107,33 @@
                 generate-ssxi: #f])
          (basename (path-strip-extension (path-strip-directory srcpath))))
     (compile-module srcpath opts)
-    ;; If embedded compile-file and we didn't use external gsc, compile .scm → .o1
-    (when (and has-embedded? (not use-external-gsc?))
-      ;; Derive module path from expander context (includes package prefix)
-      (let ((modpath (with-catch
-                      (lambda (e) basename)
-                      (lambda ()
-                        (let ((ctx (import-module srcpath)))
-                          (symbol->string (expander-context-id ctx)))))))
-        (compile-scm-files outdir modpath)))
-    (let ((native? (or has-embedded? use-external-gsc?)))
+    ;; If embedded compile-file, compile .scm → .o1 for native code
+    ;; On static binaries: set up a fake ~~ with embedded headers + gambuild-C,
+    ;; then try compile-file. Even though this process can't dlopen .o1 (musl static),
+    ;; the embedded compiler is exercised and produces real artifacts.
+    (let* ((is-static? (static-binary?))
+           (static-env-ok? (and is-static? has-embedded?
+                                (ensure-static-compile-env!)))
+           (try-native? (and has-embedded? (not use-external-gsc?)
+                             (or (not is-static?) static-env-ok?)))
+           (native-ok?
+            (and try-native?
+                 (let ((modpath (with-catch
+                                 (lambda (e) basename)
+                                 (lambda ()
+                                   (let ((ctx (import-module srcpath)))
+                                     (symbol->string (expander-context-id ctx)))))))
+                   (with-catch
+                    (lambda (e)
+                      (fprintf (current-error-port)
+                               "gsh: native compile failed, using .scm: ~a~n" e)
+                      #f)
+                    (lambda ()
+                      (compile-scm-files outdir modpath)
+                      #t))))))
       (fprintf (current-error-port) "compiled: ~a~a~n"
-               srcpath (if native? "" " (scm only)"))
-      (values outdir native?))))
+               srcpath (if native-ok? "" " (scm only)"))
+      (values outdir native-ok?))))
 
 ;;; --- Load ---
 

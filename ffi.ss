@@ -25,7 +25,14 @@
             ffi-signal-flag-install ffi-signal-flag-check
             WNOHANG WUNTRACED WCONTINUED
             WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG WIFSTOPPED WSTOPSIG
-            ffi-static-binary?)
+            ffi-static-binary?
+            ffi-find-embedded-ssi
+            ffi-extract-embedded-ssi
+            ffi-has-embedded-ssi
+            ffi-extract-embedded-scm
+            ffi-has-embedded-scm
+            ffi-extract-embedded-headers
+            ffi-has-embedded-headers)
 
   (c-declare #<<END-C
 #include <sys/types.h>
@@ -768,5 +775,62 @@ END-EXECVE
        else
          ___result = ___FAL;
      }")
+
+  ;; Embedded .ssi file support — data comes from embedded_ssi.c (linked in).
+  ;; Weak symbols: return defaults when embedded_ssi.o is not linked.
+  (c-declare #<<END-SSI
+extern const char* gsh_find_embedded_ssi(const char *path, unsigned int *size);
+extern int gsh_extract_embedded_ssi(const char *base_dir);
+extern int gsh_has_embedded_ssi(void);
+
+const char* __attribute__((weak)) gsh_find_embedded_ssi(const char *path, unsigned int *size) {
+    (void)path; (void)size; return NULL;
+}
+int __attribute__((weak)) gsh_extract_embedded_ssi(const char *base_dir) {
+    (void)base_dir; return 0;
+}
+int __attribute__((weak)) gsh_has_embedded_ssi(void) { return 0; }
+END-SSI
+  )
+  ;; Lookup a single .ssi by relative path (e.g. "std/sugar.ssi")
+  (define-c-lambda _ffi_find_embedded_ssi (char-string) char-string
+    "___return((char*)gsh_find_embedded_ssi(___arg1, NULL));")
+  (define (ffi-find-embedded-ssi path) (_ffi_find_embedded_ssi path))
+  ;; Extract all embedded .ssi files to a directory. Returns count or -1.
+  (define-c-lambda ffi-extract-embedded-ssi (char-string) int
+    "gsh_extract_embedded_ssi")
+  ;; Check if embedded .ssi data is available
+  (define-c-lambda ffi-has-embedded-ssi () int "gsh_has_embedded_ssi")
+
+  ;; --- Embedded .scm archive (compressed runtime modules) ---
+  ;; Weak symbols: default to no-op when embedded_scm.o is not linked (dynamic builds)
+  (c-declare #<<END-SCM
+int __attribute__((weak)) gsh_extract_embedded_scm(const char *base_dir) {
+    (void)base_dir; return 0;
+}
+int __attribute__((weak)) gsh_has_embedded_scm(void) { return 0; }
+END-SCM
+  )
+  ;; Extract compressed .scm archive to a directory. Returns 0 on success.
+  (define-c-lambda ffi-extract-embedded-scm (char-string) int
+    "gsh_extract_embedded_scm")
+  ;; Check if embedded .scm archive is available
+  (define-c-lambda ffi-has-embedded-scm () int "gsh_has_embedded_scm")
+
+  ;; --- Embedded gambit.h headers (for compile-file support) ---
+  ;; Weak symbols: default to no-op when embedded_gambit_h.o is not linked
+  (c-declare #<<END-HEADERS
+int __attribute__((weak)) gsh_extract_embedded_headers(const char *include_dir) {
+    (void)include_dir; return -1;
+}
+int __attribute__((weak)) gsh_has_embedded_headers(void) { return 0; }
+END-HEADERS
+  )
+  ;; Extract embedded gambit.h to a directory. Returns 0 on success.
+  (define-c-lambda ffi-extract-embedded-headers (char-string) int
+    "gsh_extract_embedded_headers")
+  ;; Check if embedded header data is available
+  (define-c-lambda ffi-has-embedded-headers () int "gsh_has_embedded_headers")
+
 
 )

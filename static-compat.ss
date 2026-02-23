@@ -1,16 +1,22 @@
-;;; static-compat.ss — Static binary compatibility for gsh
+;;; static-compat.ss -- Static binary compatibility for gsh
 ;;; Patches the Gerbil module loader to use .scm files when .o1
 ;;; loading is unavailable (statically-linked binary, no dlopen).
 ;;;
 ;;; Both script.ss (,eval) and compiler.ss (,use) need this patching.
 ;;; The patch uses ##global-var-set! because compiled set! on runtime
 ;;; loader globals doesn't propagate to load-module's internal references.
-;;; Must patch both 'load-module and '__load-module — the latter is the
+;;; Must patch both 'load-module and '__load-module -- the latter is the
 ;;; compiled Gerbil name used by .ssi (%#ref load-module) resolution.
+;;;
+;;; Embedded .ssi support: when embedded_ssi.o is linked in, extracts
+;;; .ssi files to a cache directory so the expander can find them.
+;;; This eliminates the need for -:~~=/path/to/gerbil at runtime.
 
 (export ensure-static-compat!
+        ensure-static-compile-env!
         patch-loader-post-gxi!
-        scm-only-load-module-active?)
+        scm-only-load-module-active?
+        static-binary?)
 
 (import :gerbil/runtime/loader
         :gsh/ffi)
@@ -28,9 +34,47 @@
 
 (def (static-binary?)
   "Detect if running as a statically-linked binary.
-   Tests dlopen with a path — on musl static, dlopen(NULL) succeeds
+   Tests dlopen with a path -- on musl static, dlopen(NULL) succeeds
    but dlopen(path) fails with 'Dynamic loading not supported'."
   (ffi-static-binary?))
+
+;;; --- Embedded .ssi extraction ---
+
+(def *ssi-cache-dir* #f)
+
+(def (extract-embedded-ssi!)
+  "Extract embedded .ssi and .scm files to a cache directory and add to load-path.
+   The .ssi files are needed by the expander's import-module to resolve
+   module metadata. The .scm files contain runtime module code that
+   load-module needs (numbered sub-modules like expander~1, ~2, etc.).
+   Uses ~/.cache/gsh/lib/ as the cache directory with sentinel files
+   to avoid re-extracting on subsequent runs."
+  (let* ((cache-base (or (getenv "XDG_CACHE_HOME" #f)
+                         (let ((home (getenv "HOME" #f)))
+                           (and home (string-append home "/.cache")))))
+         (cache-dir (and cache-base
+                         (string-append cache-base "/gsh/lib"))))
+    (when cache-dir
+      ;; Extract .ssi files
+      (when (> (ffi-has-embedded-ssi) 0)
+        (let ((sentinel (string-append cache-dir "/.ssi-extracted")))
+          (unless (file-exists? sentinel)
+            (let ((count (ffi-extract-embedded-ssi cache-dir)))
+              (when (> count 0)
+                (with-output-to-file sentinel
+                  (lambda () (display count))))))))
+      ;; Extract .scm archive (compressed runtime modules)
+      (when (> (ffi-has-embedded-scm) 0)
+        (let ((sentinel (string-append cache-dir "/.scm-extracted")))
+          (unless (file-exists? sentinel)
+            (let ((rc (ffi-extract-embedded-scm cache-dir)))
+              (when (= rc 0)
+                (with-output-to-file sentinel
+                  (lambda () (display "ok"))))))))
+      ;; Add to load-path so expander finds .ssi and .scm files here
+      (set! *ssi-cache-dir* cache-dir)
+      (unless (member cache-dir (load-path))
+        (add-load-path! cache-dir)))))
 
 ;;; --- .scm-only module finder ---
 
@@ -73,6 +117,9 @@
       (lambda () (close-output-port null-port)))))
 
 ;;; --- Pre-load sub-modules for builtin parents ---
+;;; The expander references internal bindings (like __foldr1) from sub-modules
+;;; that must be loaded proactively -- on-demand loading via load-module is
+;;; insufficient because the expander expects these bindings to already exist.
 ;;; Must run AFTER patch-loader-scm-only! so that any module loading
 ;;; triggered during pre-loading goes through the .scm-only replacement.
 
@@ -86,15 +133,12 @@
         (loop (+ i 1))))))
 
 (def (pre-load-builtin-submodules!)
-  "Pre-load ~N.scm sub-module files for all 'builtin parent modules.
-   Scans each load-path directory for matching .scm files.
-   Must be called after patch-loader-scm-only! so any cascading
-   module loads use the .scm-only path."
-  (for-each
-   (lambda (dir)
-     (when (file-exists? dir)
-       (pre-load-dir dir dir)))
-   (load-path)))
+  "Pre-load ~N.scm sub-module files from the embedded runtime cache.
+   Only scans the cache directory (not other load-path entries like
+   installed packages, which may contain test files with side effects).
+   Must be called after extract-embedded-ssi! and patch-loader-scm-only!."
+  (when (and *ssi-cache-dir* (file-exists? *ssi-cache-dir*))
+    (pre-load-dir *ssi-cache-dir* *ssi-cache-dir*)))
 
 (def (pre-load-dir root-dir current-dir)
   "Recursively scan directory for sub-module .scm files and pre-load them."
@@ -105,7 +149,7 @@
       (lambda (entry)
         (let ((full-path (path-expand entry current-dir)))
           (cond
-           ;; .scm file with ~ in name → sub-module candidate
+           ;; .scm file with ~ in name -> sub-module candidate
            ((and (> (string-length entry) 4)
                  (let ((len (string-length entry)))
                    (string=? (substring entry (- len 4) len) ".scm"))
@@ -122,7 +166,7 @@
                    (mutex-lock! __load-mx)
                    (hash-put! __modules modpath full-path)
                    (mutex-unlock! __load-mx))))))
-           ;; Directory (not hidden) → recurse
+           ;; Directory (not hidden) -> recurse
            ((and (not (char=? (string-ref entry 0) #\.))
                  (with-catch (lambda (e) #f)
                    (lambda () (eq? (file-info-type (file-info full-path)) 'directory))))
@@ -144,7 +188,7 @@
         (mutex-unlock! __load-mx) state)
        ((and state (eq? state 'loading))
         (mutex-unlock! __load-mx __load-cv)
-        ;; Retry — load-module will be the patched version
+        ;; Retry
         ((make-scm-only-load-module scm-finder) modpath))
        ((and state (pair? state) (eq? (car state) 'error))
         (mutex-unlock! __load-mx)
@@ -214,12 +258,85 @@
 
 (def (ensure-static-compat!)
   "If running as a static binary, patch the module loader before __load-gxi.
-   Patches load-module first, then pre-loads sub-module .scm files.
-   Order matters: patching must happen before pre-loading so that any
-   cascading module loads during pre-loading use the .scm-only path.
-   Idempotent — only patches once."
+   Extracts embedded .ssi and .scm files, patches load-module, then
+   pre-loads sub-module .scm files so the expander has all bindings ready.
+   Order matters: extract -> patch -> pre-load.
+   Idempotent -- only patches once."
   (unless *static-binary-patched*
     (set! *static-binary-patched* #t)
     (when (static-binary?)
+      (extract-embedded-ssi!)
       (patch-loader-scm-only!)
       (pre-load-builtin-submodules!))))
+
+;;; --- Compile-file environment for static binary ---
+
+(def *static-compile-env-ready* #f)
+
+(def (ensure-static-compile-env!)
+  "Set up the compile-file environment for the static binary.
+   Extracts embedded gambit.h to ~/.cache/gsh/include/,
+   generates a minimal gambuild-C script at ~/.cache/gsh/bin/,
+   and sets ~~ to ~/.cache/gsh/ so compile-file can find them.
+   Returns #t if environment was set up successfully, #f otherwise.
+   Idempotent."
+  (cond
+   (*static-compile-env-ready* #t)
+   ((not (static-binary?)) #f)
+   ((= (ffi-has-embedded-headers) 0) #f)
+   (else
+    (let* ((cache-base (or (getenv "XDG_CACHE_HOME" #f)
+                           (let ((home (getenv "HOME" #f)))
+                             (and home (string-append home "/.cache")))))
+           (gambit-home (and cache-base (string-append cache-base "/gsh")))
+           (include-dir (and gambit-home (string-append gambit-home "/include")))
+           (bin-dir (and gambit-home (string-append gambit-home "/bin")))
+           (lib-dir (and gambit-home (string-append gambit-home "/lib"))))
+      (if (not gambit-home)
+        #f
+        (with-catch
+         (lambda (e) #f)
+         (lambda ()
+           ;; Extract embedded headers
+           (create-directory* include-dir)
+           (ffi-extract-embedded-headers include-dir)
+           ;; Create lib/ directory (GAMBITDIR_LIB reference)
+           (create-directory* lib-dir)
+           ;; Generate minimal gambuild-C
+           (create-directory* bin-dir)
+           (let ((gambuild-path (string-append bin-dir "/gambuild-C")))
+             (unless (file-exists? gambuild-path)
+               (with-output-to-file gambuild-path
+                 (lambda ()
+                   (display gambuild-c-script)))
+               ;; Make executable
+               (##shell-command
+                (string-append "chmod +x " gambuild-path))))
+           ;; Set ~~ to our cache directory
+           (##set-gambitdir! (string-append gambit-home "/"))
+           (set! *static-compile-env-ready* #t)
+           #t)))))))
+
+(def gambuild-c-script
+  "#!/bin/sh
+# Minimal gambuild-C for gsh static binary
+# Only handles dyn operation (compile .c -> .o1)
+case \"$1\" in
+  dyn)
+    ${BUILD_DYN_CC_PARAM:-cc} \\
+      -O1 -shared -fPIC -fwrapv -fno-strict-aliasing \\
+      -D___SINGLE_HOST -D___DYNAMIC \\
+      -I\"$GAMBITDIR_INCLUDE\" \\
+      -o \"$BUILD_DYN_OUTPUT_FILENAME_PARAM\" \\
+      $BUILD_DYN_CC_OPTIONS_PARAM \\
+      $BUILD_DYN_LD_OPTIONS_PRELUDE_PARAM \\
+      \"$BUILD_DYN_INPUT_FILENAMES_PARAM\" \\
+      $BUILD_DYN_LD_OPTIONS_PARAM \\
+      2>&1
+    ;;
+  *)
+    echo \"gambuild-C: unsupported operation: $1\" >&2
+    exit 1
+    ;;
+esac
+")
