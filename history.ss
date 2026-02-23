@@ -49,7 +49,7 @@
       (make-vector (or histsize 1000) #f)
       0
       (or histsize 1000)
-      (or histfile "~/.gsh_history")
+      (expand-tilde (or histfile "~/.gsh_history"))
       (or filesize (* 2 (or histsize 1000)))
       []    ;; control
       []))  ;; ignore patterns
