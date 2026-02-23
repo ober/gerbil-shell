@@ -32,7 +32,8 @@
             ffi-extract-embedded-scm
             ffi-has-embedded-scm
             ffi-extract-embedded-headers
-            ffi-has-embedded-headers)
+            ffi-has-embedded-headers
+            )
 
   (c-declare #<<END-C
 #include <sys/types.h>
@@ -762,19 +763,11 @@ END-EXECVE
   (define-c-lambda ffi-signal-flag-install (int) int "ffi_signal_flag_install")
   (define-c-lambda ffi-signal-flag-check (int) int "ffi_signal_flag_check")
 
-  ;; Detect statically-linked binary (dlopen unavailable for .o1 files)
-  ;; On musl static, dlopen(NULL) succeeds but dlopen(path) fails with
-  ;; "Dynamic loading not supported". Test with a non-NULL path to detect this.
+  ;; Detect statically-linked binary by checking for embedded .ssi data.
+  ;; The gsh_has_embedded_ssi() weak symbol returns 0 in dynamic builds
+  ;; (no embedded_ssi.o linked) and >0 in static builds.
   (define-c-lambda ffi-static-binary? () scheme-object
-    "void *h = dlopen(\"__gsh_dlopen_test__\", RTLD_LAZY);
-     if (h) { dlclose(h); ___result = ___FAL; }
-     else {
-       const char *err = dlerror();
-       if (err && strstr(err, \"not supported\"))
-         ___result = ___TRU;
-       else
-         ___result = ___FAL;
-     }")
+    "___result = gsh_has_embedded_ssi() > 0 ? ___TRU : ___FAL;")
 
   ;; Embedded .ssi file support — data comes from embedded_ssi.c (linked in).
   ;; Weak symbols: return defaults when embedded_ssi.o is not linked.
@@ -831,6 +824,5 @@ END-HEADERS
     "gsh_extract_embedded_headers")
   ;; Check if embedded header data is available
   (define-c-lambda ffi-has-embedded-headers () int "gsh_has_embedded_headers")
-
 
 )

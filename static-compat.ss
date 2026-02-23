@@ -1,6 +1,6 @@
 ;;; static-compat.ss -- Static binary compatibility for gsh
-;;; Patches the Gerbil module loader to use .scm files when .o1
-;;; loading is unavailable (statically-linked binary, no dlopen).
+;;; Patches the Gerbil module loader to try .o1 first (via gsh-dlopen),
+;;; falling back to .scm files for builtin modules without separate .o1.
 ;;;
 ;;; Both script.ss (,eval) and compiler.ss (,use) need this patching.
 ;;; The patch uses ##global-var-set! because compiled set! on runtime
@@ -76,11 +76,10 @@
       (unless (member cache-dir (load-path))
         (add-load-path! cache-dir)))))
 
-;;; --- .scm-only module finder ---
+;;; --- Module finders ---
 
-(def (find-library-module-scm-only modpath)
-  "Find a module's .scm file, skipping .o1 files.
-   Used in static binaries where dlopen is unavailable."
+(def (find-library-module-scm modpath)
+  "Find a module's .scm file in the load path."
   (let lp ((rest (load-path)))
     (if (pair? rest)
       (let* ((dir (car rest))
@@ -89,6 +88,21 @@
         (if (file-exists? spath)
           (path-normalize spath)
           (lp (cdr rest))))
+      #f)))
+
+(def (find-compiled-o1 modpath)
+  "Find a module's highest-numbered .oN file in the load path.
+   Returns the full normalized path, or #f if not found."
+  (let lp ((rest (load-path)))
+    (if (pair? rest)
+      (let* ((dir (car rest))
+             (npath (path-expand modpath (path-expand dir))))
+        ;; Check .o1, .o2, ... and return highest
+        (let find-highest ((n 1) (best #f))
+          (let ((oN (string-append npath ".o" (number->string n))))
+            (if (file-exists? oN)
+              (find-highest (+ n 1) (path-normalize oN))
+              (or best (lp (cdr rest)))))))
       #f)))
 
 ;;; --- .scm loader ---
@@ -121,7 +135,7 @@
 ;;; that must be loaded proactively -- on-demand loading via load-module is
 ;;; insufficient because the expander expects these bindings to already exist.
 ;;; Must run AFTER patch-loader-scm-only! so that any module loading
-;;; triggered during pre-loading goes through the .scm-only replacement.
+;;; triggered during pre-loading goes through the patched loader.
 
 (def (has-tilde? s)
   "Check if string contains ~ character."
@@ -176,10 +190,10 @@
 
 ;;; --- Replacement load-module ---
 
-(def (make-scm-only-load-module scm-finder)
-  "Build a replacement load-module that uses .scm files only.
-   Replicates the caching/mutex logic from gerbil/runtime/loader.
-   Handles modules loaded on demand during and after __load-gxi."
+(def (make-native-first-load-module)
+  "Build a replacement load-module that tries .o1 first (via Gambit's
+   native load which uses our gsh-dlopen), falling back to .scm.
+   Replicates the caching/mutex logic from gerbil/runtime/loader."
   (lambda (modpath)
     (mutex-lock! __load-mx)
     (let ((state (hash-get __modules modpath)))
@@ -189,44 +203,87 @@
        ((and state (eq? state 'loading))
         (mutex-unlock! __load-mx __load-cv)
         ;; Retry
-        ((make-scm-only-load-module scm-finder) modpath))
+        ((make-native-first-load-module) modpath))
        ((and state (pair? state) (eq? (car state) 'error))
         (mutex-unlock! __load-mx)
         (raise (cadr state)))
        (else
-        (let ((path (scm-finder modpath)))
-          (if (not path)
-            (begin (mutex-unlock! __load-mx)
-                   (error "module not found" modpath))
-            (begin
-              (hash-put! __modules modpath 'loading)
-              (mutex-unlock! __load-mx)
-              (with-catch
-               (lambda (exn)
-                 (mutex-lock! __load-mx)
-                 (hash-put! __modules modpath (list 'error exn))
-                 (condition-variable-broadcast! __load-cv)
-                 (mutex-unlock! __load-mx)
-                 (raise exn))
-               (lambda ()
-                 (load-scm-skip-declare path)
-                 (mutex-lock! __load-mx)
-                 (hash-put! __modules modpath path)
-                 (when (not (hash-get __load-order modpath))
-                   (hash-put! __load-order modpath __load-order-next)
-                   (set! __load-order-next (+ 1 __load-order-next)))
-                 (condition-variable-broadcast! __load-cv)
-                 (mutex-unlock! __load-mx)
-                 path))))))))))
+        ;; Mark as loading and release mutex before I/O
+        (hash-put! __modules modpath 'loading)
+        (mutex-unlock! __load-mx)
+        ;; Try .o1 first via Gambit's native load (→ dlopen via gsh-dlopen)
+        (let ((o1-path (with-catch (lambda (e) #f)
+                         (lambda () (find-compiled-o1 modpath)))))
+           (if o1-path
+            (with-catch
+             (lambda (exn)
+               ;; .o1 load failed — fall back to .scm
+               (let ((scm-path (find-library-module-scm modpath)))
+                 (if (not scm-path)
+                   (begin
+                     (mutex-lock! __load-mx)
+                     (hash-put! __modules modpath (list 'error exn))
+                     (condition-variable-broadcast! __load-cv)
+                     (mutex-unlock! __load-mx)
+                     (raise exn))
+                   (with-catch
+                    (lambda (exn2)
+                      (mutex-lock! __load-mx)
+                      (hash-put! __modules modpath (list 'error exn2))
+                      (condition-variable-broadcast! __load-cv)
+                      (mutex-unlock! __load-mx)
+                      (raise exn2))
+                    (lambda ()
+                      (load-scm-skip-declare scm-path)
+                      (mutex-lock! __load-mx)
+                      (hash-put! __modules modpath scm-path)
+                      (condition-variable-broadcast! __load-cv)
+                      (mutex-unlock! __load-mx)
+                      scm-path)))))
+             (lambda ()
+               ;; Gambit's load handles dlopen + ___LNK + setup_modules
+               (load o1-path)
+               (mutex-lock! __load-mx)
+               (hash-put! __modules modpath o1-path)
+               (condition-variable-broadcast! __load-cv)
+               (mutex-unlock! __load-mx)
+               o1-path))
+            ;; No .o1 found — use .scm
+            (let ((scm-path (find-library-module-scm modpath)))
+              (if (not scm-path)
+                (begin
+                  (mutex-lock! __load-mx)
+                  (hash-put! __modules modpath
+                    (list 'error (error "module not found" modpath)))
+                  (condition-variable-broadcast! __load-cv)
+                  (mutex-unlock! __load-mx))
+                (with-catch
+                 (lambda (exn)
+                   (mutex-lock! __load-mx)
+                   (hash-put! __modules modpath (list 'error exn))
+                   (condition-variable-broadcast! __load-cv)
+                   (mutex-unlock! __load-mx)
+                   (raise exn))
+                 (lambda ()
+                   (load-scm-skip-declare scm-path)
+                   (mutex-lock! __load-mx)
+                   (hash-put! __modules modpath scm-path)
+                   (when (not (hash-get __load-order modpath))
+                     (hash-put! __load-order modpath __load-order-next)
+                     (set! __load-order-next (+ 1 __load-order-next)))
+                   (condition-variable-broadcast! __load-cv)
+                   (mutex-unlock! __load-mx)
+                   scm-path)))))))))))
 
 ;;; --- Patching ---
 
 (def (patch-loader-scm-only!)
-  "Override load-module in Gambit's global variable table so .ssi files
-   (which are interpreted by Gambit) see the patched version.
+  "Override load-module to try .o1 first (via Gambit's native load +
+   gsh-dlopen), then fall back to .scm for modules without .o1 files.
+   Patches Gambit's global variable table so .ssi files see the patched version.
    Patches both 'load-module and '__load-module (the compiled Gerbil name).
    Also stores the replacement in a Gambit global for post-__load-gxi patching."
-  (let ((new-lm (make-scm-only-load-module find-library-module-scm-only)))
+  (let ((new-lm (make-native-first-load-module)))
     (set! *scm-only-load-module* new-lm)
     ;; Patch both Gambit globals
     (for-each
@@ -258,8 +315,9 @@
 
 (def (ensure-static-compat!)
   "If running as a static binary, patch the module loader before __load-gxi.
-   Extracts embedded .ssi and .scm files, patches load-module, then
-   pre-loads sub-module .scm files so the expander has all bindings ready.
+   Extracts embedded .ssi and .scm files, patches load-module to try .o1
+   first (via gsh-dlopen) then fall back to .scm, then pre-loads sub-module
+   .scm files so the expander has all bindings ready.
    Order matters: extract -> patch -> pre-load.
    Idempotent -- only patches once."
   (unless *static-binary-patched*
@@ -324,8 +382,12 @@
 case \"$1\" in
   dyn)
     ${BUILD_DYN_CC_PARAM:-cc} \\
-      -O1 -shared -fPIC -fwrapv -fno-strict-aliasing \\
-      -D___SINGLE_HOST -D___DYNAMIC \\
+      -O1 -fexpensive-optimizations -fno-gcse \\
+      -shared -fPIC -rdynamic \\
+      -fwrapv -fno-strict-aliasing \\
+      -foptimize-sibling-calls -fomit-frame-pointer \\
+      -D___SINGLE_HOST -D___DYNAMIC -D___TRUST_C_TCO \\
+      -D___CAN_IMPORT_CLIB_DYNAMICALLY -D___CAN_IMPORT_SETJMP_DYNAMICALLY \\
       -I\"$GAMBITDIR_INCLUDE\" \\
       -o \"$BUILD_DYN_OUTPUT_FILENAME_PARAM\" \\
       $BUILD_DYN_CC_OPTIONS_PARAM \\

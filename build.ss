@@ -25,6 +25,14 @@
     (collect-vendor-objs "_vendor/gerbil-runtime")
     ""))
 
+;; Collect gsh-dlopen .o files for linking (static builds only)
+;; Provides dlopen/dlsym/dlclose/dlerror that override musl's weak stubs,
+;; enabling .o1 loading in the static binary
+(def gsh-dlopen-ld-opts
+  (if (getenv "GSH_STATIC" #f)
+    (collect-vendor-objs "_vendor/gsh-dlopen")
+    ""))
+
 ;; GSH_STATIC=1 adds -static for static binary builds
 (def static-ld-opts
   (if (getenv "GSH_STATIC" #f) "-static " ""))
@@ -59,5 +67,5 @@
     "compiler"
     "startup"
     (exe: "main" bin: "gsh" optimize: #t debug: 'env
-          "-ld-options" ,(string-append static-ld-opts "-lpcre2-8 " gambitgsc-ld-opts " " gerbil-runtime-ld-opts)))
+          "-ld-options" ,(string-append static-ld-opts "-lpcre2-8 " gsh-dlopen-ld-opts " " gambitgsc-ld-opts " " gerbil-runtime-ld-opts)))
   parallelize: (max 1 (quotient (##cpu-count) 2)))

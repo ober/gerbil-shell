@@ -16,6 +16,7 @@ GID := $(shell id -g)
 
 GAMBITGSC_DIR := _vendor/gambitgsc
 RUNTIME_DIR := _vendor/gerbil-runtime
+DLOPEN_DIR := _vendor/gsh-dlopen
 
 gambitgsc:
 	$(CURDIR)/scripts/generate-gambitgsc
@@ -23,9 +24,12 @@ gambitgsc:
 gerbil-runtime:
 	$(CURDIR)/scripts/generate-gerbil-runtime
 
+gsh-dlopen:
+	cc -O2 -c $(DLOPEN_DIR)/gsh-dlopen.c -o $(DLOPEN_DIR)/gsh-dlopen.o
+
 # --- Build ---
 
-build: gambitgsc gerbil-runtime
+build: gambitgsc gerbil-runtime gsh-dlopen
 	GERBIL_GSC=$(CURDIR)/scripts/gsc-with-gambitgsc \
 	GERBIL_LOADPATH="$$HOME/.gerbil/pkg/gerbil-pcre/.gerbil/lib:$$GERBIL_LOADPATH" \
 	LIBRARY_PATH="$$(brew --prefix openssl@3 2>/dev/null)/lib:$$LIBRARY_PATH" \
@@ -132,6 +136,7 @@ clean:
 	rm -f ~/.gerbil/lib/static/gsh__*.scm
 	rm -f $(GAMBITGSC_DIR)/*.o $(GAMBITGSC_DIR)/*.c $(GAMBITGSC_DIR)/LINK_ORDER $(GAMBITGSC_DIR)/.gambit-version
 	rm -f $(RUNTIME_DIR)/*.o $(RUNTIME_DIR)/*.scm $(RUNTIME_DIR)/*.c $(RUNTIME_DIR)/LINK_ORDER $(RUNTIME_DIR)/.gerbil-version
+	rm -f $(DLOPEN_DIR)/*.o
 
 # --- Static binary (Docker) ---
 
@@ -146,7 +151,7 @@ check-root:
 	  git config --global --add safe.directory /src; \
 	fi
 
-build-static: check-root gambitgsc gerbil-runtime
+build-static: check-root gambitgsc gerbil-runtime gsh-dlopen
 	gxpkg install github.com/ober/gerbil-pcre2
 	GSH_STATIC=1 \
 	GERBIL_GSC=$(CURDIR)/scripts/gsc-with-gambitgsc \
@@ -170,9 +175,10 @@ linux-static-docker: clean-docker
 	  "rm -rf /src/.gerbil /src/$(GAMBITGSC_DIR)/*.o /src/$(GAMBITGSC_DIR)/*.c \
 	   /src/$(GAMBITGSC_DIR)/LINK_ORDER /src/$(GAMBITGSC_DIR)/.gambit-version \
 	   /src/$(RUNTIME_DIR)/*.o /src/$(RUNTIME_DIR)/*.scm /src/$(RUNTIME_DIR)/*.c \
-	   /src/$(RUNTIME_DIR)/LINK_ORDER /src/$(RUNTIME_DIR)/.gerbil-version"
+	   /src/$(RUNTIME_DIR)/LINK_ORDER /src/$(RUNTIME_DIR)/.gerbil-version \
+	   /src/$(DLOPEN_DIR)/*.o"
 	@echo "Static binary: static/gsh"
 
 .PHONY: build install clean compat compat-smoke compat-tier0 compat-tier1 compat-tier2 \
         compat-one compat-range compat-debug compat-report vendor-update bench \
-        static clean-docker check-root build-static linux-static-docker gambitgsc gerbil-runtime
+        static clean-docker check-root build-static linux-static-docker gambitgsc gerbil-runtime gsh-dlopen
