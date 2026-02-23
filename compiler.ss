@@ -137,17 +137,51 @@
 
 ;;; --- Load ---
 
-(def (gsh-load modpath libdir: (libdir #f))
+(def (gsh-load modpath libdir: (libdir #f) native-preloaded: (native-preloaded #f))
   "Load a compiled Gerbil module and import into the eval context.
-   modpath is like \"test-mod\" or \"mylib/foo\"."
+   modpath is like \"test-mod\" or \"mylib/foo\".
+   When native-preloaded is #t, the module's .o1 was already loaded via
+   load-module -- bind exports directly to avoid the expander re-evaluating
+   the module source interpreted (which would overwrite native definitions)."
   (ensure-gerbil-compiler!)
   (when libdir
     (let ((dir (path-normalize libdir)))
       (unless (member dir (load-path))
         (add-load-path! dir))))
-  (let ((mod-sym (string->symbol (string-append ":" modpath))))
-    (eval `(import ,mod-sym))
-    (fprintf (current-error-port) "loaded: ~a~n" modpath)))
+  (if native-preloaded
+    ;; Module already loaded natively. Bind exports in the eval environment
+    ;; without going through (eval '(import ...)) which would re-evaluate
+    ;; the source interpreted via the expander.
+    (let ((mod-sym (string->symbol (string-append ":" modpath))))
+      (bind-module-exports! mod-sym)
+      (fprintf (current-error-port) "loaded: ~a~n" modpath))
+    ;; Fallback: standard import through expander
+    (let ((mod-sym (string->symbol (string-append ":" modpath))))
+      (eval `(import ,mod-sym))
+      (fprintf (current-error-port) "loaded: ~a~n" modpath))))
+
+(def (bind-module-exports! mod-sym)
+  "Bind a module's runtime exports in the eval environment.
+   Uses the expander's module context (from compile-module) to enumerate
+   exports, then defines each name in the eval environment pointing to
+   the native Gambit global set by the .o1 load."
+  (let ((ctx (with-catch (lambda (e) #f)
+               (lambda () (import-module mod-sym)))))
+    (when ctx
+      (for-each
+       (lambda (exp)
+         (when (and (module-export? exp) (eqv? (module-export-phi exp) 0))
+           (let* ((name (module-export-name exp))
+                  (binding (with-catch (lambda (e) #f)
+                             (lambda () (core-resolve-module-export exp)))))
+             (when (and binding (runtime-binding? binding))
+               (let ((rid (runtime-binding-id binding)))
+                 ;; Bind in eval env: (define name qualified-global)
+                 (with-catch
+                  (lambda (e) #f) ;; skip if binding fails
+                  (lambda ()
+                    (eval `(define ,name ,rid)))))))))
+       (module-context-export ctx)))))
 
 ;;; --- Use (compile + load) ---
 
@@ -170,8 +204,17 @@
               (lambda ()
                 (let ((ctx (import-module srcpath)))
                   (symbol->string (expander-context-id ctx)))))))
-        (gsh-load modpath)
-        modpath))))
+        ;; Pre-load via load-module which uses load-path (finds .o1 files)
+        ;; rather than gerbil.pkg source resolution. Then bind exports
+        ;; directly in the eval env to avoid the expander re-evaluating
+        ;; the module source interpreted (which would overwrite native defs).
+        (let ((preloaded
+               (and native?
+                    (with-catch
+                     (lambda (e) #f)
+                     (lambda () (load-module modpath) #t)))))
+          (gsh-load modpath native-preloaded: preloaded)
+          modpath)))))
 
 ;;; --- Show exports ---
 
