@@ -1,4 +1,5 @@
 (package: gsh)
 (depend: ("github.com/ober/gerbil-pcre2"
           "github.com/ober/gerbil-coreutils"))
-(loadpath: "~/.gerbil/pkg/gerbil-pcre/.gerbil/lib")
+(loadpath: "~/.gerbil/pkg/gerbil-pcre/.gerbil/lib"
+           "~/.gerbil/pkg/github.com/ober/gerbil-coreutils/.gerbil/lib")

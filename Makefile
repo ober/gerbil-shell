@@ -31,9 +31,14 @@ gsh-dlopen:
 
 build: gambitgsc gerbil-runtime gsh-dlopen
 	GERBIL_GSC=$(CURDIR)/scripts/gsc-with-gambitgsc \
-	GERBIL_LOADPATH="$$HOME/.gerbil/lib:$$HOME/.gerbil/pkg/gerbil-pcre/.gerbil/lib:$$GERBIL_LOADPATH" \
+	GERBIL_LOADPATH="$$HOME/.gerbil/lib:$$HOME/.gerbil/pkg/gerbil-pcre/.gerbil/lib:$$HOME/.gerbil/pkg/github.com/ober/gerbil-coreutils/.gerbil/lib:$$GERBIL_LOADPATH" \
 	LIBRARY_PATH="$$(brew --prefix openssl@3 2>/dev/null)/lib:$$LIBRARY_PATH" \
 	gerbil build
+	@# Patch rpath for brew openssl (needed by coreutils crypto: cksum, md5sum, sha*sum)
+	@OPENSSL_LIB="$$(brew --prefix openssl@3 2>/dev/null)/lib"; \
+	if [ -n "$$OPENSSL_LIB" ] && [ -d "$$OPENSSL_LIB" ] && command -v patchelf >/dev/null 2>&1; then \
+	  patchelf --set-rpath "$$OPENSSL_LIB" $(GSH) 2>/dev/null || true; \
+	fi
 
 install:
 	@if [ -f static/gsh ]; then \
@@ -153,7 +158,7 @@ check-root:
 
 build-static: check-root gambitgsc gerbil-runtime gsh-dlopen
 	gxpkg install github.com/ober/gerbil-pcre2
-	gxpkg install github.com/ober/gerbil-coreutils
+	GERBIL_BUILD_CORES=1 gxpkg install github.com/ober/gerbil-coreutils
 	GSH_STATIC=1 \
 	GERBIL_GSC=$(CURDIR)/scripts/gsc-with-gambitgsc \
 	GERBIL_LOADPATH="$$HOME/.gerbil/lib:$$(pwd)/.gerbil/lib:$$GERBIL_LOADPATH" \
