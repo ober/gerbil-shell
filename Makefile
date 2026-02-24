@@ -164,13 +164,14 @@ linux-static-docker: clean-docker
 	  --ulimit nofile=1024:1024 \
 	  -v $(PWD):/src:z \
 	  $(DOCKER_IMAGE) \
-	  sh -c "apk add --no-cache pcre2-dev pcre2-static && \
-	         cd /src && \
-	         make build-static && \
-	         mkdir -p static && \
-	         cp .gerbil/bin/gsh static/gsh && \
-	         chown -R $(UID):$(GID) static"
-	@# Clean ALL Docker artifacts so local builds are never corrupted
+	  sh -c "apk add --no-cache pcre2-dev pcre2-static su-exec && \
+	         mkdir -p /tmp/gsh-build && chown $(UID):$(GID) /tmp/gsh-build && \
+	         exec su-exec $(UID):$(GID) env HOME=/tmp/gsh-build sh -c '\
+	           cd /src && \
+	           make build-static && \
+	           mkdir -p static && \
+	           cp .gerbil/bin/gsh static/gsh'"
+	@# Clean Docker artifacts so local builds are never corrupted
 	-rm -rf .gerbil 2>/dev/null || true
 	docker run --rm -v $(PWD):/src:z alpine sh -c \
 	  "rm -rf /src/.gerbil /src/$(GAMBITGSC_DIR)/*.o /src/$(GAMBITGSC_DIR)/*.c \
