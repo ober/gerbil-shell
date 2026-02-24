@@ -161,10 +161,11 @@ build-static: check-root gambitgsc gerbil-runtime gsh-dlopen
 
 linux-static-docker: clean-docker
 	docker run --rm \
-	  --ulimit nofile=1024:1024 \
+	  --ulimit nofile=8192:8192 \
 	  -v $(PWD):/src:z \
 	  $(DOCKER_IMAGE) \
 	  sh -c "apk add --no-cache pcre2-dev pcre2-static su-exec && \
+	         chown -R $(UID):$(GID) /opt/ && \
 	         mkdir -p /tmp/gsh-build && chown $(UID):$(GID) /tmp/gsh-build && \
 	         exec su-exec $(UID):$(GID) env HOME=/tmp/gsh-build sh -c '\
 	           cd /src && \
