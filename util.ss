@@ -75,6 +75,16 @@
 
 ;;; --- String utilities ---
 
+(def (string-trim-whitespace str)
+  (let* ((len (string-length str))
+         (start (let loop ((i 0))
+                  (if (and (< i len) (char-whitespace? (string-ref str i)))
+                    (loop (+ i 1)) i)))
+         (end (let loop ((i (- len 1)))
+                (if (and (>= i start) (char-whitespace? (string-ref str i)))
+                  (loop (- i 1)) (+ i 1)))))
+    (substring str start end)))
+
 ;; Split string by any character in charset (a string of delimiters)
 (def (string-split-chars str charset)
   (let loop ((i 0) (start 0) (result []))

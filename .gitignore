@@ -38,6 +38,9 @@ zz-*-xx
 lib.sh
 test_osh
 
+# Generated stage file (Makefile generates based on GSH_TIER)
+stage.ss
+
 # Editor / misc
 "\n"
 *~

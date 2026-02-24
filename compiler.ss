@@ -5,6 +5,10 @@
 ;;; When gambitgsc is linked in, compile-file runs in-process (no external gsc).
 ;;; When gambitgsc is absent but external gsc exists, delegates to it.
 ;;; When neither is available, generates .scm/.ssi only (no native .o1).
+;;;
+;;; Self-registers at module init time:
+;;;   - Sets *meta-command-handler* for ,compile / ,load / ,use / ,exports
+;;;   - Registers gsc-compile, gsc-load, gsc-exports builtins
 
 (export ensure-gerbil-compiler!
         gsc-available?
@@ -12,7 +16,8 @@
         gsh-compile
         gsh-load
         gsh-use
-        gsh-show-exports)
+        gsh-show-exports
+        handle-meta-command)
 
 (import :std/sugar
         :std/format
@@ -20,7 +25,10 @@
         :gerbil/runtime/loader
         :gerbil/expander
         :gerbil/compiler
-        :gsh/static-compat)
+        :gsh/static-compat
+        :gsh/util
+        :gsh/registry
+        :gsh/script)
 
 ;;; --- Lazy initialization ---
 
@@ -57,7 +65,7 @@
           (file-exists?
            (path-expand "gsc" (path-expand "bin" (path-expand "~~"))))))))
 
-;;; --- In-process .scm → .o1 compilation ---
+;;; --- In-process .scm -> .o1 compilation ---
 
 (def (compile-scm-files outdir modpath)
   "Compile generated .scm files to .o1 using in-process compile-file.
@@ -107,7 +115,7 @@
                 generate-ssxi: #f])
          (basename (path-strip-extension (path-strip-directory srcpath))))
     (compile-module srcpath opts)
-    ;; If embedded compile-file, compile .scm → .o1 for native code
+    ;; If embedded compile-file, compile .scm -> .o1 for native code
     ;; On static binaries: set up a fake ~~ with embedded headers + gambuild-C,
     ;; then try compile-file. Even though this process can't dlopen .o1 (musl static),
     ;; the embedded compiler is exercised and produces real artifacts.
@@ -248,3 +256,170 @@
                   (fprintf (current-output-port) "  ~a~n" name))))))
          exports)
         0))))
+
+;;; --- Meta-command dispatch for ,compile / ,load / ,use / ,exports ---
+
+(def (handle-meta-command expr-str)
+  "Handle special meta-commands. Returns (cons result-string status) or #f."
+  (cond
+    ((meta-cmd-match expr-str "compile ")
+     => (lambda (arg)
+          (meta-cmd-wrap
+           (lambda ()
+             (let-values (((path verbose no-gsc) (parse-compile-args arg)))
+               (gsh-compile path
+                            invoke-gsc: (if no-gsc #f 'auto)
+                            verbose: verbose))))))
+    ((meta-cmd-match expr-str "load ")
+     => (lambda (arg)
+          (meta-cmd-wrap
+           (lambda ()
+             (let-values (((modpath libdir) (parse-load-args arg)))
+               (gsh-load modpath libdir: libdir))))))
+    ((meta-cmd-match expr-str "use ")
+     => (lambda (arg)
+          (meta-cmd-wrap
+           (lambda ()
+             (gsh-use (parse-path-arg arg))))))
+    ((meta-cmd-match expr-str "exports ")
+     => (lambda (arg)
+          (meta-cmd-wrap
+           (lambda ()
+             (gsh-show-exports (string-trim-whitespace arg))))))
+    (else #f)))
+
+(def (meta-cmd-match str prefix)
+  (and (>= (string-length str) (string-length prefix))
+       (string=? (substring str 0 (string-length prefix)) prefix)
+       (substring str (string-length prefix) (string-length str))))
+
+(def (meta-cmd-wrap thunk)
+  (with-catch
+   (lambda (e)
+     (cons (call-with-output-string
+            (lambda (port) (display-exception e port)))
+           1))
+   (lambda ()
+     (thunk)
+     (cons "" 0))))
+
+(def (parse-path-arg arg)
+  "Parse a path argument, stripping surrounding quotes if present."
+  (let ((trimmed (string-trim-whitespace arg)))
+    (if (and (> (string-length trimmed) 1)
+             (char=? (string-ref trimmed 0) #\"))
+      (with-catch
+       (lambda (e) trimmed)
+       (lambda () (call-with-input-string trimmed read)))
+      trimmed)))
+
+(def (parse-compile-args arg)
+  "Parse: [-v] [-n] <path>.  Returns (values path verbose no-gsc)."
+  (let loop ((parts (string-split arg #\space))
+             (verbose #f) (no-gsc #f))
+    (cond
+      ((null? parts) (values "" verbose no-gsc))
+      ((string=? (car parts) "") (loop (cdr parts) verbose no-gsc))
+      ((string=? (car parts) "-v") (loop (cdr parts) #t no-gsc))
+      ((string=? (car parts) "-n") (loop (cdr parts) verbose #t))
+      (else
+       (values (parse-path-arg (string-join parts " "))
+               verbose no-gsc)))))
+
+(def (parse-load-args arg)
+  "Parse: <modpath> [-L dir].  Returns (values modpath libdir)."
+  (let loop ((parts (string-split arg #\space))
+             (modpath #f) (libdir #f))
+    (cond
+      ((null? parts) (values (or modpath "") libdir))
+      ((string=? (car parts) "") (loop (cdr parts) modpath libdir))
+      ((string=? (car parts) "-L")
+       (if (pair? (cdr parts))
+         (loop (cddr parts) modpath (cadr parts))
+         (values (or modpath "") libdir)))
+      (else
+       (loop (cdr parts) (or modpath (car parts)) libdir)))))
+
+;;; --- Self-registration (runs at module init time) ---
+
+;; Set meta-command handler so ,compile / ,load / ,use / ,exports work
+(*meta-command-handler* handle-meta-command)
+
+;; Register compiler-related builtins
+(builtin-register! "gsc-compile"
+  (lambda (args env)
+    (if (null? args)
+      (begin
+        (fprintf (current-error-port)
+                 "usage: gsc-compile [-v] [-n] <file.ss>~n")
+        2)
+      (let loop ((args args) (verbose #f) (no-gsc #f))
+        (cond
+          ((null? args)
+           (fprintf (current-error-port)
+                    "gsh: gsc-compile: missing file argument~n")
+           2)
+          ((string=? (car args) "-v") (loop (cdr args) #t no-gsc))
+          ((string=? (car args) "-n") (loop (cdr args) verbose #t))
+          (else
+           (with-catch
+            (lambda (e)
+              (fprintf (current-error-port) "gsh: gsc-compile: ~a~n"
+                       (call-with-output-string
+                        (lambda (p) (display-exception e p))))
+              1)
+            (lambda ()
+              (gsh-compile (car args)
+                           invoke-gsc: (if no-gsc #f 'auto)
+                           verbose: verbose)
+              0))))))))
+
+(builtin-register! "gsc-load"
+  (lambda (args env)
+    (if (null? args)
+      (begin
+        (fprintf (current-error-port)
+                 "usage: gsc-load <modpath> [-L dir]~n")
+        2)
+      (let loop ((args args) (modpath #f) (libdir #f))
+        (cond
+          ((null? args)
+           (if modpath
+             (with-catch
+              (lambda (e)
+                (fprintf (current-error-port) "gsh: gsc-load: ~a~n"
+                         (call-with-output-string
+                          (lambda (p) (display-exception e p))))
+                1)
+              (lambda ()
+                (gsh-load modpath libdir: libdir)
+                0))
+             (begin
+               (fprintf (current-error-port)
+                        "gsh: gsc-load: missing module path~n")
+               2)))
+          ((string=? (car args) "-L")
+           (if (pair? (cdr args))
+             (loop (cddr args) modpath (cadr args))
+             (begin
+               (fprintf (current-error-port)
+                        "gsh: gsc-load: -L requires directory argument~n")
+               2)))
+          (else
+           (loop (cdr args) (or modpath (car args)) libdir)))))))
+
+(builtin-register! "gsc-exports"
+  (lambda (args env)
+    (if (null? args)
+      (begin
+        (fprintf (current-error-port)
+                 "usage: gsc-exports <modpath>~n")
+        2)
+      (with-catch
+       (lambda (e)
+         (fprintf (current-error-port) "gsh: gsc-exports: ~a~n"
+                  (call-with-output-string
+                   (lambda (p) (display-exception e p))))
+         1)
+       (lambda ()
+         (gsh-show-exports (car args)))))))

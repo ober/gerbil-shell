@@ -14,7 +14,8 @@
         :gsh/executor
         :gsh/signals
         :gsh/jobs
-        :gsh/static-compat)
+        :gsh/static-compat
+        :gsh/registry)
 
 ;;; --- Meta-command handler (set by main.ss to wire up ,compile etc.) ---
 
@@ -27,7 +28,10 @@
 (def (ensure-gerbil-eval!)
   "Initialize the Gerbil expander on first use so eval supports full
    Gerbil syntax (def, defstruct, hash, match, import, etc.).
-   Called lazily to avoid ~100ms startup cost for normal shell operations."
+   Called lazily to avoid ~100ms startup cost for normal shell operations.
+   Blocked in the 'tiny' tier which has no eval support."
+  (when (string=? (*gsh-tier*) "tiny")
+    (error "Gerbil eval not available in this build (tier: tiny). Rebuild with GSH_TIER=small or higher"))
   (unless *gerbil-eval-initialized*
     (set! *gerbil-eval-initialized* #t)
     (ensure-static-compat!)

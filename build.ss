@@ -3,6 +3,9 @@
         :std/misc/path
         :std/misc/string)
 
+;; Build tier: tiny (shell only), small (+eval), medium (+compiler), large (+coreutils)
+(def tier (or (getenv "GSH_TIER" #f) "tiny"))
+
 ;; Collect .o files from a vendor directory for linking
 (def (collect-vendor-objs subdir)
   (let ((dir (path-expand subdir (current-directory))))
@@ -15,21 +18,27 @@
       "")))
 
 ;; Collect gambitgsc .o files for linking (enables in-process compile-file)
-(def gambitgsc-ld-opts (collect-vendor-objs "_vendor/gambitgsc"))
+;; Only for medium+ tiers that include the compiler
+(def gambitgsc-ld-opts
+  (if (member tier '("medium" "large"))
+    (collect-vendor-objs "_vendor/gambitgsc")
+    ""))
 
-;; Collect gerbil-runtime .o files for linking (static builds only)
+;; Collect gerbil-runtime .o files for linking (static builds, small+ tiers)
 ;; These embed missing runtime modules + .ssi data so the static binary
 ;; doesn't need -:~~=/path/to/gerbil
 (def gerbil-runtime-ld-opts
-  (if (getenv "GSH_STATIC" #f)
+  (if (and (getenv "GSH_STATIC" #f)
+           (not (string=? tier "tiny")))
     (collect-vendor-objs "_vendor/gerbil-runtime")
     ""))
 
-;; Collect gsh-dlopen .o files for linking (static builds only)
+;; Collect gsh-dlopen .o files for linking (static builds, small+ tiers)
 ;; Provides dlopen/dlsym/dlclose/dlerror that override musl's weak stubs,
 ;; enabling .o1 loading in the static binary
 (def gsh-dlopen-ld-opts
-  (if (getenv "GSH_STATIC" #f)
+  (if (and (getenv "GSH_STATIC" #f)
+           (not (string=? tier "tiny")))
     (collect-vendor-objs "_vendor/gsh-dlopen")
     ""))
 
@@ -37,8 +46,13 @@
 (def static-ld-opts
   (if (getenv "GSH_STATIC" #f) "-static " ""))
 
-(defbuild-script
-  `("ffi"
+;; pcre2 is needed by coreutils (large tier)
+(def pcre2-ld-opts
+  (if (string=? tier "large") "-lpcre2-8 " ""))
+
+;; Core modules — always included regardless of tier
+(def core-modules
+  '("ffi"
     "util"
     "ast"
     "pregexp-compat"
@@ -66,9 +80,25 @@
     "completion"
     "static-compat"
     "script"
-    "coreutils"
-    "compiler"
-    "startup"
-    (exe: "main" bin: "gsh" optimize: #t debug: 'env
-          "-ld-options" ,(string-append static-ld-opts "-lpcre2-8 " gsh-dlopen-ld-opts " " gambitgsc-ld-opts " " gerbil-runtime-ld-opts)))
+    "startup"))
+
+;; Tier-specific modules
+(def tier-modules
+  (cond
+    ((string=? tier "tiny")   '())
+    ((string=? tier "small")  '())
+    ((string=? tier "medium") '("compiler"))
+    ((string=? tier "large")  '("compiler" "coreutils"))
+    (else '("compiler" "coreutils"))))
+
+;; Full module list: core + tier-specific + stage glue + exe entry point
+(def all-modules
+  (append core-modules
+          tier-modules
+          `("stage"
+            (exe: "main" bin: "gsh" optimize: #t debug: 'env
+                  "-ld-options" ,(string-append static-ld-opts pcre2-ld-opts gsh-dlopen-ld-opts " " gambitgsc-ld-opts " " gerbil-runtime-ld-opts)))))
+
+(defbuild-script
+  all-modules
   parallelize: (max 1 (quotient (##cpu-count) 2)))

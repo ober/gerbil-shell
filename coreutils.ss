@@ -274,3 +274,6 @@
      ;; --- Misc ---
      ("dir"       . ,cu-dir)
      ("vdir"      . ,cu-vdir))))
+
+;;; --- Self-registration (runs at module init time) ---
+(register-coreutils!)
