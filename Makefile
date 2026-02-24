@@ -1,3 +1,5 @@
+.DEFAULT_GOAL := help
+
 GSH        := $(CURDIR)/.gerbil/bin/gsh
 OILS_DIR   := _vendor/oils
 SH_SPEC    := python3 $(CURDIR)/test/run_spec.py
@@ -308,7 +310,39 @@ static-medium:
 static-large:
 	$(MAKE) static GSH_STATIC_TIER=large
 
-.PHONY: build build-tiny build-small build-medium build-large \
+help:
+	@echo "gsh — Gerbil Shell"
+	@echo ""
+	@echo "Build tiers (dynamic):        Binary size:"
+	@echo "  make build                   tiny  (21MB) — shell only"
+	@echo "  make build-small             small (23MB) — + ,eval"
+	@echo "  make build-medium            medium(37MB) — + ,use foo.ss"
+	@echo "  make build-large             large (42MB) — + 101 coreutils"
+	@echo ""
+	@echo "Build tiers (static, via Docker):"
+	@echo "  make static-tiny"
+	@echo "  make static-small"
+	@echo "  make static-medium"
+	@echo "  make static-large            (default for 'make static')"
+	@echo ""
+	@echo "Other:"
+	@echo "  make install                 Install to ~/.local/bin/gsh"
+	@echo "  make clean                   Remove build artifacts"
+	@echo ""
+	@echo "Compat tests (auto-builds large tier):"
+	@echo "  make compat-smoke            Quick 18-test sanity check"
+	@echo "  make compat-tier0            Tier 0 spec tests"
+	@echo "  make compat-tier1            Tier 1 spec tests"
+	@echo "  make compat-tier2            Tier 2 spec tests"
+	@echo "  make compat                  All tiers + update report"
+	@echo "  make compat-one SPEC=name    Single spec file"
+	@echo "  make compat-range SPEC=name RANGE=3-5"
+	@echo "  make compat-debug SPEC=name  Verbose single spec"
+	@echo ""
+	@echo "Benchmarks:"
+	@echo "  make bench                   Run shellbench suite"
+
+.PHONY: help build build-tiny build-small build-medium build-large \
         install clean generate-stage \
         compat compat-smoke compat-tier0 compat-tier1 compat-tier2 compat-build \
         compat-one compat-range compat-debug compat-report vendor-update bench \
