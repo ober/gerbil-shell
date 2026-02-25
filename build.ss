@@ -6,6 +6,9 @@
 ;; Build tier: tiny (shell only), small (+eval), medium (+compiler), large (+coreutils)
 (def tier (or (getenv "GSH_TIER" #f) "tiny"))
 
+;; Library-only mode: compile modules without linking the executable
+(def lib-only? (and (getenv "GSH_LIB_ONLY" #f) #t))
+
 ;; Collect .o files from a vendor directory for linking
 (def (collect-vendor-objs subdir)
   (let ((dir (path-expand subdir (current-directory))))
@@ -91,13 +94,17 @@
     ((string=? tier "large")  '("compiler" "coreutils"))
     (else '("compiler" "coreutils"))))
 
-;; Full module list: core + tier-specific + stage glue + exe entry point
+;; Full module list depends on build mode
 (def all-modules
-  (append core-modules
-          tier-modules
-          `("stage"
-            (exe: "main" bin: "gsh" optimize: #t debug: 'env
-                  "-ld-options" ,(string-append static-ld-opts pcre2-ld-opts gsh-dlopen-ld-opts " " gambitgsc-ld-opts " " gerbil-runtime-ld-opts)))))
+  (if lib-only?
+    ;; Library mode: core modules + lib entry point, no exe/stage
+    (append core-modules '("lib"))
+    ;; Executable mode: core + tier-specific + stage glue + exe
+    (append core-modules
+            tier-modules
+            `("stage"
+              (exe: "main" bin: "gsh" optimize: #t debug: 'env
+                    "-ld-options" ,(string-append static-ld-opts pcre2-ld-opts gsh-dlopen-ld-opts " " gambitgsc-ld-opts " " gerbil-runtime-ld-opts))))))
 
 (defbuild-script
   all-modules

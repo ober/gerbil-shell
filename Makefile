@@ -139,6 +139,23 @@ build-medium:
 build-large:
 	$(MAKE) build GSH_TIER=large
 
+# --- Library build ---
+# Compile all core modules as a library (no executable).
+# Other Gerbil projects can then: (import :gsh/lib)
+
+lib:
+	GSH_LIB_ONLY=1 GERBIL_LOADPATH="$$HOME/.gerbil/lib:$$GERBIL_LOADPATH" gerbil build
+
+install-lib: lib
+	@echo "Installing gsh library via gxpkg link..."
+	@cd $(HOME) && gxpkg link gsh $(CURDIR) || true
+	@cd $(HOME) && gxpkg build gsh
+	@echo "Installed. Other projects can now: (import :gsh/lib)"
+
+uninstall-lib:
+	@cd $(HOME) && gxpkg unlink gsh || true
+	@echo "Unlinked gsh library"
+
 install:
 	@if [ -f static/gsh ]; then \
 	  SRC=static/gsh; \
@@ -326,6 +343,11 @@ help:
 	@echo "  make static-medium"
 	@echo "  make static-large            (default for 'make static')"
 	@echo ""
+	@echo "Library (for embedding in other Gerbil projects):"
+	@echo "  make lib                     Build library modules only"
+	@echo "  make install-lib             Build + link via gxpkg"
+	@echo "  make uninstall-lib           Unlink gxpkg"
+	@echo ""
 	@echo "Other:"
 	@echo "  make install                 Install to ~/.local/bin/gsh"
 	@echo "  make clean                   Remove build artifacts"
@@ -344,6 +366,7 @@ help:
 	@echo "  make bench                   Run shellbench suite"
 
 .PHONY: help build build-tiny build-small build-medium build-large \
+        lib install-lib uninstall-lib \
         install clean generate-stage \
         compat compat-smoke compat-tier0 compat-tier1 compat-tier2 compat-build \
         compat-one compat-range compat-debug compat-report vendor-update bench \
