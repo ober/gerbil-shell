@@ -1,13 +1,13 @@
 # Shell Compatibility Report
 
-Generated: 2026-02-21
+Generated: 2026-02-25
 
 ## Summary
 
 | Shell | Pass | Total | Rate |
 |-------|------|-------|------|
 | bash | 1036 | 1179 | 88% |
-| gsh | 1163 | 1179 | 99% |
+| gsh | 1133 | 1179 | 96% |
 
 ## Results by Tier
 
@@ -16,9 +16,9 @@ Generated: 2026-02-21
 | Suite | Description | bash | gsh |
 |-------|-------------|-----|-----|
 | smoke | Basic shell operations | **18/18** | **18/18** |
-| pipeline | Pipe operator and pipelines | 25/26 | **26/26** |
+| pipeline | Pipe operator and pipelines | 25/26 | 21/26 |
 | redirect | I/O redirection (>, <, >>, etc.) | 38/41 | 40/41 |
-| redirect-multi | Multiple and complex redirections | 11/13 | **13/13** |
+| redirect-multi | Multiple and complex redirections | 11/13 | 10/13 |
 | builtin-eval-source | eval and source/. builtins | 22/23 | **23/23** |
 | command-sub | Command substitution $() and `` | 29/30 | **30/30** |
 | comments | Shell comments | **2/2** | **2/2** |
@@ -29,17 +29,17 @@ Generated: 2026-02-21
 | Suite | Description | bash | gsh |
 |-------|-------------|-----|-----|
 | here-doc | Here-documents (<<, <<-, <<< ) | 35/36 | **36/36** |
-| quote | Quoting (single, double, $'...') | 31/35 | **35/35** |
+| quote | Quoting (single, double, $'...') | 31/35 | 31/35 |
 | word-eval | Word evaluation and expansion | **8/8** | **8/8** |
 | word-split | IFS word splitting | 50/55 | **55/55** |
 | var-sub | Variable substitution ($var, ${var}) | 5/6 | **6/6** |
 | var-sub-quote | Variable substitution in quoting contexts | 40/41 | **41/41** |
 | var-num | Numeric/special variables ($#, $?, $$, etc.) | **7/7** | **7/7** |
 | var-op-test | Variable operators (${var:-default}, etc.) | 33/37 | 35/37 |
-| var-op-strip | Variable pattern stripping (${var#pat}, etc.) | 28/29 | **29/29** |
+| var-op-strip | Variable pattern stripping (${var#pat}, etc.) | 28/29 | 28/29 |
 | var-op-len | Variable length ${#var} | 5/9 | 7/9 |
 | assign | Variable assignment | 36/48 | **48/48** |
-| tilde | Tilde expansion (~, ~user) | 12/14 | **14/14** |
+| tilde | Tilde expansion (~, ~user) | 12/14 | 13/14 |
 
 ### Tier 2 — Builtins & Advanced
 
@@ -54,19 +54,19 @@ Generated: 2026-02-21
 | for-expr | C-style for ((i=0; ...)) | 8/9 | **9/9** |
 | subshell | Subshell execution (...) | **2/2** | **2/2** |
 | sh-func | Shell functions | 10/12 | **12/12** |
-| builtin-echo | echo builtin | **27/27** | **27/27** |
+| builtin-echo | echo builtin | **27/27** | 21/27 |
 | builtin-printf | printf builtin | 54/63 | 62/63 |
 | builtin-read | read builtin | 58/64 | **64/64** |
-| builtin-cd | cd builtin | 26/30 | 29/30 |
+| builtin-cd | cd builtin | 26/30 | 28/30 |
 | builtin-set | set and shopt builtins | **24/24** | **24/24** |
-| builtin-type | type/command/which builtins | 4/6 | **6/6** |
+| builtin-type | type/command/which builtins | 4/6 | 5/6 |
 | builtin-trap | trap builtin | 31/33 | **33/33** |
-| builtin-bracket | [[ ]] and [ ] test operators | 49/52 | **52/52** |
-| builtin-misc | Misc builtins (true, false, colon, etc.) | 3/7 | 6/7 |
+| builtin-bracket | [[ ]] and [ ] test operators | 49/52 | 48/52 |
+| builtin-misc | Misc builtins (true, false, colon, etc.) | 3/7 | 5/7 |
 | builtin-process | Process builtins (kill, wait, ulimit, etc.) | 18/26 | 25/26 |
-| background | Background jobs (&, wait, jobs) | 24/27 | **27/27** |
+| background | Background jobs (&, wait, jobs) | 24/27 | 23/27 |
 | command-parsing | Command parsing edge cases | 4/5 | **5/5** |
-| var-op-bash | Bash-specific variable operations | 24/27 | 25/27 |
+| var-op-bash | Bash-specific variable operations | 24/27 | 26/27 |
 | var-op-slice | Variable slicing ${var:offset:length} | 19/22 | **22/22** |
 | assign-extended | declare/typeset/local/export | 23/39 | 36/39 |
 
@@ -78,20 +78,49 @@ Tests where gsh fails but bash passes.
 
 | Suite | # | Test | Reason |
 |-------|---|------|--------|
+| pipeline | 4 | Redirect in Pipeline | status: expected 0, got -1; stdout mismatch |
+| pipeline | 10 | PIPESTATUS with shopt -s lastpipe | status: expected 0, got -1; stdout mismatch |
+| pipeline | 23 | SIGPIPE causes pipeline to die (regression for issue #295) | stdout mismatch |
+| pipeline | 24 | Nested pipelines | status: expected 0, got 70; stdout mismatch |
+| pipeline | 25 | Pipeline in eval | status: expected 0, got 70; stdout mismatch |
 | redirect | 30 | <> for read/write named pipes | status: expected 0, got -1; stdout mismatch |
+| redirect-multi | 7 | File redirect to $var with glob char | status: expected 1, got 0; stdout mismatch |
+| redirect-multi | 12 | Redirect with brace expansion isn't allowed | stdout mismatch |
+| redirect-multi | 13 | File redirects have word splitting too! | stdout mismatch |
 
 ### Tier 1 — Expansion & Variables
 
 | Suite | # | Test | Reason |
 |-------|---|------|--------|
+| quote | 28 | $'' octal escapes don't have leading 0 | stdout mismatch |
+| quote | 29 | $'' octal escapes with fewer than 3 chars | stdout mismatch |
+| quote | 34 | $'' supports \cA escape for Ctrl-A - mask with 0x1f | stdout mismatch |
 | var-op-test | 4 | Unquoted with array as default value | stdout mismatch |
 | var-op-test | 6 | Assign default with array | stdout mismatch |
+| var-op-strip | 11 | Strip unicode prefix | stdout mismatch |
+| tilde | 14 | temp assignment x=~ env | status: expected 0, got 1; stdout mismatch |
 
 ### Tier 2 — Builtins & Advanced
 
 | Suite | # | Test | Reason |
 |-------|---|------|--------|
+| builtin-echo | 21 | incomplete hex escape | stdout mismatch |
+| builtin-echo | 22 | \x | stdout mismatch |
+| builtin-echo | 23 | incomplete octal escape | stdout mismatch |
+| builtin-echo | 24 | incomplete unicode escape | stdout mismatch |
+| builtin-echo | 25 | \u6 | stdout mismatch |
+| builtin-echo | 26 | \0 \1 \8 | stdout mismatch |
+| builtin-cd | 16 | Test the current directory after 'cd ..' involving symlinks | stdout mismatch |
 | builtin-cd | 27 | Survey of getcwd() syscall | stdout mismatch |
+| builtin-type | 2 | type -> alias external | stdout mismatch |
+| builtin-bracket | 26 | -r | stdout mismatch |
+| builtin-bracket | 27 | -w | stdout mismatch |
+| builtin-bracket | 32 | -ot and -nt | stdout mismatch |
+| builtin-bracket | 38 | -u for setuid, -g too | stdout mismatch |
+| background | 14 | Wait for job and PIPESTATUS - cat | status: expected 0, got -1; stdout mismatch |
+| background | 23 | jobs -p prints one line per job | status: expected 0, got 70; stdout mismatch |
+| background | 24 | No stderr spew when shell is not interactive | status: expected 0, got 70 |
+| background | 27 | Signal message for killed background job | status: expected 0, got 1; stdout mismatch |
 | assign-extended | 22 | declare -p UNDEF (and typeset) -- prints something to stderr | stdout mismatch |
 
 ## Bonus: Tests where gsh passes but bash fails
@@ -112,7 +141,6 @@ Tests where gsh fails but bash passes.
 | quote | 20 | $? split over multiple lines |
 | quote | 21 | Unterminated single quote |
 | quote | 22 | Unterminated double quote |
-| quote | 35 | \c' is an escape, unlike bash |
 | word-split | 40 | IFS='' with ${!prefix@} and ${!prefix*} (bug #627) |
 | word-split | 41 | IFS='' with ${!a[@]} and ${!a[*]} (bug #627) |
 | word-split | 49 | IFS=x and '' and $@ - same bug as spec/toysh-posix case #12 |
@@ -199,7 +227,6 @@ Tests where gsh fails but bash passes.
 | builtin-bracket | 43 | Overflow error |
 | builtin-bracket | 51 | Looks like octal, but digit is too big |
 | builtin-misc | 1 | history builtin usage |
-| builtin-misc | 2 | Print shell strings with weird chars: set and printf %q and ${x@Q} |
 | builtin-misc | 7 | Invalid shift argument |
 | builtin-process | 8 | Exit builtin with invalid arg |
 | builtin-process | 9 | Exit builtin with too many args |
@@ -213,6 +240,7 @@ Tests where gsh fails but bash passes.
 | background | 26 | YSH wait --verbose |
 | command-parsing | 1 | Prefix env on assignment |
 | var-op-bash | 20 | ${!A@a} and ${!A[@]@a} |
+| var-op-bash | 26 | Array expansion with nullary var op @P |
 | var-op-slice | 10 | Slice undefined |
 | var-op-slice | 12 | Slice string with invalid UTF-8 results in empty string and warning |
 | var-op-slice | 13 | Slice string with invalid UTF-8 with strict_word_eval |
