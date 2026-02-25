@@ -47,3 +47,4 @@ stage.ss
 .claude
 manifest.ss
 gsh/
+.aider*

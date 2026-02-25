@@ -98,7 +98,7 @@ ifneq (,$(filter medium large,$(GSH_TIER)))
   TIER_PREREQS += gambitgsc
 endif
 
-# GERBIL_GSC: only use gambitgsc wrapper for medium/large (embeds compiler)
+# GERBIL_GSC: use wrapper for medium/large tiers (injects gambitgsc compiler modules)
 ifneq (,$(filter medium large,$(GSH_TIER)))
   BUILD_GSC := $(CURDIR)/scripts/gsc-with-gambitgsc
 endif
@@ -262,7 +262,8 @@ check-root:
 	  git config --global --add safe.directory /src; \
 	fi
 
-build-static: check-root generate-stage gerbil-runtime gsh-dlopen
+build-static: check-root gerbil-runtime gsh-dlopen
+	$(MAKE) generate-stage GSH_TIER=$(GSH_STATIC_TIER)
 	@# Install gambitgsc only for medium/large (embedded compiler)
 	@case "$(GSH_STATIC_TIER)" in medium|large) $(MAKE) gambitgsc ;; esac
 	@# Install coreutils only for large tier

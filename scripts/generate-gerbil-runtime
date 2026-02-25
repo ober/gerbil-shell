@@ -2,9 +2,9 @@
 # Generate _vendor/gerbil-runtime/ contents from the user's installed Gerbil.
 #
 # This script:
-# 1. Finds .scm files in $GERBIL_HOME/lib/static/ that lack .o (195 modules)
-# 2. Compiles each with gsc -obj to produce .o files
-# 3. Generates LINK_ORDER listing the .scm filenames for gsc -link injection
+# 1. Identifies .scm files in $GERBIL_HOME/lib/static/ that lack .o (195 modules)
+#    (these modules are loaded at runtime from the embedded .scm archive)
+# 2. Generates empty LINK_ORDER (no .c injection into gsc -link)
 # 4. Collects all .ssi files from $GERBIL_HOME/lib/ and generates embedded_ssi.c
 #    with a lookup table so the static binary can resolve .ssi from memory
 # 5. Creates a gzip-compressed archive of all .scm files from $GERBIL_HOME/lib/
@@ -88,42 +88,17 @@ done
 
 echo "Found $SCM_COUNT .scm files to compile"
 
-# Compile each .scm to .c (for gsc -link) and .o (for final linking)
-# gsc -c generates a .c file from .scm (used by gsc -link for init chain)
-# gsc -obj generates a .o file from .scm (actual compiled code for linking)
-echo "Compiling .scm files to .c + .o..."
-FAIL=0
-DONE=0
-for name in $SCM_LIST; do
-  src="$STATIC_DIR/$name"
-  cfile="$RUNTIME_DIR/${name%.scm}.c"
-  ofile="$RUNTIME_DIR/${name%.scm}.o"
-  DONE=$((DONE + 1))
-  if [ $((DONE % 20)) -eq 0 ] || [ "$DONE" -eq "$SCM_COUNT" ]; then
-    printf "  [%d/%d] %s\n" "$DONE" "$SCM_COUNT" "$name"
-  fi
-  if ! "$GSC" -c -o "$cfile" "$src" >/dev/null 2>&1; then
-    echo "  ERROR: gsc -c failed for $name" >&2
-    FAIL=1
-    continue
-  fi
-  if ! "$GSC" -obj -o "$ofile" "$src" >/dev/null 2>&1; then
-    echo "  ERROR: gsc -obj failed for $name" >&2
-    FAIL=1
-  fi
-done
+# NOTE: We do NOT compile these .scm files to .c/.o.
+# Compiling them creates a dependency ordering problem: gsc -link uses
+# command-line order for init, but can't determine correct inter-module
+# dependencies. Wrong ordering causes segfaults or #!unbound errors at startup.
+# Instead, these modules are loaded at runtime from the embedded .scm archive
+# by the patched load-module in static-compat.ss. This is slightly slower
+# (interpreted vs compiled) but correct and reliable.
+echo "Skipping .scm compilation ($SCM_COUNT modules — will be loaded from embedded archive)"
 
-if [ "$FAIL" -ne 0 ]; then
-  echo "generate-gerbil-runtime: some .scm files failed to compile" >&2
-  exit 1
-fi
-
-# --- Generate LINK_ORDER (lists .c files for gsc -link injection) ---
-
-echo "Generating LINK_ORDER..."
-for name in $SCM_LIST; do
-  echo "${name%.scm}.c"
-done > "$RUNTIME_DIR/LINK_ORDER"
+# LINK_ORDER is empty — no .c files to inject into gsc -link
+: > "$RUNTIME_DIR/LINK_ORDER"
 
 # --- Part 2: Generate embedded_ssi.c ---
 
@@ -418,4 +393,4 @@ fi
 
 echo "$STAMP_VALUE" > "$VERSION_STAMP"
 
-echo "Done: $SCM_COUNT .scm → .o, plus embedded_ssi.o + embedded_scm.o + embedded_gambit_h.o"
+echo "Done: embedded_ssi.o + embedded_scm.o + embedded_gambit_h.o ($SCM_COUNT modules in .scm archive)"
