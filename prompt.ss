@@ -161,6 +161,9 @@
                 (begin
                   (display "\\D" out)
                   (loop (+ i 2)))))
+             ;; Non-printing delimiters (bash \[ \]) — skip
+             ((#\[) (loop (+ i 2)))
+             ((#\]) (loop (+ i 2)))
              ;; Unknown escape: output literally
              (else
               (display "\\" out)
