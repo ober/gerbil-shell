@@ -392,7 +392,24 @@
 
 ;;; --- Entry point ---
 
+(def (init-smp!)
+  ;; Enable SMP (multiple OS threads for parallel Scheme execution).
+  ;; Controlled by GSH_PROCESSORS env var:
+  ;;   unset or "1" → single-threaded (default)
+  ;;   "N"          → use N processors
+  ;;   "auto"       → use all available CPU cores
+  (let* ((env-val (getenv "GSH_PROCESSORS" #f))
+         (n (cond
+              ((not env-val) #f)
+              ((string=? env-val "auto") (##cpu-count))
+              (else (string->number env-val)))))
+    (when (and n (> n 1))
+      (##set-parallelism-level! n)
+      (##startup-parallelism!))))
+
 (def (main . args)
+  ;; Enable SMP if requested via GSH_PROCESSORS env var
+  (init-smp!)
   ;; Move Gambit's internal fds (3-9) to high numbers so user can use exec 3>, etc.
   (move-internal-fds-high!)
   ;; Reserve fds 3-9 so signalfd (created by add-signal-handler!) doesn't get fd 3.
