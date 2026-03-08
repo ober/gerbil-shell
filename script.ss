@@ -42,13 +42,85 @@
 
 ;;; --- Scheme Evaluation Helpers ---
 
+(def (fmt-bytes b)
+  "Format a byte count as a human-readable string (B/KB/MB/GB)."
+  (cond
+    ((>= b (* 1024 1024 1024))
+     (string-append (number->string (/ (floor (* (/ b (* 1024 1024 1024)) 100)) 100.0)) " GB"))
+    ((>= b (* 1024 1024))
+     (string-append (number->string (/ (floor (* (/ b (* 1024 1024)) 100)) 100.0)) " MB"))
+    ((>= b 1024)
+     (string-append (number->string (/ (floor (* (/ b 1024) 100)) 100.0)) " KB"))
+    (else
+     (string-append (number->string (inexact->exact (floor b))) " B"))))
+
+(def (handle-room-command)
+  "Display GC, heap, and runtime information (like Common Lisp's ROOM)."
+  (with-catch
+   (lambda (e)
+     (cons (call-with-output-string
+            (lambda (port) (display "Error: " port) (display-exception e port)))
+           1))
+   (lambda ()
+     (##gc)
+     (let* ((ps (##process-statistics))
+            (user-cpu (f64vector-ref ps 0))
+            (sys-cpu (f64vector-ref ps 1))
+            (real-time (f64vector-ref ps 2))
+            (gc-user (f64vector-ref ps 3))
+            (gc-sys (f64vector-ref ps 4))
+            (gc-real (f64vector-ref ps 5))
+            (num-gcs (inexact->exact (floor (f64vector-ref ps 6))))
+            (heap-size (f64vector-ref ps 7))
+            (nb-minor-faults (inexact->exact (floor (f64vector-ref ps 8))))
+            (nb-major-faults (inexact->exact (floor (f64vector-ref ps 9))))
+            (alloc-total (f64vector-ref ps 15))
+            (reclaimed (f64vector-ref ps 16))
+            (live-heap (f64vector-ref ps 17))
+            (movable (f64vector-ref ps 18))
+            (still (f64vector-ref ps 19)))
+       (cons
+        (call-with-output-string
+         (lambda (port)
+           (display "--- GC & Heap ---\n" port)
+           (display "  Heap size:       " port) (display (fmt-bytes heap-size) port) (newline port)
+           (display "  Live after GC:   " port) (display (fmt-bytes live-heap) port) (newline port)
+           (display "    Movable:       " port) (display (fmt-bytes movable) port) (newline port)
+           (display "    Still:         " port) (display (fmt-bytes still) port) (newline port)
+           (display "  Total allocated: " port) (display (fmt-bytes alloc-total) port) (newline port)
+           (display "  Total reclaimed: " port) (display (fmt-bytes reclaimed) port) (newline port)
+           (display "  GC runs:         " port) (display num-gcs port) (newline port)
+           (display "  GC time:         " port)
+           (display (/ (floor (* gc-real 1000)) 1.0) port) (display " ms real, " port)
+           (display (/ (floor (* gc-user 1000)) 1.0) port) (display " ms cpu" port) (newline port)
+           (display "  Live percent:    " port) (display (##get-live-percent) port) (display "%" port) (newline port)
+           (newline port)
+           (display "--- Process ---\n" port)
+           (display "  CPU time:        " port)
+           (display (/ (floor (* user-cpu 1000)) 1.0) port) (display " ms user, " port)
+           (display (/ (floor (* sys-cpu 1000)) 1.0) port) (display " ms sys" port) (newline port)
+           (display "  Real time:       " port)
+           (display (/ (floor (* real-time 1000)) 1.0) port) (display " ms" port) (newline port)
+           (display "  Page faults:     " port) (display nb-minor-faults port)
+           (display " minor, " port) (display nb-major-faults port) (display " major" port) (newline port)
+           (display "  CPU cache:       " port) (display (fmt-bytes (##cpu-cache-size)) port) (newline port)
+           (newline port)
+           (display "--- Runtime ---\n" port)
+           (display "  Gambit:          " port) (display (##system-version-string) port) (newline port)
+           (display "  Platform:        " port) (display (##system-type-string) port)))
+        0)))))
+
 (def (eval-scheme-expr expr-str)
   ;; Evaluate a Gerbil Scheme expression string and return (cons result-string status)
   ;; Status: 0 = success, 1 = error
-  ;; Check for meta-commands first (,compile, ,load, ,use, ,exports)
-  (let ((handler (*meta-command-handler*)))
-    (or (and handler (handler expr-str))
-        ;; Normal Scheme eval
+  ;; Handle built-in meta-commands that don't need any tier
+  (cond
+   ((string=? expr-str "room") (handle-room-command))
+   (else
+    ;; Check for meta-commands (,compile, ,load, ,use, ,exports)
+    (let ((handler (*meta-command-handler*)))
+      (or (and handler (handler expr-str))
+          ;; Normal Scheme eval
         (begin
           (ensure-gerbil-eval!)
           (with-catch
@@ -75,7 +147,7 @@
                    (call-with-output-string
                     (lambda (port)
                       (write result port)))))
-                0))))))))
+                0))))))))))
 
 (def (scheme-eval-line? line)
   ;; Check if line starts with comma meta-command
